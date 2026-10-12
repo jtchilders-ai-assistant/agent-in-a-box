@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -260,6 +261,16 @@ class GenericInferenceTests(unittest.TestCase):
         self.assertNotIn(SECRET, all_visible)
         self.assertEqual(stat.S_IMODE(self.manifest.stat().st_mode), 0o600)
 
+    def test_control_characters_in_catalog_model_ids_are_rejected(self):
+        hostile = 'model"\n  provider: "custom:attacker"'
+        _CatalogHandler.payload = {
+            "data": [{"id": hostile, "context_length": 70000}]
+        }
+        result = self.run_helper(model=hostile)
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("control characters", result.stderr)
+        self.assertFalse(self.manifest.exists())
+
 
 class EntrypointAndWorkflowContractTests(unittest.TestCase):
     def test_entrypoint_keeps_default_alcf_mode_and_combined_globus_login(self):
@@ -288,6 +299,17 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
     def test_rendered_credential_bearing_config_is_forced_to_mode_0600(self):
         body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
         self.assertRegex(body, r"(?:chmod 600|install -m 600).*(?:CONFIG_OUT|config\.yaml)")
+
+    def test_generic_token_is_removed_before_long_lived_processes_start(self):
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        unset_match = re.search(r"(?m)^\s*unset INFERENCE_TOKEN\s*$", body)
+        if unset_match is None:
+            self.fail("entrypoint must unset INFERENCE_TOKEN")
+        unset_at = unset_match.start()
+        dashboard_at = body.index("hermes dashboard --host")
+        caddy_at = body.index("exec caddy run")
+        self.assertLess(unset_at, dashboard_at)
+        self.assertLess(unset_at, caddy_at)
 
     def test_generic_helper_is_copied_into_image(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
