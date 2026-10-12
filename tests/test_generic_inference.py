@@ -273,6 +273,98 @@ class GenericInferenceTests(unittest.TestCase):
 
 
 class EntrypointAndWorkflowContractTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.runtime = Path(self._tmp.name)
+        self.alcf_dir = self.runtime / "alcf"
+        self.venv_bin = self.runtime / "venv" / "bin"
+        self.hermes_agent = self.runtime / "hermes-agent"
+        self.home = self.runtime / "home"
+        self.alcf_dir.mkdir(parents=True)
+        self.venv_bin.mkdir(parents=True)
+        self.hermes_agent.mkdir(parents=True)
+        self.home.mkdir(parents=True)
+        _CatalogHandler.payload = {"object": "list", "data": []}
+        _CatalogHandler.expected_path = "/v1/models"
+        _CatalogHandler.expected_auth = f"Bearer {SECRET}"
+        _CatalogHandler.status = 200
+        _CatalogHandler.seen = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CatalogHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address[:2]
+        self.base_url = f"http://{host}:{port}/v1"
+        self.addCleanup(lambda: self.thread.join(timeout=5))
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+        (self.alcf_dir / "generic_inference.py").write_bytes(SCRIPT.read_bytes())
+        (self.alcf_dir / "config.template.yaml").write_bytes(
+            (ROOT / "config" / "config.template.yaml").read_bytes()
+        )
+        (self.hermes_agent / "capabilities.py").write_text(
+            "delegate_task = True\n", encoding="utf-8"
+        )
+
+        python_wrapper = self.venv_bin / "python"
+        python_wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ ${1:-} == -c && ${2:-} == *plugins.dashboard_auth.basic* ]]; then\n"
+            "  printf '%s\\n' test-password-hash\n"
+            "  exit 0\n"
+            "fi\n"
+            f"exec {sys.executable!s} \"$@\"\n",
+            encoding="utf-8",
+        )
+        python_wrapper.chmod(0o755)
+
+        token_cli = self.venv_bin / "alcf-tokens"
+        token_cli.write_text(
+            "#!/usr/bin/env bash\n"
+            "case ${1:-} in\n"
+            "  get-token) printf '%s\\n' test-alcf-token ;;\n"
+            "  login) exit 0 ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        token_cli.chmod(0o755)
+
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        body = body.replace("ALCF_DIR=/opt/alcf", f"ALCF_DIR={self.alcf_dir}")
+        body = body.replace("VENV_BIN=/opt/hermes/.venv/bin", f"VENV_BIN={self.venv_bin}")
+        body = body.replace("/opt/hermes/agent", str(self.hermes_agent))
+        stop_marker = "# --- 4b. Model availability status banner"
+        self.assertIn(stop_marker, body)
+        body = body.replace(stop_marker, "exit 0\n" + stop_marker, 1)
+        self.entrypoint = self.runtime / "entrypoint-under-test.sh"
+        self.entrypoint.write_text(body, encoding="utf-8")
+        self.entrypoint.chmod(0o755)
+
+    def run_entrypoint(self, **overrides):
+        env = os.environ.copy()
+        env.update(
+            {
+                "HERMES_HOME": str(self.home),
+                "ALCF_CLUSTER": "sophia",
+                "ALCF_DASHBOARD_PASSWORD": "test-dashboard-password",
+                "ALCF_ENABLE_GLOBUS_COMPUTE": "0",
+                "INFERENCE_URL": "",
+                "INFERENCE_TOKEN": "",
+                "INFERENCE_MODEL": "",
+                "ALCF_DELEGATION_MODEL": "",
+            }
+        )
+        env.update(overrides)
+        return subprocess.run(
+            ["bash", str(self.entrypoint)],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=15,
+        )
+
     def test_entrypoint_keeps_default_alcf_mode_and_combined_globus_login(self):
         body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
         self.assertIn('if [[ -n "${INFERENCE_URL:-}" ]]', body)
@@ -284,17 +376,51 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         self.assertIn("ALCF_SHOW_MODEL_STATUS", body)
 
     def test_partial_generic_configuration_fails_closed(self):
-        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
-        self.assertIn("INFERENCE_TOKEN", body)
-        self.assertIn("INFERENCE_MODEL", body)
-        self.assertIn("exit 78", body)
-        self.assertIn('elif [[ -n "${INFERENCE_TOKEN:-}" || -n "${INFERENCE_MODEL:-}"', body)
+        for partial in (
+            {"INFERENCE_TOKEN": "only-token"},
+            {"INFERENCE_MODEL": "only-model"},
+        ):
+            with self.subTest(partial=tuple(partial)):
+                result = self.run_entrypoint(**partial)
+                self.assertEqual(result.returncode, 78, result.stderr)
+                self.assertIn("partial generic inference configuration", result.stderr)
+                self.assertFalse((self.home / "config.yaml").exists())
 
     def test_generic_delegation_never_falls_back_to_alcf_inference_resolution(self):
-        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
-        self.assertIn('if [[ "$GENERIC_MODE" == "1" ]]', body)
-        self.assertIn("generic delegation model", body.lower())
-        self.assertIn("refusing to start", body.lower())
+        _CatalogHandler.payload = {
+            "data": [{"id": "launch-model", "context_length": 131072}]
+        }
+        result = self.run_entrypoint(
+            INFERENCE_URL=self.base_url,
+            INFERENCE_TOKEN=SECRET,
+            INFERENCE_MODEL="launch-model",
+            ALCF_DELEGATION_MODEL="missing-delegation-model",
+        )
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("generic delegation model", result.stderr.lower())
+        self.assertIn("refusing to start", result.stderr.lower())
+        self.assertFalse((self.home / "config.yaml").exists())
+
+    def test_generic_render_config_maps_selected_manifest_model(self):
+        _CatalogHandler.payload = {
+            "data": [
+                {"id": "selected/model", "context_length": 131072},
+                {"id": "other-model", "context_length": 70000},
+            ]
+        }
+        result = self.run_entrypoint(
+            INFERENCE_URL=self.base_url,
+            INFERENCE_TOKEN=SECRET,
+            INFERENCE_MODEL="selected/model",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = (self.home / "config.yaml").read_text(encoding="utf-8")
+        self.assertIn('provider: "custom:generic-inference"', config)
+        self.assertIn(f'base_url: "{self.base_url}"', config)
+        self.assertIn('model: "selected/model"', config)
+        self.assertIn('default: "selected/model"', config)
+        self.assertIn(f'api_key: "{SECRET}"', config)
+        self.assertEqual(stat.S_IMODE((self.home / "config.yaml").stat().st_mode), 0o600)
 
     def test_rendered_credential_bearing_config_is_forced_to_mode_0600(self):
         body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
