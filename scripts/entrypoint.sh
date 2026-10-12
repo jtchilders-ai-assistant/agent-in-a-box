@@ -15,6 +15,12 @@
 #
 # $HERMES_HOME (/opt/data) and ~/.globus persist across restarts, so step 2
 # is skipped once tokens exist.
+#
+# GENERIC MODE: setting INFERENCE_URL switches the LLM brain from the ALCF
+# Inference Service to any OpenAI-compatible endpoint (see step 1b). The
+# combined Globus login still happens because IRI, Globus Compute, and
+# Transfer keep working unchanged; only the ALCF-specific inference catalog,
+# status banner, and token refresh are skipped.
 set -euo pipefail
 
 ALCF_DIR=/opt/alcf
@@ -56,6 +62,44 @@ esac
 export ALCF_BASE_URL
 
 mkdir -p "$HERMES_HOME"
+
+# --- 1b. Generic inference mode (opt-in via INFERENCE_URL) --------------------
+# Setting INFERENCE_URL points the agent's LLM brain at ANY OpenAI-compatible
+# endpoint instead of the ALCF Inference Service. This changes ONLY the model
+# provider: the combined Globus login below still happens (step 2), and IRI,
+# Globus Compute, Transfer, and the dashboard behave exactly as in ALCF mode.
+# What generic mode skips is the ALCF-specific part of inference: the gateway
+# catalog/status banner, max_model_len resolution, and the 6h Globus token
+# refresh (the supplied INFERENCE_TOKEN is static and user-managed).
+# FAIL-CLOSED: any partial generic configuration is refused with exit 78.
+GENERIC_MODE=0
+if [[ -n "${INFERENCE_URL:-}" ]]; then
+  GENERIC_MODE=1
+  missing=""
+  [[ -n "${INFERENCE_TOKEN:-}" ]] || missing+=" INFERENCE_TOKEN"
+  [[ -n "${INFERENCE_MODEL:-}" ]] || missing+=" INFERENCE_MODEL"
+  if [[ -n "$missing" ]]; then
+    err "INFERENCE_URL is set (generic inference mode) but required setting(s) are missing:$missing"
+    err "In generic mode INFERENCE_TOKEN and INFERENCE_MODEL are both mandatory."
+    err "Unset INFERENCE_URL to use the default ALCF Inference Service."
+    exit 78   # EX_CONFIG: launch configuration is invalid
+  fi
+  if ! printf '%s' "${INFERENCE_MAX_TOKENS:-4096}" | grep -Eq '^[1-9][0-9]*$'; then
+    err "INFERENCE_MAX_TOKENS must be a positive integer (got '${INFERENCE_MAX_TOKENS}')."
+    exit 78   # EX_CONFIG
+  fi
+  log "Generic inference mode: endpoint from INFERENCE_URL, model '$INFERENCE_MODEL'"
+  log "(IRI / Globus Compute / Transfer still use the combined ALCF Globus login; the token itself is never logged)"
+elif [[ -n "${INFERENCE_TOKEN:-}" || -n "${INFERENCE_MODEL:-}" ]]; then
+  # PARTIAL GENERIC CONFIGURATION: generic settings are set but INFERENCE_URL
+  # is absent. Silently entering default ALCF mode here would ignore settings
+  # the user clearly meant for a generic endpoint (and would then use the ALCF
+  # gateway with them pending), so refuse the state outright. Values are never
+  # printed — only the names of the offending variables.
+  err "INFERENCE_TOKEN and/or INFERENCE_MODEL are set but INFERENCE_URL is not — this is a partial generic inference configuration."
+  err "Either set INFERENCE_URL to complete generic mode, or unset INFERENCE_TOKEN/INFERENCE_MODEL to use the default ALCF Inference Service."
+  exit 78   # EX_CONFIG: partial generic configuration is refused
+fi
 
 # --- 2. First-run Globus auth (interactive, idempotent) ---------------------
 # ONE alcf-tokens login covers ALL ALCF services (Inference, IRI, Globus
@@ -99,6 +143,58 @@ export ALCF_DASHBOARD_PASSWORD_HASH="$("$PY" -c "from plugins.dashboard_auth.bas
 # --- 4. Render config (Python; no envsubst in the base image) ---------------
 render_config() {
   local token ctxlen providers_block
+  local launch_model launch_provider render_base_url block_for_scan
+  if [[ "$GENERIC_MODE" == "1" ]]; then
+    # GENERIC MODE: static user-supplied endpoint/token/model. We skip the
+    # ALCF-specific catalog discovery (populate_models.py), the gateway
+    # max_model_len resolution, and the floor-guard fallback machinery —
+    # generic_inference.py already validated the URL, authenticated against
+    # <base>/models, enforced the 64k context floor, and refused (exit 78)
+    # anything unusable. The token is never echoed to any log.
+    token="$INFERENCE_TOKEN"
+    launch_model="$INFERENCE_MODEL"
+    launch_provider="custom:generic-inference"
+    local gmanifest="$HERMES_HOME/.generic_inference_manifest.json"
+    if ! INFERENCE_TOKEN="$token" "$PY" "$ALCF_DIR/generic_inference.py" \
+           --base-url "$INFERENCE_URL" --model "$INFERENCE_MODEL" \
+           --max-tokens "${INFERENCE_MAX_TOKENS:-4096}" \
+           --output "$gmanifest" >/tmp/generic_inference.log 2>&1; then
+      err "Generic inference setup failed — refusing to start. Details (token-free):"
+      sed 's/^/  /' /tmp/generic_inference.log >&2 || true
+      exit 78   # EX_CONFIG: endpoint/token/model/catalog is unusable
+    fi
+    # Surface the per-model ENABLED/DISABLED report in the startup log.
+    while IFS= read -r _gline; do log "$_gline"; done </tmp/generic_inference.log
+    ctxlen="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_context_length"])' "$gmanifest")"
+    render_base_url="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_url"])' "$gmanifest")"
+    # One named provider carrying EVERY catalog-enabled model with its real
+    # context window (static mapping — discover_models off, like ALCF mode).
+    # The api_key stays a ${...} placeholder; the token is substituted once at
+    # template render, exactly like the ALCF path.
+    providers_block="$("$PY" - "$gmanifest" "${INFERENCE_MAX_TOKENS:-4096}" <<'GPYEOF'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+lines = [
+    "custom_providers:",
+    "  - name: generic-inference",
+    "    base_url: " + json.dumps(manifest["base_url"]),
+    '    api_key: "${ALCF_ACCESS_TOKEN}"',
+    "    discover_models: false",
+    "    max_tokens: %d" % int(sys.argv[2]),
+    "    models:",
+]
+for model_id, ctx in sorted(manifest["enabled_models"].items()):
+    lines.append("      " + json.dumps(model_id) + ":")
+    lines.append("        context_length: %d" % ctx)
+print("\n".join(lines))
+GPYEOF
+)"
+    case "$providers_block" in
+      custom_providers:*) : ;;
+      *) err "generic_inference produced no providers block; refusing to start"; exit 78 ;;
+    esac
+    block_for_scan="$providers_block"
+  else
   token="$("$ALCF_TOKENS" get-token inference)"
   # Resolve the REAL serving context window for the LAUNCH model from the
   # server's max_model_len (ALCF caps some models below their published spec;
@@ -220,6 +316,9 @@ render_config() {
   [ -n "$launch_provider" ] || launch_provider="custom:alcf-sophia"
   log "Launch model '$launch_model' -> provider $launch_provider (per-model output cap)"
   # --- end launch-model provider resolution --------------------------------
+  render_base_url="$ALCF_BASE_URL"
+  fi
+  # --- end generic/ALCF branch ----------------------------------------------
 
   # --- Optional feature blocks (delegation subagents + MCP bash tool) -------
   # Both are appended AFTER the providers block and each is gated on a runtime
@@ -239,6 +338,32 @@ render_config() {
     delegation_model="${ALCF_DELEGATION_MODEL:-$launch_model}"
     if [ "$delegation_model" = "$launch_model" ]; then
       delegation_provider="$launch_provider"
+    elif [[ "$GENERIC_MODE" == "1" ]]; then
+      # GENERIC MODE delegation: the ONLY provider that exists is
+      # generic-inference, and the ONLY models on it are the catalog-enabled
+      # ones generic_inference.py verified (the manifest's enabled_models
+      # mapping — the provider block quotes model ids, so membership is
+      # checked against the manifest, not by grepping the YAML block).
+      # A delegation model not in that mapping has NO valid provider in
+      # generic mode, and the ALCF path below (populate_models.py with
+      # $token, plus the custom:alcf-sophia fallback) would leak the generic
+      # INFERENCE_TOKEN to the ALCF gateway and route subagents to a provider
+      # that does not exist in this config. Fail closed instead.
+      if ! "$PY" -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1], encoding="utf-8"))["enabled_models"] else 1)' \
+             "$gmanifest" "$delegation_model"; then
+        err "======================================================================"
+        err "REFUSING TO START: generic delegation model '$delegation_model'"
+        err "(ALCF_DELEGATION_MODEL) is not one of the models served by the"
+        err "generic inference endpoint. In generic mode there is no ALCF provider"
+        err "to resolve it against, and silently falling back would leak the"
+        err "generic token to the ALCF gateway."
+        err ""
+        err "Set ALCF_DELEGATION_MODEL to one of the ENABLED models reported above,"
+        err "or unset it to delegate on the launch model '$launch_model'."
+        err "======================================================================"
+        exit 78   # EX_CONFIG: generic delegation model is unresolvable
+      fi
+      delegation_provider="custom:generic-inference"
     else
       # Same provider scan as the launch model (which named provider lists it),
       # with the same Python-resolver + static fallbacks.
@@ -325,8 +450,8 @@ EOF
   # block over the sentinel-to-EOF region of the template. The generated block
   # still contains ${ALCF_ACCESS_TOKEN}, so we splice FIRST then substitute.
   ALCF_ACCESS_TOKEN="$token" \
-  ALCF_BASE_URL="$ALCF_BASE_URL" \
-  ALCF_MODEL="${ALCF_MODEL:-google/gemma-4-31B-it}" \
+  ALCF_BASE_URL="$render_base_url" \
+  ALCF_MODEL="$launch_model" \
   ALCF_LAUNCH_PROVIDER="$launch_provider" \
   ALCF_MAX_TOKENS="${ALCF_MAX_TOKENS:-2048}" \
   ALCF_CONTEXT_LENGTH="$ctxlen" \
@@ -364,9 +489,18 @@ if extra:
 out = string.Template(tmpl).safe_substitute(os.environ)
 open(dst, "w", encoding="utf-8").write(out)
 PYEOF
+  # The rendered config embeds the live inference api_key. FORCE mode 0600 on
+  # every render — including re-renders over an existing file, where the file
+  # mode comes from the pre-existing inode and open(mode=) alone would not
+  # tighten it.
+  chmod 600 "$CONFIG_OUT"
 }
 render_config
-log "Config rendered -> $CONFIG_OUT (cluster=$ALCF_CLUSTER model=${ALCF_MODEL:-google/gemma-4-31B-it})"
+if [[ "$GENERIC_MODE" == "1" ]]; then
+  log "Config rendered -> $CONFIG_OUT (mode 0600; generic endpoint from INFERENCE_URL, model '$INFERENCE_MODEL')"
+else
+  log "Config rendered -> $CONFIG_OUT (mode 0600; cluster=$ALCF_CLUSTER model=${ALCF_MODEL:-google/gemma-4-31B-it})"
+fi
 
 # --- 4b. Model availability status banner ------------------------------------
 # The model dropdown lists the full ALCF catalog, but ALCF only keeps a subset
@@ -377,7 +511,9 @@ log "Config rendered -> $CONFIG_OUT (cluster=$ALCF_CLUSTER model=${ALCF_MODEL:-g
 # ~10-15 min GPU warm-up), or know a cluster is simply down. Purely informational
 # and best-effort: never fatal (|| true), and the script itself reports "unknown"
 # rather than guessing if /jobs is unreachable.
-if [ "${ALCF_SHOW_MODEL_STATUS:-1}" != "0" ]; then
+# GENERIC MODE skips this ALCF-specific gateway banner (generic_inference.py's
+# ENABLED/DISABLED report above is the equivalent in generic mode).
+if [ "$GENERIC_MODE" == "0" ] && [ "${ALCF_SHOW_MODEL_STATUS:-1}" != "0" ]; then
   ALCF_INFER_TOKEN="$("$ALCF_TOKENS" get-token inference 2>/dev/null || true)" ALCF_PY="$PY" \
     ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
     ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
@@ -454,7 +590,9 @@ cp -r "$ALCF_DIR/skills/." "$HERMES_HOME/skills/research/" 2>/dev/null || true
 
 # --- 6. Token refresh loop (tokens last 48h; refresh every 6h) --------------
 # The inference token IS the api_key, and it rotates. We re-render the config
-# with a fresh token every 6h. If a refresh FAILS, the token has almost
+# with a fresh token every 6h. GENERIC MODE SKIPS THIS LOOP: the supplied
+# INFERENCE_TOKEN is static and user-managed (restarting the container with an
+# updated -e INFERENCE_TOKEN=... is how you rotate it). If a refresh FAILS, the token has almost
 # certainly hit the 30-day hard re-auth limit — from then on every LLM call
 # will fail upstream (typically HTTP 401). A chat-only user never sees the
 # container log, so we (a) print a loud, actionable banner to the log AND (b)
@@ -464,6 +602,7 @@ TOKEN_STATUS="$HERMES_HOME/.inference_token_status"
 : > "$TOKEN_STATUS" 2>/dev/null || true   # start clean (empty = healthy)
 reauth_cmd="docker exec -it <container> \
   /opt/hermes/.venv/bin/alcf-tokens login"
+if [[ "$GENERIC_MODE" == "0" ]]; then
 (
   while true; do
     sleep 21600
@@ -485,6 +624,7 @@ reauth_cmd="docker exec -it <container> \
     fi
   done
 ) &
+fi   # end ALCF-mode token-refresh loop guard (generic mode uses a static INFERENCE_TOKEN)
 
 # --- 7. Launch: dashboard behind Caddy on a loopback-published HTTP port ------
 # Browsers treat http://localhost as a trustworthy secure context, so clipboard

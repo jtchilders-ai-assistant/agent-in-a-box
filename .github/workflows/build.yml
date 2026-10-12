@@ -4,7 +4,7 @@ name: Build and publish image
 # Non-product images are maintained outside this public repository.
 on:
   push:
-    branches: [main]
+    branches: [main, feat/generic-inference]
     tags: ["v*"]
   schedule:
     - cron: "17 3 * * *"
@@ -37,6 +37,7 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
             type=ref,event=tag
             type=sha,format=short
 

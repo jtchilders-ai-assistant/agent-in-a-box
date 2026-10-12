@@ -282,6 +282,75 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 | `ALCF_ENABLE_MINERVA` | `1` | Include the Minerva cluster's models in the switchable list |
 | `ALCF_SHOW_MODEL_STATUS` | `1` | Print the model availability banner (LIVE/QUEUED/OFFLINE + context windows) at startup |
 | `ALCF_BASH_ACCOUNT` | *(unset)* | **Recommended:** your default ALCF project for the compute-node `bash` tool. When set, the agent holds ONE warm compute node across the whole conversation instead of paying repeated cold starts; when unset, it must ask/look up a project first. |
+
+## Generic OpenAI-compatible inference mode (optional)
+
+**The default is unchanged:** with no `INFERENCE_*` variables set, the box
+behaves exactly as before — ALCF Inference Service on `ALCF_CLUSTER`, the
+combined Globus login, the live catalog, the availability banner, and the
+6-hour token refresh. Everything below only applies when you opt in.
+
+Setting `INFERENCE_URL` points the agent's own brain at **any**
+OpenAI-compatible endpoint (`GET <base>/models` + Bearer auth) instead of the
+ALCF gateway. IRI job/filesystem tools, Globus Compute, Transfer, and the
+dashboard are untouched — the combined `alcf-tokens` login still happens
+because those features keep working. Generic mode skips only the ALCF-specific
+catalog/status/refresh machinery.
+
+Required settings (any partial combination fails closed with exit 78):
+
+| Env var | Required | Meaning |
+|---|---|---|
+| `INFERENCE_URL` | *(unset = ALCF mode)* | OpenAI-compatible API base URL (http/https; credentials, query strings, and fragments are rejected). `/models` is appended exactly once. |
+| `INFERENCE_TOKEN` | **yes** in generic mode | Bearer token for the endpoint. Never logged, never written to the manifest. |
+| `INFERENCE_MODEL` | **yes** in generic mode | Model id to launch; must exist in the endpoint's catalog with context ≥ 64000. |
+| `INFERENCE_MAX_TOKENS` | optional (default `4096`) | Per-response output cap; must be a positive integer. |
+| `INFERENCE_CONTEXT_LENGTHS` | optional | JSON object overriding per-model context windows for models the endpoint doesn't report correctly, e.g. `-e INFERENCE_CONTEXT_LENGTHS='{"my-model": 200000}'`. An override may not invent a model absent from the catalog, and overrides below 64000 still disable the model. |
+
+Docker:
+
+```bash
+docker run -it --rm \
+  -p 127.0.0.1:8787:8787 \
+  -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
+  -e INFERENCE_URL='https://my-vllm.example.com/v1' \
+  -e INFERENCE_TOKEN='...' \
+  -e INFERENCE_MODEL='my-model' \
+  -v alcf-agent-home:/opt/data \
+  ghcr.io/jtchilders-ai-assistant/alcf-agent:feat-generic-inference
+```
+
+Podman accepts the identical options (`podman run -it --rm \ -p
+127.0.0.1:8787:8787 …`). For Apptainer, keep the existing confinement
+(`--containall --no-mount cwd`, private home, host network — no port mapping)
+and pass the settings with the `APPTAINERENV_` prefix:
+
+```bash
+export APPTAINERENV_INFERENCE_URL='https://my-vllm.example.com/v1'
+export APPTAINERENV_INFERENCE_TOKEN='...'
+export APPTAINERENV_INFERENCE_MODEL='my-model'
+apptainer run --containall --no-mount cwd \
+  --home "$APPTAINER_HOME:$HOME" \
+  --cwd /opt/data \
+  --bind "$HOME/.local/share/alcf-agent:/opt/data" \
+  alcf-agent.sif
+```
+
+At startup the container prints an ENABLED/DISABLED report for every catalog
+model (a model is disabled if its context window is missing or below 64000;
+model *names* are never used to infer a window — only `max_model_len`,
+`context_length`, `context_window`, `max_context_length`,
+`capabilities.context_window_tokens`, `metadata.context_length`, or an
+explicit override count).
+
+> ⚠️ **Credential persistence:** `INFERENCE_TOKEN` is rendered into
+> `$HERMES_HOME/config.yaml` (forced to mode 0600), which lives on your
+> `alcf-agent-home` volume / Apptainer state directory and persists after the
+> container exits. Anyone with access to that volume can read the token. It is
+> static — there is no auto-refresh in generic mode; restart the container with
+> an updated `-e INFERENCE_TOKEN=...` to rotate it. Keep publishing the
+> dashboard on `127.0.0.1` only, exactly as above.
+
 ## What happens at container start
 
 `scripts/entrypoint.sh` is the launch script. On every start (not just the first
