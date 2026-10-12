@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from typing import NoReturn
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -57,6 +58,29 @@ def fail(message: str) -> "NoReturn":
 
 def is_positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def validate_model_id(model_id: str, source: str) -> None:
+    """Fail closed on model ids carrying Unicode control characters (Cc).
+
+    A hostile catalog id such as ``model"\\n  provider: "custom:attacker"``
+    survives selection and is written into the rendered config, where raw
+    ${...} substitution lets the embedded newline/quote override
+    provider/base_url/api_key and redirect the bearer token. Rejecting any
+    character in Unicode general category Cc (NUL, newline, CR, tab, the rest
+    of C0 and C1) before the id is ever used closes that channel. Ordinary
+    names — spaces, slashes, punctuation, printable Unicode — pass untouched.
+    The id is echoed only via repr() so the rejection message itself can
+    never inject control characters into the log.
+    """
+    for ch in model_id:
+        if unicodedata.category(ch) == "Cc":
+            fail(
+                f"{source} {model_id!r} contains Unicode control characters "
+                "(general category Cc: newline, CR, tab, NUL, ...) which could "
+                "inject YAML into the rendered config — refusing to use it"
+            )
+            return  # fail() never returns; keeps type-checkers happy
 
 
 def normalize_base_url(raw: str) -> tuple[str, str]:
@@ -109,6 +133,9 @@ def parse_context_overrides(raw: str | None) -> dict[str, int]:
     for key, value in parsed.items():
         if not isinstance(key, str) or key == "":
             fail("INFERENCE_CONTEXT_LENGTHS keys must be non-empty model ids")
+        # Validate the override id BEFORE it can ever reach the manifest or
+        # the rendered config — same control-character bar as catalog ids.
+        validate_model_id(key, "INFERENCE_CONTEXT_LENGTHS model id")
         if not is_positive_int(value):
             fail(
                 "INFERENCE_CONTEXT_LENGTHS values must be positive integers "
@@ -154,6 +181,10 @@ def parse_catalog(payload: object) -> list[dict]:
         model_id = item.get("id")
         if not isinstance(model_id, str) or model_id == "":
             fail("malformed catalog: every model entry needs a non-empty 'id'")
+        # A hostile endpoint can hand us a YAML-injection id; validate BEFORE
+        # the entry enters the enabled/disabled maps (and therefore the
+        # manifest and the rendered providers block).
+        validate_model_id(model_id, "catalog model id")
         if model_id in seen:
             fail(f"malformed catalog: duplicate model id '{model_id}'")
         seen.add(model_id)
@@ -226,6 +257,11 @@ def main(argv: list[str] | None = None) -> int:
         fail(f"cannot remove existing manifest {args.output}: {exc.strerror or exc}")
 
     max_tokens = parse_max_tokens(args.max_tokens)
+
+    # Validate the SELECTED model id up front — before catalog use, the
+    # manifest, or any substitution — so a hostile INFERENCE_MODEL is
+    # rejected with the same control-character bar applied to catalog ids.
+    validate_model_id(args.model, "selected model (INFERENCE_MODEL)")
 
     token = os.environ.get("INFERENCE_TOKEN", "")
     if not token:

@@ -502,6 +502,22 @@ else
   log "Config rendered -> $CONFIG_OUT (mode 0600; cluster=$ALCF_CLUSTER model=${ALCF_MODEL:-google/gemma-4-31B-it})"
 fi
 
+# SECRET HYGIENE (generic mode): INFERENCE_TOKEN arrived in the container
+# environment (docker -e) and render_config has already substituted it into
+# the mode-0600 config — its ONLY intended durable home. Left in place it
+# would be inherited by the dashboard, Caddy, the MCP server, terminal tools,
+# and every long-lived descendant, so drop it from the entrypoint environment
+# BEFORE any of those start. `unset` removes it from the shell's parameters
+# AND the exported environment. No top-level shell variable retains the value
+# ($token inside render_config is `local` and died with the function). The
+# token remains intentionally persisted in $CONFIG_OUT (chmod 600 above).
+# ALCF mode never has INFERENCE_TOKEN set (partial config exits 78 above), so
+# this is scoped to generic mode and cannot affect the ALCF refresh loop's
+# re-render of render_config.
+if [[ "$GENERIC_MODE" == "1" ]]; then
+  unset INFERENCE_TOKEN
+fi
+
 # --- 4b. Model availability status banner ------------------------------------
 # The model dropdown lists the full ALCF catalog, but ALCF only keeps a subset
 # loaded on GPU at any time. populate_models.py --status-report classifies every
