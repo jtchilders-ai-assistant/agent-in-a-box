@@ -217,6 +217,19 @@ class GenericInferenceTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 78)
                 self.assertIn("INFERENCE_MAX_TOKENS", result.stderr)
 
+    def test_every_failure_removes_a_stale_manifest(self):
+        failure_cases = (
+            {"context_lengths": "not-json"},
+            {"base_url": "ftp://example.invalid/v1"},
+            {"max_tokens": "0"},
+        )
+        for kwargs in failure_cases:
+            with self.subTest(kwargs=kwargs):
+                self.manifest.write_text('{"stale": true}\n', encoding="utf-8")
+                result = self.run_helper(**kwargs)
+                self.assertEqual(result.returncode, 78)
+                self.assertFalse(self.manifest.exists())
+
     def test_rejects_malformed_catalog_and_duplicate_model_ids(self):
         for payload in (
             [],
@@ -264,6 +277,13 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         self.assertIn("INFERENCE_TOKEN", body)
         self.assertIn("INFERENCE_MODEL", body)
         self.assertIn("exit 78", body)
+        self.assertIn('elif [[ -n "${INFERENCE_TOKEN:-}" || -n "${INFERENCE_MODEL:-}"', body)
+
+    def test_generic_delegation_never_falls_back_to_alcf_inference_resolution(self):
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn('if [[ "$GENERIC_MODE" == "1" ]]', body)
+        self.assertIn("generic delegation model", body.lower())
+        self.assertIn("refusing to start", body.lower())
 
     def test_rendered_credential_bearing_config_is_forced_to_mode_0600(self):
         body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
