@@ -141,13 +141,14 @@ class GenericInferenceTests(unittest.TestCase):
                 {"id": "b", "max_context_length": 65000},
                 {"id": "c", "capabilities": {"context_window_tokens": 66000}},
                 {"id": "d", "metadata": {"context_length": 67000}},
+                {"id": "e", "max_input_tokens": 68000},
             ]
         }
         result = self.run_helper()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.manifest_data()["enabled_models"],
-            {"b": 65000, "c": 66000, "d": 67000, "model-enabled": 64000},
+            {"b": 65000, "c": 66000, "d": 67000, "e": 68000, "model-enabled": 64000},
         )
 
     def test_explicit_context_override_wins_and_can_enable_missing_metadata(self):

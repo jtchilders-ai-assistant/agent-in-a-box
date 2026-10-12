@@ -43,6 +43,7 @@ DIRECT_CONTEXT_FIELDS = (
     "context_length",
     "context_window",
     "max_context_length",
+    "max_input_tokens",
 )
 NESTED_CONTEXT_FIELDS = (
     ("capabilities", "context_window_tokens"),

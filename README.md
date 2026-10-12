@@ -339,7 +339,7 @@ apptainer run --containall --no-mount cwd \
 At startup the container prints an ENABLED/DISABLED report for every catalog
 model (a model is disabled if its context window is missing or below 64000;
 model *names* are never used to infer a window — only `max_model_len`,
-`context_length`, `context_window`, `max_context_length`,
+`context_length`, `context_window`, `max_context_length`, `max_input_tokens`,
 `capabilities.context_window_tokens`, `metadata.context_length`, or an
 explicit override count).
 
