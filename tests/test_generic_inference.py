@@ -455,6 +455,16 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("alcf-agent:feat-generic-inference", readme)
         self.assertIn("alcf-agent:latest", readme)
 
+    def test_readme_includes_a_safe_mag_example(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("### Example: AmSC Model Access Gateway (MAG)", readme)
+        self.assertIn("INFERENCE_URL='https://mag.genesis.americansciencecloud.org/v1'", readme)
+        self.assertIn("INFERENCE_TOKEN=\"$MAG_TOKEN\"", readme)
+        self.assertIn("INFERENCE_MODEL='gpt-5.6-sol@openai'", readme)
+        self.assertIn("INFERENCE_MAX_TOKENS='8192'", readme)
+        self.assertIn("-p 127.0.0.1:8787:8787", readme)
+        self.assertNotIn("INFERENCE_TOKEN='YOUR_MAG_TOKEN'", readme)
+
 
 if __name__ == "__main__":
     unittest.main()

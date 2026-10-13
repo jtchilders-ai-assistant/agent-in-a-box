@@ -336,6 +336,36 @@ apptainer run --containall --no-mount cwd \
   alcf-agent.sif
 ```
 
+### Example: AmSC Model Access Gateway (MAG)
+
+MAG is one example of the generic OpenAI-compatible mode; it does not require
+MAG-specific code. Obtain a MAG bearer token through your organization's normal
+credential process, keep it out of shell history and the repository, and expose
+it to the command through an environment variable:
+
+```bash
+read -rsp 'MAG bearer token: ' MAG_TOKEN && printf '\n'
+export MAG_TOKEN
+
+docker run -it --rm \
+  -p 127.0.0.1:8787:8787 \
+  -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
+  -e INFERENCE_URL='https://mag.genesis.americansciencecloud.org/v1' \
+  -e INFERENCE_TOKEN="$MAG_TOKEN" \
+  -e INFERENCE_MODEL='gpt-5.6-sol@openai' \
+  -e INFERENCE_MAX_TOKENS='8192' \
+  -v alcf-agent-home:/opt/data \
+  ghcr.io/jtchilders-ai-assistant/alcf-agent:latest
+
+unset MAG_TOKEN
+```
+
+The model must be present in MAG's live `/models` catalog and report at least a
+64,000-token context window. If you choose a catalog model without recognized
+context metadata, provide an explicit `INFERENCE_CONTEXT_LENGTHS` override as
+described above. The generic-mode credential-persistence warning below applies
+to MAG too.
+
 At startup the container prints an ENABLED/DISABLED report for every catalog
 model (a model is disabled if its context window is missing or below 64000;
 model *names* are never used to infer a window — only `max_model_len`,
