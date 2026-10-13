@@ -676,6 +676,11 @@ src, dst = sys.argv[1], sys.argv[2]
 open(dst, "w").write(string.Template(open(src).read()).safe_substitute(os.environ))
 PYEOF
 
-log "Web chat ready at http://localhost:${PUB_PORT}"
-log "Login: user=${ALCF_DASHBOARD_USER}  (password you set via ALCF_DASHBOARD_PASSWORD)"
+# Make the user-facing URL visually dominant; Hermes and Caddy emit additional
+# startup lines immediately afterward, so a single ordinary log line is easy to
+# miss in terminal output.
+log "================================================================"
+log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"
+log "  LOGIN: user=${ALCF_DASHBOARD_USER}  (use your dashboard password)"
+log "================================================================"
 exec caddy run --config /opt/data/Caddyfile --adapter caddyfile

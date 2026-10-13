@@ -465,6 +465,16 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         self.assertIn("-p 127.0.0.1:8787:8787", readme)
         self.assertNotIn("INFERENCE_TOKEN='YOUR_MAG_TOKEN'", readme)
 
+    def test_dashboard_ready_banner_makes_public_url_prominent(self):
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn('log "================================================================"', body)
+        self.assertIn('log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"', body)
+        self.assertIn('log "================================================================"', body)
+        self.assertLess(
+            body.index('log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"'),
+            body.index("exec caddy run"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
