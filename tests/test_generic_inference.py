@@ -442,12 +442,18 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("scripts/generic_inference.py", dockerfile)
 
-    def test_feature_branch_builds_multiarch_test_tag_without_latest(self):
+    def test_main_release_builds_multiarch_latest_without_temporary_feature_trigger(self):
         workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
-        self.assertIn("feat/generic-inference", workflow)
+        self.assertNotIn("feat/generic-inference", workflow)
+        self.assertIn("branches: [main]", workflow)
         self.assertIn("linux/amd64,linux/arm64", workflow)
-        self.assertIn("type=ref,event=branch", workflow)
+        self.assertNotIn("type=ref,event=branch", workflow)
         self.assertIn("type=raw,value=latest,enable={{is_default_branch}}", workflow)
+
+    def test_generic_docker_example_uses_the_default_release_tag(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn("alcf-agent:feat-generic-inference", readme)
+        self.assertIn("alcf-agent:latest", readme)
 
 
 if __name__ == "__main__":

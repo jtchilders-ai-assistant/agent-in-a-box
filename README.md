@@ -317,7 +317,7 @@ docker run -it --rm \
   -e INFERENCE_TOKEN='...' \
   -e INFERENCE_MODEL='my-model' \
   -v alcf-agent-home:/opt/data \
-  ghcr.io/jtchilders-ai-assistant/alcf-agent:feat-generic-inference
+  ghcr.io/jtchilders-ai-assistant/alcf-agent:latest
 ```
 
 Podman accepts the identical options (`podman run -it --rm \ -p
