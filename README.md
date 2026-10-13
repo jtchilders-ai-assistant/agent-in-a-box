@@ -36,7 +36,7 @@ node and do not give the container SSH access.
 ## Quick start with Docker
 
 ```bash
-docker run -it --rm \
+docker run --pull=always -it --rm \
   -p 127.0.0.1:8787:8787 \
   -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
   -v alcf-agent-home:/opt/data \
@@ -178,7 +178,7 @@ a **dedicated** directory (never your whole home):
 
 ```bash
 # creates/uses ~/alcf-work on your host, visible to the agent at /work
-docker run -it --rm -p 127.0.0.1:8787:8787 \
+docker run --pull=always -it --rm -p 127.0.0.1:8787:8787 \
   -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
   -v alcf-agent-home:/opt/data \
   -v "$HOME/alcf-work:/work" \
@@ -310,7 +310,7 @@ Required settings (any partial combination fails closed with exit 78):
 Docker:
 
 ```bash
-docker run -it --rm \
+docker run --pull=always -it --rm \
   -p 127.0.0.1:8787:8787 \
   -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
   -e INFERENCE_URL='https://my-vllm.example.com/v1' \
@@ -347,7 +347,7 @@ it to the command through an environment variable:
 read -rsp 'MAG bearer token: ' MAG_TOKEN && printf '\n'
 export MAG_TOKEN
 
-docker run -it --rm \
+docker run --pull=always -it --rm \
   -p 127.0.0.1:8787:8787 \
   -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
   -e INFERENCE_URL='https://mag.genesis.americansciencecloud.org/v1' \
