@@ -475,6 +475,17 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
             body.index("exec caddy run"),
         )
 
+    def test_readme_latest_docker_examples_force_a_fresh_pull(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        latest_runs = re.findall(
+            r"docker run (?P<options>.*?)ghcr\.io/jtchilders-ai-assistant/alcf-agent:latest",
+            readme,
+            flags=re.DOTALL,
+        )
+        self.assertGreaterEqual(len(latest_runs), 4)
+        for options in latest_runs:
+            self.assertIn("--pull=always", options)
+
 
 if __name__ == "__main__":
     unittest.main()
