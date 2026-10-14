@@ -3,7 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 from agent_box_config import (
     ConfigError, SCHEMA_VERSION,
     load_registry, resolve_configuration, parse_env,
-    parse_product_config, atomic_yaml_write,
+    parse_product_config, atomic_yaml_write, load_product_config,
 )
 
 WORK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -255,6 +255,61 @@ class ConfigTests(unittest.TestCase):
                 load_registry(path)
         finally:
             os.unlink(path)
+
+class LoadProductConfigFileTests(unittest.TestCase):
+    """Tests for the load_product_config file loader helper (Task 2 review)."""
+
+    def setUp(self):
+        self.registry, _ = load_registry(REGISTRY_PATH)
+
+    def test_load_product_config_reads_valid_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.yaml")
+            atomic_yaml_write(path, {
+                "schema_version": 1,
+                "facilities": {
+                    "alcf": {"enabled": True, "iri": {"version": "v1"}},
+                    "nersc": {"enabled": False, "iri": {"version": "v2"}},
+                },
+            })
+            data = load_product_config(path, registry=self.registry)
+            self.assertEqual(data["schema_version"], 1)
+            self.assertTrue(data["facilities"]["alcf"]["enabled"])
+            self.assertEqual(data["facilities"]["nersc"]["iri"]["version"], "v2")
+
+    def test_load_product_config_missing_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "absent.yaml")
+            with self.assertRaises(ConfigError) as raised:
+                load_product_config(path, registry=self.registry)
+            self.assertEqual(raised.exception.exit_code, 78)
+
+    def test_load_product_config_malformed_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "bad.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("schema_version: 2\nfacilities: {}\n")
+            with self.assertRaises(ConfigError) as raised:
+                load_product_config(path, registry=self.registry)
+            self.assertEqual(raised.exception.exit_code, 78)
+
+    def test_load_product_config_unknown_facility_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "unknown.yaml")
+            atomic_yaml_write(path, {
+                "schema_version": 1,
+                "facilities": {
+                    "not-a-facility": {"enabled": True},
+                },
+            })
+            with self.assertRaises(ConfigError) as raised:
+                load_product_config(path, registry=self.registry)
+            self.assertEqual(raised.exception.exit_code, 78)
+
+    def test_load_product_config_rejects_empty_path(self):
+        with self.assertRaises(ConfigError):
+            load_product_config("", registry=self.registry)
+
 
 if __name__ == '__main__':
     unittest.main()

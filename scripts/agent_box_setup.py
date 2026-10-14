@@ -33,6 +33,7 @@ import sys
 from agent_box_config import (
     ConfigError,
     atomic_yaml_write,
+    load_product_config,
     load_registry,
     parse_env,
     resolve_configuration,
@@ -41,10 +42,12 @@ from agent_box_config import (
 # Relative path of the persistent product configuration under the supplied home.
 LEGACY_CONFIG_RELATIVE_PATH = os.path.join("agent-box", "config.yaml")
 
-# Conventional location where a future task may persist an ESnet AMSC token
-# file.  This module only ever checks its existence and permission bits — it
-# never opens or reads it.
-PERSISTED_AMSC_TOKEN_RELATIVE_PATH = os.path.join("agent-box", "esnet-amsc-token")
+# Approved-design location for a persisted ESnet AMSC token file, relative to
+# the supplied home.  This module only ever stats this path (never opens or
+# reads it); actual credential capture is Task 3.
+PERSISTED_AMSC_TOKEN_RELATIVE_PATH = os.path.join(
+    "agent-box", "credentials", "esnet", "amsc-token"
+)
 
 # Environment variable naming an operator-supplied AMSC token file.
 AMSC_TOKEN_FILE_ENV = "ESNET_AMSC_TOKEN_FILE"
@@ -104,22 +107,24 @@ def _facility_requires_amsc(registry, facility):
 
 
 def _is_safe_token_path(path):
-    """Existence/stat-only safety check.  The file is never opened or read.
+    """Existence/stat-only safety check via lstat — never follows symlinks.
 
-    Safe means: absolute, regular file, owned by the current user, and not
-    readable or writable by group or others.
+    Safe means: absolute, an *actual* regular file (lstat, so a symlink —
+    even to a safe-looking target — is rejected), owned by the current
+    user, and not readable or writable by group or others.  The file is
+    never opened or read.
     """
     if not isinstance(path, str) or not path:
         return False
     if not os.path.isabs(path):
         return False
     try:
-        st = os.stat(path)
+        st = os.lstat(path)
     except OSError:
         return False
     import stat as _stat
 
-    if not _stat.S_ISREG(st.st_mode):
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
         return False
     if st.st_uid != os.geteuid():
         return False
@@ -265,38 +270,70 @@ def _write_product_config(home, config):
     return config_path
 
 
-def _legacy_alcf_detected(home):
-    """Existence-only detection of a prior ALCF install. Never reads content."""
+def _legacy_token_evidence(home):
+    """Existence-only detection of a legacy ALCF install. Never reads content."""
     for relative in _LEGACY_CANDIDATE_RELATIVE_PATHS:
         if os.path.exists(os.path.join(home, relative)):
             return True
-    if os.path.exists(os.path.join(home, LEGACY_CONFIG_RELATIVE_PATH)):
-        return True
     return False
 
 
 def run_first_setup(home, registry, input_stream, output_stream, is_tty, environ):
     """Run first-run setup: legacy migration, non-interactive default, or wizard.
 
+    Facility iteration and wizard numbering follow the shipped registry's
+    insertion order (config/facilities.yaml), which is the documented
+    wizard display order.
+
     Writes nothing unless the outcome is an applied configuration.
     """
-    if is_tty and _legacy_alcf_detected(home):
-        # Conservative migration: a legacy ALCF install is present.  Keep the
-        # runtime's own resolution (ALCF enabled by default) and touch
-        # nothing — no prompting, no rewriting of legacy state.
-        output_stream.write(
-            "Existing ALCF configuration detected; keeping current settings.\n"
-        )
+    config_path = os.path.join(home, LEGACY_CONFIG_RELATIVE_PATH)
+    if os.path.exists(config_path) or _legacy_token_evidence(home):
+        # Migration path — no prompting in either sub-case.
+        persisted_facilities = None
+        configuration = None
+        status = "migrated"
+        if os.path.exists(config_path):
+            # Product config already exists: read and parse it so the
+            # operator's persisted enabled/version state survives migration.
+            parsed = load_product_config(config_path, registry=registry)
+            persisted_facilities = parsed["facilities"]
+            configuration = parsed
+            output_stream.write(
+                "Existing product configuration detected; preserving "
+                "persisted facility state.\n"
+            )
+        else:
+            # Only legacy token evidence exists: durably seed the
+            # ALCF-default product config (atomic write, private paths).
+            output_stream.write(
+                "Existing ALCF install detected; writing ALCF-default "
+                "product configuration.\n"
+            )
+            default_selected = ["alcf"]
+            versions = {
+                f: registry[f]["default_version"] for f in default_selected
+            }
+            configuration = _build_product_config(
+                registry, default_selected, versions
+            )
+            _write_product_config(home, configuration)
+            persisted_facilities = configuration["facilities"]
+        # Environment overrides stay highest precedence during migration:
+        # resolve_configuration applies AGENT_BOX_* on top of persisted state.
         return SetupResult(
-            status="migrated",
-            configuration=None,
-            resolved=resolve_configuration(registry, persisted=None, environ=environ),
+            status=status,
+            configuration=configuration,
+            resolved=resolve_configuration(
+                registry, persisted=persisted_facilities, environ=environ
+            ),
         )
 
-    if not is_tty:
-        # Non-interactive: ALCF-only default, no override unless
-        # AGENT_BOX_FACILITIES is explicitly provided.
-        env_facilities = environ.get("AGENT_BOX_FACILITIES")
+    env_facilities = environ.get("AGENT_BOX_FACILITIES")
+    if env_facilities is not None or not is_tty:
+        # Explicit selection (AGENT_BOX_FACILITIES) is honored with or
+        # without a TTY and skips the wizard without reading input.
+        # Non-interactive with no explicit selection: ALCF-only default.
         if env_facilities is not None:
             selected = list(parse_env(env_facilities, registry=registry))
         else:
@@ -353,12 +390,23 @@ def main(argv=None):
     exit code (77 for missing ESnet credentials, 78 otherwise) on failure.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
-    home = os.environ.get("HOME", "")
+    home = None
     if argv and argv[0] == "--home":
         if len(argv) < 2:
             print("--home requires a path", file=sys.stderr)
             return 78
         home = argv[1]
+    else:
+        # Fail closed: no HOME and no --home means nowhere safe to read or
+        # write persistent configuration.
+        home = os.environ.get("HOME")
+        if not home:
+            print(
+                "setup error: HOME is not set and no --home was supplied; "
+                "refusing to run",
+                file=sys.stderr,
+            )
+            return 78
     registry_path = os.environ.get(
         "AGENT_BOX_REGISTRY",
         os.path.join(os.path.dirname(os.path.abspath(__file__)),

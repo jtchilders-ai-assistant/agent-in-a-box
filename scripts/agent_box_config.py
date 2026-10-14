@@ -227,6 +227,22 @@ def parse_product_config(yaml_text, registry=None, schema_version=1):
     return data
 
 
+def load_product_config(path, registry=None):
+    """Load and validate a persisted product-config file.
+
+    Fails closed (exit 78) when the file is missing or malformed; content
+    is parsed strictly through parse_product_config.  This helper never
+    touches credential material — it reads only the product config.
+    """
+    if not isinstance(path, str) or not path:
+        raise ConfigError("product config path must be a non-empty string", 78)
+    if not os.path.isfile(path):
+        raise ConfigError(f"product config missing: {path}", 78)
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    return parse_product_config(text, registry=registry)
+
+
 def atomic_yaml_write(path, data):
     directory = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=directory)

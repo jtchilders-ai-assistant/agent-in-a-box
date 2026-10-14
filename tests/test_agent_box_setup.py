@@ -122,6 +122,21 @@ class FirstRunWizardTests(unittest.TestCase):
             self.assertTrue(result.resolved["alcf"]["enabled"])
             self.assertTrue(result.resolved["nersc"]["enabled"])
 
+    def test_explicit_interactive_selection_skips_wizard_and_is_honored(self):
+        with tempfile.TemporaryDirectory() as home:
+            result = run_first_setup(
+                home=home,
+                registry=self.registry,
+                input_stream=io.StringIO("must not be read"),
+                output_stream=io.StringIO(),
+                is_tty=True,
+                environ={"AGENT_BOX_FACILITIES": "nersc"},
+            )
+            self.assertFalse(result.resolved["alcf"]["enabled"])
+            self.assertTrue(result.resolved["nersc"]["enabled"])
+            self.assertFalse(result.configuration["facilities"]["alcf"]["enabled"])
+            self.assertTrue(result.configuration["facilities"]["nersc"]["enabled"])
+
     def test_noninteractive_esnet_without_safe_token_fails_77(self):
         with tempfile.TemporaryDirectory() as home:
             with self.assertRaises(ConfigError) as raised:
