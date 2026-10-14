@@ -88,9 +88,10 @@ class FirstRunWizardTests(unittest.TestCase):
             self.assertEqual(result.configuration["schema_version"], 1)
             self.assertTrue(result.configuration["facilities"]["alcf"]["enabled"])
             self.assertTrue(result.configuration["facilities"]["nersc"]["enabled"])
-            serialized = open(
+            with open(
                 os.path.join(home, LEGACY_CONFIG_RELATIVE_PATH), encoding="utf-8"
-            ).read()
+            ) as handle:
+                serialized = handle.read()
             self.assertNotIn("token", serialized.lower())
             self.assertNotIn("password", serialized.lower())
 
