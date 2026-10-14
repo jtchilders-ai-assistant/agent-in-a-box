@@ -15,13 +15,18 @@ and safe in non-interactive containers.  Rules enforced here:
   ``atomic_yaml_write``) at ``<home>/agent-box/config.yaml`` with the
   parent directory held at mode 0700 and the file at 0600.  It contains
   no secrets.
-- Interactive ESnet (amsc-pat) selection with no safe token already
-  available prompts exactly once through a hidden reader (Task 3
-  ``agent_box_credentials``), validates the candidate independently for
-  every selected site/version via an injected validator *before*
-  persisting anything, and fails closed with ConfigError exit code 77
-  — persisting nothing, surfacing no secret — when validation fails, the
-  validator raises, or no validator callback is supplied.
+- Interactive ESnet (amsc-pat) selection never treats filesystem
+  safety as token validity (Task 3 security, I-2): an existing safe
+  persisted or external token is read securely through
+  ``agent_box_credentials`` and validated once per selected
+  site/version through an injected validator before setup may
+  complete; with no safe token available the operator is prompted
+  exactly once through a hidden reader and the new candidate is
+  validated before it is persisted.  A failed validation, a validator
+  exception, or a missing validator fails closed with ConfigError exit
+  code 77 — preserving any existing token, persisting nothing new,
+  writing no configuration, surfacing no secret, and suppressing
+  exception chaining (``from None``) — when it occurs.
 - Non-interactive ESnet selection keeps the Task 2 behavior: it requires
   a *safe* ``ESNET_AMSC_TOKEN_FILE`` or a *safe* persisted token path
   and otherwise fails closed with ConfigError exit code 77.  It never
@@ -47,8 +52,13 @@ from agent_box_config import (
 )
 from agent_box_credentials import (
     CredentialError,
+    capture_amsc_token,
     prompt_amsc_token,
+    read_amsc_token,
+    read_external_token_file,
     reconfigure_amsc_token,
+    remove_amsc_token,
+    token_status,
     write_amsc_token,
 )
 
@@ -181,81 +191,120 @@ def _esnet_selections(registry, selected, versions):
     ]
 
 
-def _capture_and_validate_amsc_token(home, selections, hidden_reader,
-                                     amsc_validator, output_stream):
-    """Interactive ESnet credential flow (Task 3).
+def _validate_amsc_candidate(selections, token, amsc_validator):
+    """Run the injected validator independently per selected profile.
 
-    Prompts exactly once through the hidden reader, then validates the
-    candidate *independently* for every selected (facility, version)
-    BEFORE persisting anything.  A failed validation, a validator
-    exception, or a missing validator fails closed with ConfigError
-    exit code 77, persists nothing, and surfaces no secret.
+    Fails closed with a fixed, secret-free ConfigError exit 77 (context
+    suppressed via ``from None`` so a validator exception carrying the
+    token can never chain into the surfaced error) on a failed
+    validation, a validator exception, or a missing validator.
     """
     if amsc_validator is None:
-        # No network validation client yet and none injected: fail
-        # closed rather than persist an unvalidated credential.
         raise ConfigError(
             "ESnet facility selected but no AMSC token validator is "
-            "available; refusing to store an unvalidated token.",
+            "available; refusing to complete setup with an unvalidated "
+            "token.",
             77,
-        )
-    output_stream.write(
-        "An ESnet facility was selected. You will be asked for your "
-        "AmSC token once; it is validated before it is stored.\n"
-    )
-    try:
-        token = prompt_amsc_token(hidden_reader=hidden_reader,
-                                  output_stream=output_stream)
-    except (CredentialError, EOFError, KeyboardInterrupt):
-        # Never quote the candidate: the message stays secret-free.
-        raise ConfigError(
-            "ESnet AmSC token capture was cancelled or produced an empty "
-            "token; nothing was stored.",
-            77,
-        )
+        ) from None
     for facility, version in selections:
         try:
             result = amsc_validator(facility, version, token)
         except Exception:
-            # Suppress the validator's exception entirely: it could echo
-            # call arguments.  Surface a secret-free failure instead.
             raise ConfigError(
                 "ESnet AmSC token validation failed for %s (IRI version "
                 "%s): the validator raised; nothing was stored."
                 % (facility, version),
                 77,
-            )
+            ) from None
         if not (isinstance(result, dict) and result.get("valid") is True):
             raise ConfigError(
                 "ESnet AmSC token validation failed for %s (IRI version "
                 "%s); nothing was stored." % (facility, version),
                 77,
-            )
-    write_amsc_token(home, token)
-    output_stream.write("ESnet AmSC token validated and stored privately "
-                        "at %s\n"
-                        % os.path.join(home, PERSISTED_AMSC_TOKEN_RELATIVE_PATH))
+            ) from None
+
+
+def _capture_amsc_candidate(hidden_reader, output_stream):
+    """Prompt once through the hidden reader.
+
+    Every ordinary reader exception (EOFError, KeyboardInterrupt,
+    CredentialError, RuntimeError, ...) is converted to the same fixed,
+    secret-free ConfigError exit 77 with the exception context
+    suppressed (``from None``) so neither the message, the chain, nor
+    any output can carry the reader's secret or error text.
+    """
+    output_stream.write(
+        "An ESnet facility was selected. You will be asked for your "
+        "AmSC token once; it is validated before it is stored.\n"
+    )
+    try:
+        return prompt_amsc_token(hidden_reader=hidden_reader,
+                                 output_stream=output_stream)
+    except (Exception, KeyboardInterrupt):
+        raise ConfigError(
+            "ESnet AmSC token capture failed or was cancelled; nothing "
+            "was stored.",
+            77,
+        ) from None
 
 
 def _ensure_amsc_credentials_interactive(home, registry, selected, versions,
                                          environ, hidden_reader,
                                          amsc_validator, output_stream):
-    """Resolve ESnet credentials for the interactive wizard path.
+    """Resolve ESnet credentials for the interactive wizard path (I-2).
 
-    Honors an existing *safe* env/persisted token without re-prompting;
-    otherwise runs the one-prompt validate-then-persist flow.
+    Filesystem safety is never treated as token validity: an existing
+    *safe* external or persisted token is re-read securely through the
+    credential module's no-follow descriptor reads and then passed
+    through the validator exactly once per selected (facility,
+    version) pair before setup may complete.  With no existing safe
+    token the operator is prompted once (hidden reader); the new
+    candidate is likewise validated for every selected profile BEFORE
+    it is persisted.  Any validation failure (or missing validator)
+    aborts setup with exit 77: the existing token (if any) is left
+    untouched, nothing new is persisted, and no product configuration
+    is written.
     """
     selections = _esnet_selections(registry, selected, versions)
     if not selections:
         return
+    token = None
+    source = None
     env_path = environ.get(AMSC_TOKEN_FILE_ENV)
     if env_path is not None and _is_safe_token_path(env_path.strip()):
-        return
-    persisted = os.path.join(home, PERSISTED_AMSC_TOKEN_RELATIVE_PATH)
-    if _is_safe_token_path(persisted):
-        return
-    _capture_and_validate_amsc_token(home, selections, hidden_reader,
-                                     amsc_validator, output_stream)
+        try:
+            token = read_external_token_file(env_path.strip())
+        except CredentialError:
+            raise ConfigError(
+                "ESnet AMSC token file from the environment could not be "
+                "read under the credential safety policy; setup aborted.",
+                77,
+            ) from None
+        source = "external"
+    else:
+        try:
+            token = read_amsc_token(home)
+            source = "persisted"
+        except CredentialError:
+            token = None
+    if token is None:
+        token = _capture_amsc_candidate(hidden_reader, output_stream)
+    _validate_amsc_candidate(selections, token, amsc_validator)
+    if source is None:
+        # New candidate validated for every selected profile: now, and
+        # only now, persist it atomically at the approved path.
+        try:
+            write_amsc_token(home, token)
+        except CredentialError:
+            raise ConfigError(
+                "ESnet AmSC token could not be stored under the "
+                "credential safety policy; setup aborted.",
+                77,
+            ) from None
+        output_stream.write(
+            "ESnet AmSC token validated and stored privately at %s\n"
+            % os.path.join(home, PERSISTED_AMSC_TOKEN_RELATIVE_PATH)
+        )
 
 
 def reconfigure_amsc_credential(home, choice, hidden_reader=None,
@@ -269,6 +318,45 @@ def reconfigure_amsc_credential(home, choice, hidden_reader=None,
     """
     return reconfigure_amsc_token(home, choice, hidden_reader=hidden_reader,
                                   output_stream=output_stream)
+
+
+def reconfigure_amsc_credential_interactive(home, input_stream,
+                                            output_stream,
+                                            hidden_reader=None):
+    """Stream-injected keep/replace/remove reconfiguration prompt.
+
+    Reads the operator's choice from ``input_stream``, then applies it
+    through the credential primitives.  Removal requires an explicit
+    confirmation line; without it the token is kept.  Replacement
+    captures the new token through the hidden reader.  The token
+    content never appears in ``output_stream``.  Returns the resulting
+    ``token_status`` value.
+    """
+    output_stream.write("Stored ESnet AmSC token status: %s\n"
+                        % token_status(home))
+    output_stream.write(
+        "Keep, replace, or remove the stored AmSC token? "
+        "(keep/replace/remove): "
+    )
+    choice = (_read_line(input_stream) or "").strip().lower()
+    if choice == "keep":
+        return token_status(home)
+    if choice == "replace":
+        capture_amsc_token(home, hidden_reader=hidden_reader,
+                           output_stream=output_stream)
+        return token_status(home)
+    if choice == "remove":
+        output_stream.write("Really remove the stored AmSC token? [y/N] ")
+        answer = _read_line(input_stream)
+        if answer is not None and answer.lower() in ("y", "yes"):
+            remove_amsc_token(home)
+            output_stream.write("Stored AmSC token removed.\n")
+        else:
+            output_stream.write("Removal cancelled; token kept.\n")
+        return token_status(home)
+    raise CredentialError(
+        "invalid choice: enter keep, replace, or remove"
+    )
 
 
 def select_facilities(registry, input_stream, output_stream):
@@ -400,10 +488,12 @@ def run_first_setup(home, registry, input_stream, output_stream, is_tty,
     wizard display order.
 
     ``hidden_reader`` and ``amsc_validator`` drive the interactive ESnet
-    credential flow (see ``_capture_and_validate_amsc_token``); the
-    wizard fails closed with exit 77 without a validator.  They are
-    unused on the migration and non-interactive paths, which keep the
-    safe-token-file requirement.
+    credential flow (see ``_ensure_amsc_credentials_interactive``): any
+    usable token — existing persisted, existing external, or freshly
+    captured — is validated once per selected facility/version before
+    setup may complete, and the wizard fails closed with exit 77
+    without a validator.  They are unused on the migration and
+    non-interactive paths, which keep the safe-token-file requirement.
 
     Writes nothing unless the outcome is an applied configuration
     (plus, for a validated interactive ESnet selection, the private

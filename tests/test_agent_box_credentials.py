@@ -119,6 +119,54 @@ class AmscCredentialTests(unittest.TestCase):
             self.assertEqual(token_status(home), "absent")
             self.assertFalse(remove_amsc_token(home))
 
+    def test_reconfiguration_wizard_keep_replace_remove(self):
+        from agent_box_setup import reconfigure_amsc_credential_interactive
+
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, "old-token")
+            output = io.StringIO()
+            status = reconfigure_amsc_credential_interactive(
+                home,
+                input_stream=io.StringIO("keep\n"),
+                output_stream=output,
+                hidden_reader=lambda _: self.fail("keep must not prompt"),
+            )
+            self.assertEqual(status, "present")
+            self.assertEqual(read_amsc_token(home), "old-token")
+            self.assertNotIn("old-token", output.getvalue())
+
+            output = io.StringIO()
+            status = reconfigure_amsc_credential_interactive(
+                home,
+                input_stream=io.StringIO("replace\n"),
+                output_stream=output,
+                hidden_reader=lambda _: "new-token",
+            )
+            self.assertEqual(status, "present")
+            self.assertEqual(read_amsc_token(home), "new-token")
+            self.assertNotIn("new-token", output.getvalue())
+
+            status = reconfigure_amsc_credential_interactive(
+                home,
+                input_stream=io.StringIO("remove\ny\n"),
+                output_stream=io.StringIO(),
+                hidden_reader=lambda _: self.fail("remove must not prompt for token"),
+            )
+            self.assertEqual(status, "absent")
+
+    def test_reconfiguration_remove_requires_confirmation(self):
+        from agent_box_setup import reconfigure_amsc_credential_interactive
+
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, SECRET)
+            status = reconfigure_amsc_credential_interactive(
+                home,
+                input_stream=io.StringIO("remove\nn\n"),
+                output_stream=io.StringIO(),
+            )
+            self.assertEqual(status, "present")
+            self.assertEqual(read_amsc_token(home), SECRET)
+
     def test_esnet_selection_prompts_once_for_east_and_west(self):
         with tempfile.TemporaryDirectory() as home:
             output = io.StringIO()
