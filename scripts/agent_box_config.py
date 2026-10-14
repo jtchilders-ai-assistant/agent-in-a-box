@@ -126,8 +126,16 @@ def resolve_configuration(registry, persisted=None, environ=None):
                     )
             else:
                 version = persisted_spec.get("version")
+                if version is not None and not isinstance(version, str):
+                    raise ConfigError(
+                        f"version must be string for {fac}, got {type(version).__name__}", 78
+                    )
         else:
             version = persisted_spec.get("version")
+            if version is not None and not isinstance(version, str):
+                raise ConfigError(
+                    f"version must be string for {fac}, got {type(version).__name__}", 78
+                )
         if version == "auto":
             version = reg.get("default_version")
         elif isinstance(version, str):

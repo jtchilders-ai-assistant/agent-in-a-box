@@ -210,6 +210,16 @@ class ConfigTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.exit_code, 78)
 
+    def test_resolve_rejects_non_string_flat_legacy_version(self):
+        registry, _ = load_registry(REGISTRY_PATH)
+        with self.assertRaises(ConfigError) as raised:
+            resolve_configuration(
+                registry,
+                persisted={"nersc": {"enabled": True, "version": 2}},
+                environ={},
+            )
+        self.assertEqual(raised.exception.exit_code, 78)
+
     def test_resolve_rejects_non_mapping_facility_entry(self):
         registry, _ = load_registry(REGISTRY_PATH)
         with self.assertRaises(ConfigError) as raised:
