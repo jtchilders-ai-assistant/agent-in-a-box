@@ -186,5 +186,65 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("replace", events)
             self.assertIn("fsync", events[events.index("replace") + 1 :])
 
+    def test_resolve_reads_documented_nested_iri_version(self):
+        registry, _ = load_registry(REGISTRY_PATH)
+        persisted = parse_product_config(
+            "schema_version: 1\n"
+            "facilities:\n"
+            "  nersc:\n"
+            "    enabled: true\n"
+            "    iri:\n"
+            "      version: v1\n",
+            registry=registry,
+        )["facilities"]
+        resolved = resolve_configuration(registry, persisted=persisted, environ={})
+        self.assertEqual(resolved["nersc"]["version"], "v1")
+
+    def test_resolve_rejects_non_string_nested_version(self):
+        registry, _ = load_registry(REGISTRY_PATH)
+        with self.assertRaises(ConfigError) as raised:
+            resolve_configuration(
+                registry,
+                persisted={"nersc": {"enabled": True, "iri": {"version": 2}}},
+                environ={},
+            )
+        self.assertEqual(raised.exception.exit_code, 78)
+
+    def test_resolve_rejects_non_mapping_facility_entry(self):
+        registry, _ = load_registry(REGISTRY_PATH)
+        with self.assertRaises(ConfigError) as raised:
+            resolve_configuration(
+                registry,
+                persisted={"nersc": "enabled"},
+                environ={},
+            )
+        self.assertEqual(raised.exception.exit_code, 78)
+
+    def test_registry_rejects_non_string_facility_key(self):
+        document = {
+            "schema_version": 1,
+            "facilities": {
+                7: {
+                    "iri": {
+                        "default_version": "v1",
+                        "versions": {
+                            "v1": {
+                                "base_url": "https://example.test/api/v1",
+                                "auth_provider": "test",
+                            }
+                        },
+                    }
+                }
+            },
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+            yaml.safe_dump(document, handle)
+            path = handle.name
+        try:
+            with self.assertRaises(ConfigError):
+                load_registry(path)
+        finally:
+            os.unlink(path)
+
 if __name__ == '__main__':
     unittest.main()

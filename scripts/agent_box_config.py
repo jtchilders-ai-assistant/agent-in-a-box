@@ -34,6 +34,8 @@ def load_registry(path):
         raise ConfigError("registry facilities must be a non-empty mapping", 78)
     registry = {}
     for fac, entry in facilities.items():
+        if not isinstance(fac, str) or not fac:
+            raise ConfigError("facility key must be a non-empty string", 78)
         if not isinstance(entry, dict):
             raise ConfigError(f"bad registry entry shape for {fac}", 78)
         iri = entry.get("iri")
@@ -93,6 +95,8 @@ def resolve_configuration(registry, persisted=None, environ=None):
         persisted_spec = persisted.get(fac) if isinstance(persisted, dict) else {}
         if persisted_spec is None:
             persisted_spec = {}
+        if not isinstance(persisted_spec, dict):
+            raise ConfigError(f"persisted entry must be mapping for {fac}, got {type(persisted_spec).__name__}", 78)
         # No boolean coercion: only accept actual bool
         enabled_raw = persisted_spec.get("enabled")
         if isinstance(enabled_raw, bool):
@@ -107,7 +111,23 @@ def resolve_configuration(registry, persisted=None, environ=None):
         else:
             if fac in enabled_set:
                 enabled = True
-        version = persisted_spec.get("version")
+        # Documented nested form: facilities.<facility>.iri.version wins;
+        # flat version is retained only as backward compatibility when the
+        # nested version is absent.
+        iri_spec = persisted_spec.get("iri")
+        if iri_spec is not None:
+            if not isinstance(iri_spec, dict):
+                raise ConfigError(f"iri must be mapping for {fac}", 78)
+            if "version" in iri_spec:
+                version = iri_spec["version"]
+                if not isinstance(version, str):
+                    raise ConfigError(
+                        f"iri.version must be string for {fac}, got {type(version).__name__}", 78
+                    )
+            else:
+                version = persisted_spec.get("version")
+        else:
+            version = persisted_spec.get("version")
         if version == "auto":
             version = reg.get("default_version")
         elif isinstance(version, str):
