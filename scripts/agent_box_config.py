@@ -40,10 +40,12 @@ def load_registry(path):
         if not isinstance(iri, dict):
             raise ConfigError(f"bad iri for {fac}", 78)
         versions = iri.get("versions")
-        if not isinstance(versions, dict):
+        if not isinstance(versions, dict) or not versions:
             raise ConfigError(f"versions must be mapping for {fac}", 78)
         default_version = iri.get("default_version")
-        if default_version is not None and not isinstance(default_version, str):
+        if default_version is None:
+            raise ConfigError(f"missing default_version for {fac}", 78)
+        if not isinstance(default_version, str):
             raise ConfigError(f"default_version must be string for {fac}", 78)
         if default_version is not None and default_version not in versions:
             raise ConfigError(f"default_version {default_version} not in versions for {fac}", 78)
@@ -79,7 +81,9 @@ def resolve_configuration(registry, persisted=None, environ=None):
     env_facilities = environ.get("AGENT_BOX_FACILITIES")
     enabled_set = set()
     if env_facilities is not None:
-        enabled_set = set(p.strip() for p in env_facilities.split(",") if p.strip())
+        # Use parse_env for duplicate awareness and unknown rejection
+        parsed_env = parse_env(env_facilities, registry=registry)
+        enabled_set = set(parsed_env.keys())
         for p in enabled_set:
             if p not in registry:
                 raise ConfigError(f"unknown facility in AGENT_BOX_FACILITIES: {p}", 78)
@@ -97,9 +101,18 @@ def resolve_configuration(registry, persisted=None, environ=None):
             enabled = defaults.get(fac, {}).get("enabled", False)
         else:
             raise ConfigError(f"enabled must be bool for {fac}, got {type(enabled_raw).__name__}", 78)
-        if fac in enabled_set:
-            enabled = True
+        # AGENT_BOX_FACILITIES defines exact enabled set
+        if env_facilities is not None:
+            enabled = fac in enabled_set
+        else:
+            if fac in enabled_set:
+                enabled = True
         version = persisted_spec.get("version")
+        if version == "auto":
+            version = reg.get("default_version")
+        elif isinstance(version, str):
+            if version not in reg.get("versions", {}):
+                raise ConfigError(f"unsupported version {version} for {fac}", 78)
         if not isinstance(version, str):
             version = defaults.get(fac, {}).get("version")
         # Version env overrides
@@ -144,7 +157,7 @@ def parse_env(env_str, registry=None):
     return result
 
 
-def parse_product_config(yaml_text, schema_version=1):
+def parse_product_config(yaml_text, registry=None, schema_version=1):
     if schema_version != 1:
         raise ConfigError(f"unsupported schema_version: {schema_version}", 78)
     try:
@@ -172,6 +185,17 @@ def parse_product_config(yaml_text, schema_version=1):
         version = spec.get("version")
         if version is not None and not isinstance(version, str):
             raise ConfigError(f"version must be string for {fac}", 78)
+        # Legacy top-level version support
+        top_version = spec.get("version") if not isinstance(spec.get("iri"), dict) else None
+        # Optional iri mapping validation
+        iri_spec = spec.get("iri")
+        if iri_spec is not None:
+            if not isinstance(iri_spec, dict):
+                raise ConfigError(f"iri must be mapping for {fac}", 78)
+            if "version" in iri_spec and not isinstance(iri_spec["version"], str):
+                raise ConfigError(f"iri.version must be string for {fac}", 78)
+        if registry is not None and fac not in registry:
+            raise ConfigError(f"unknown facility: {fac}", 78)
     return data
 
 
@@ -180,10 +204,18 @@ def atomic_yaml_write(path, data):
     fd, tmp_path = tempfile.mkstemp(dir=directory)
     try:
         os.fchmod(fd, 0o600)
-        with open(fd, "w", encoding="utf-8", closefd=False) as handle:
+        handle = open(fd, "w", encoding="utf-8", closefd=False)
+        try:
             yaml.safe_dump(data, handle, default_flow_style=False)
             handle.flush()
             os.fsync(handle.fileno())
+        finally:
+            handle.close()
+            # Also close the underlying fd since closefd=False
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -192,6 +224,7 @@ def atomic_yaml_write(path, data):
         raise
     try:
         os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
         dir_fd = None
         if hasattr(os, "O_DIRECTORY"):
             dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -202,7 +235,6 @@ def atomic_yaml_write(path, data):
         finally:
             if dir_fd is not None:
                 os.close(dir_fd)
-        os.replace(tmp_path, path)
         mode = os.stat(path).st_mode & 0o777
         if mode != 0o600:
             os.chmod(path, 0o600)
