@@ -163,6 +163,30 @@ class SetupReviewRegressionTests(unittest.TestCase):
             self.assertNotIn("password", text)
             self.assertEqual(stat.S_IMODE(os.stat(config_path).st_mode), 0o600)
 
+    def test_management_cli_configure_runs_stream_injected_wizard(self):
+        from agent_box import main as agent_box_main
+
+        with tempfile.TemporaryDirectory() as home:
+            output = io.StringIO()
+            exit_code = agent_box_main(
+                ["configure"],
+                home=home,
+                registry_path=REGISTRY_PATH,
+                input_stream=io.StringIO("1,2\n\ny\n"),
+                output_stream=output,
+                error_stream=io.StringIO(),
+                is_tty=True,
+                environ={},
+            )
+            self.assertEqual(exit_code, 0)
+            config_path = os.path.join(home, LEGACY_CONFIG_RELATIVE_PATH)
+            self.assertTrue(os.path.isfile(config_path))
+            with open(config_path, encoding="utf-8") as handle:
+                serialized = handle.read().lower()
+            self.assertIn("nersc", serialized)
+            self.assertNotIn("token", serialized)
+            self.assertNotIn("password", serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,9 @@
 """agent-box management CLI — inspect and validate the product configuration.
 
-Current commands (first-run configuration lives in the separate
-first-run-setup entry point, agent_box_setup):
+Current commands (first-run configuration logic lives in the separate
+first-run-setup entry point, agent_box_setup, which `configure` delegates to):
 
+    agent-box configure         — run the stream-injected first-run wizard
     agent-box config show       — print the persisted facility configuration
     agent-box config validate   — validate the persisted configuration
 
@@ -26,7 +27,10 @@ from agent_box_config import (
     load_registry,
 )
 
-USAGE = "usage: agent-box config show | agent-box config validate"
+USAGE = (
+    "usage: agent-box configure | agent-box config show "
+    "| agent-box config validate"
+)
 
 
 def _config_show(home, registry_path, output_stream):
@@ -65,17 +69,47 @@ def _config_validate(home, registry_path, output_stream):
     return 0
 
 
-def main(argv, home, registry_path, output_stream, error_stream):
+def main(argv, home, registry_path, output_stream, error_stream,
+         input_stream=None, is_tty=None, environ=None):
     """Entry point for the agent-box management CLI.
 
     Returns a process exit code (0 on success; ConfigError's exit_code —
-    77/78 — on failure).  Never raises ConfigError to callers.
+    77/78 — on failure; 2 on usage errors).  Never raises ConfigError to
+    callers.
+
+    `configure` delegates to the first-run flow in agent_box_setup.  Its
+    interactivity is fully injectable (input_stream/is_tty/environ); when
+    not injected it falls back to sys.stdin, its isatty() state, and
+    os.environ.  `config show`/`config validate` keep their existing API.
     """
     argv = list(argv)
+    if input_stream is None:
+        input_stream = sys.stdin
+    if is_tty is None:
+        is_tty = input_stream.isatty()
+    if environ is None:
+        environ = os.environ
     if not argv or argv[0] in ("-h", "--help"):
         output_stream.write(USAGE + "\n")
         return 0 if argv else 2
     try:
+        if argv[0] == "configure":
+            # First-run wizard (wizard / migration / non-interactive default)
+            # lives in agent_box_setup; import lazily so config subcommands
+            # keep a light import surface.
+            from agent_box_setup import run_first_setup
+
+            registry, _ = load_registry(registry_path)
+            result = run_first_setup(
+                home=home,
+                registry=registry,
+                input_stream=input_stream,
+                output_stream=output_stream,
+                is_tty=is_tty,
+                environ=environ,
+            )
+            output_stream.write("configure status: %s\n" % result.status)
+            return 0
         if argv[0] == "config":
             if len(argv) < 2:
                 error_stream.write(USAGE + "\n")
