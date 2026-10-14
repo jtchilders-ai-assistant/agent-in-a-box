@@ -14,11 +14,18 @@ and safe in non-interactive containers.  Rules enforced here:
 - The product configuration is written atomically (Task 1
   ``atomic_yaml_write``) at ``<home>/agent-box/config.yaml`` with the
   parent directory held at mode 0700 and the file at 0600.  It contains
-  no secrets, and this module never prompts for or stores any token
-  (ESnet AMSC credential capture is Task 3).
-- Selecting an ESnet (amsc-pat) facility without a *safe*
-  ``ESNET_AMSC_TOKEN_FILE`` or a *safe* persisted token path fails closed
-  with ConfigError exit code 77 instead of prompting.
+  no secrets.
+- Interactive ESnet (amsc-pat) selection with no safe token already
+  available prompts exactly once through a hidden reader (Task 3
+  ``agent_box_credentials``), validates the candidate independently for
+  every selected site/version via an injected validator *before*
+  persisting anything, and fails closed with ConfigError exit code 77
+  — persisting nothing, surfacing no secret — when validation fails, the
+  validator raises, or no validator callback is supplied.
+- Non-interactive ESnet selection keeps the Task 2 behavior: it requires
+  a *safe* ``ESNET_AMSC_TOKEN_FILE`` or a *safe* persisted token path
+  and otherwise fails closed with ConfigError exit code 77.  It never
+  prompts.
 - Legacy ALCF detection is existence-only (``os.path.exists`` on known
   candidate paths).  It never opens or reads credential content.
 
@@ -38,13 +45,20 @@ from agent_box_config import (
     parse_env,
     resolve_configuration,
 )
+from agent_box_credentials import (
+    CredentialError,
+    prompt_amsc_token,
+    reconfigure_amsc_token,
+    write_amsc_token,
+)
 
 # Relative path of the persistent product configuration under the supplied home.
 LEGACY_CONFIG_RELATIVE_PATH = os.path.join("agent-box", "config.yaml")
 
 # Approved-design location for a persisted ESnet AMSC token file, relative to
-# the supplied home.  This module only ever stats this path (never opens or
-# reads it); actual credential capture is Task 3.
+# the supplied home.  The wizard only ever stats this path via
+# _is_safe_token_path; reading and writing the token goes through
+# agent_box_credentials (Task 3).
 PERSISTED_AMSC_TOKEN_RELATIVE_PATH = os.path.join(
     "agent-box", "credentials", "esnet", "amsc-token"
 )
@@ -156,6 +170,105 @@ def _require_amsc_credentials(registry, selected, environ, home):
         % (", ".join(esnet_selected), AMSC_TOKEN_FILE_ENV, persisted),
         77,
     )
+
+
+def _esnet_selections(registry, selected, versions):
+    """(facility, version) pairs for selected amsc-pat facilities."""
+    return [
+        (facility, versions[facility])
+        for facility in selected
+        if _facility_requires_amsc(registry, facility)
+    ]
+
+
+def _capture_and_validate_amsc_token(home, selections, hidden_reader,
+                                     amsc_validator, output_stream):
+    """Interactive ESnet credential flow (Task 3).
+
+    Prompts exactly once through the hidden reader, then validates the
+    candidate *independently* for every selected (facility, version)
+    BEFORE persisting anything.  A failed validation, a validator
+    exception, or a missing validator fails closed with ConfigError
+    exit code 77, persists nothing, and surfaces no secret.
+    """
+    if amsc_validator is None:
+        # No network validation client yet and none injected: fail
+        # closed rather than persist an unvalidated credential.
+        raise ConfigError(
+            "ESnet facility selected but no AMSC token validator is "
+            "available; refusing to store an unvalidated token.",
+            77,
+        )
+    output_stream.write(
+        "An ESnet facility was selected. You will be asked for your "
+        "AmSC token once; it is validated before it is stored.\n"
+    )
+    try:
+        token = prompt_amsc_token(hidden_reader=hidden_reader,
+                                  output_stream=output_stream)
+    except (CredentialError, EOFError, KeyboardInterrupt):
+        # Never quote the candidate: the message stays secret-free.
+        raise ConfigError(
+            "ESnet AmSC token capture was cancelled or produced an empty "
+            "token; nothing was stored.",
+            77,
+        )
+    for facility, version in selections:
+        try:
+            result = amsc_validator(facility, version, token)
+        except Exception:
+            # Suppress the validator's exception entirely: it could echo
+            # call arguments.  Surface a secret-free failure instead.
+            raise ConfigError(
+                "ESnet AmSC token validation failed for %s (IRI version "
+                "%s): the validator raised; nothing was stored."
+                % (facility, version),
+                77,
+            )
+        if not (isinstance(result, dict) and result.get("valid") is True):
+            raise ConfigError(
+                "ESnet AmSC token validation failed for %s (IRI version "
+                "%s); nothing was stored." % (facility, version),
+                77,
+            )
+    write_amsc_token(home, token)
+    output_stream.write("ESnet AmSC token validated and stored privately "
+                        "at %s\n"
+                        % os.path.join(home, PERSISTED_AMSC_TOKEN_RELATIVE_PATH))
+
+
+def _ensure_amsc_credentials_interactive(home, registry, selected, versions,
+                                         environ, hidden_reader,
+                                         amsc_validator, output_stream):
+    """Resolve ESnet credentials for the interactive wizard path.
+
+    Honors an existing *safe* env/persisted token without re-prompting;
+    otherwise runs the one-prompt validate-then-persist flow.
+    """
+    selections = _esnet_selections(registry, selected, versions)
+    if not selections:
+        return
+    env_path = environ.get(AMSC_TOKEN_FILE_ENV)
+    if env_path is not None and _is_safe_token_path(env_path.strip()):
+        return
+    persisted = os.path.join(home, PERSISTED_AMSC_TOKEN_RELATIVE_PATH)
+    if _is_safe_token_path(persisted):
+        return
+    _capture_and_validate_amsc_token(home, selections, hidden_reader,
+                                     amsc_validator, output_stream)
+
+
+def reconfigure_amsc_credential(home, choice, hidden_reader=None,
+                                output_stream=None):
+    """Expose keep/replace/remove reconfiguration of a persisted token.
+
+    Thin delegation to ``agent_box_credentials.reconfigure_amsc_token``
+    so a configure flow can drive credential changes without importing
+    the credential module directly.  Returns the resulting
+    ``token_status`` value ('absent' | 'present' | 'unsafe').
+    """
+    return reconfigure_amsc_token(home, choice, hidden_reader=hidden_reader,
+                                  output_stream=output_stream)
 
 
 def select_facilities(registry, input_stream, output_stream):
@@ -278,14 +391,23 @@ def _legacy_token_evidence(home):
     return False
 
 
-def run_first_setup(home, registry, input_stream, output_stream, is_tty, environ):
+def run_first_setup(home, registry, input_stream, output_stream, is_tty,
+                    environ, hidden_reader=None, amsc_validator=None):
     """Run first-run setup: legacy migration, non-interactive default, or wizard.
 
     Facility iteration and wizard numbering follow the shipped registry's
     insertion order (config/facilities.yaml), which is the documented
     wizard display order.
 
-    Writes nothing unless the outcome is an applied configuration.
+    ``hidden_reader`` and ``amsc_validator`` drive the interactive ESnet
+    credential flow (see ``_capture_and_validate_amsc_token``); the
+    wizard fails closed with exit 77 without a validator.  They are
+    unused on the migration and non-interactive paths, which keep the
+    safe-token-file requirement.
+
+    Writes nothing unless the outcome is an applied configuration
+    (plus, for a validated interactive ESnet selection, the private
+    AMSC token file).
     """
     config_path = os.path.join(home, LEGACY_CONFIG_RELATIVE_PATH)
     if os.path.exists(config_path) or _legacy_token_evidence(home):
@@ -362,14 +484,19 @@ def run_first_setup(home, registry, input_stream, output_stream, is_tty, environ
             )
         else:
             output_stream.write("  %s: disabled\n" % _display_name(facility))
-    output_stream.write("No credentials are collected or stored by setup.\n")
     output_stream.write("Apply this configuration? [y/N] ")
     answer = _read_line(input_stream)
     if answer is None or answer.lower() not in ("y", "yes"):
         output_stream.write("Setup cancelled. Nothing was written.\n")
         return SetupResult(status="cancelled", configuration=None, resolved=None)
-    # Post-confirm guard: still fail closed rather than capture credentials.
-    _require_amsc_credentials(registry, selected, environ, home)
+    # Post-confirm credential step: prompts once (hidden), validates per
+    # selected site/version, and fails closed (exit 77) without
+    # persisting anything on failure.  No-op when no ESnet facility is
+    # selected or a safe token is already available.
+    _ensure_amsc_credentials_interactive(
+        home, registry, selected, versions, environ, hidden_reader,
+        amsc_validator, output_stream,
+    )
     config = _build_product_config(registry, selected, versions)
     _write_product_config(home, config)
     output_stream.write("Configuration written to %s\n"
