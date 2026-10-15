@@ -83,16 +83,34 @@ class AmscCredentialTests(unittest.TestCase):
                 with self.assertRaises(CredentialError):
                     read_amsc_token(home)
 
-    def test_failed_atomic_replace_preserves_existing_token_and_cleans_temp(self):
+    def test_failed_publication_preserves_existing_token_and_cleans_temp(self):
         with tempfile.TemporaryDirectory() as home:
+            import agent_box_credentials as credentials
+
             path = write_amsc_token(home, "old-token")
             before = set(os.listdir(os.path.dirname(path)))
-            with mock.patch(
-                "agent_box_credentials.os.replace", side_effect=OSError("injected")
+            real_noreplace = credentials._rename_noreplace_at
+            attempts = {"publish": 0}
+
+            def fail_publication(src_dir_fd, src, dst_dir_fd, dst):
+                # The first temp -> public publish attempt fails (the
+                # Aegis I-1 publication seam); the backup -> public
+                # restore afterwards must run for real.
+                if src.startswith(".amsc-token.") and dst == "amsc-token":
+                    attempts["publish"] += 1
+                    if attempts["publish"] == 1:
+                        raise OSError("injected publication failure")
+                return real_noreplace(src_dir_fd, src, dst_dir_fd, dst)
+
+            with mock.patch.object(
+                credentials, "_rename_noreplace_at", side_effect=fail_publication
             ):
-                with self.assertRaises(OSError):
+                with self.assertRaises(CredentialError):
                     write_amsc_token(home, "new-token")
+            self.assertGreaterEqual(attempts["publish"], 1)
             self.assertEqual(read_amsc_token(home), "old-token")
+            # The restore consumed the backup name and the writer's
+            # temp was released: namespace identical to before.
             self.assertEqual(set(os.listdir(os.path.dirname(path))), before)
 
     def test_capture_uses_hidden_reader_and_never_prints_secret(self):

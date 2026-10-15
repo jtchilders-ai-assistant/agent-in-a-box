@@ -24,18 +24,35 @@ Trust-boundary rules enforced here (Aegis I-1 / I-3 / M-1):
   verification probe can therefore only ever cause a fail-closed
   rejection, never redirect the content actually read.
   ``O_NONBLOCK`` prevents a FIFO from blocking or being consumed.
-- Writes create and replace the leaf entirely relative to the trusted
-  ``esnet`` directory descriptor: an unpredictable temp leaf name
+- Writes create and publish the leaf entirely relative to the trusted
+  ``esnet`` directory descriptor and NEVER overwrite the public leaf
+  (Aegis I-1 write-publication fix): an unpredictable temp leaf name
   (seeded via ``tempfile.mkstemp`` in the system temp dir, whose
   artifact is immediately discarded) is created exclusively with
   ``O_CREAT|O_EXCL`` through ``dir_fd`` — never placed by full-path
   ``tempfile.mkstemp`` into the credential path — written, fchmod 0600,
-  fsynced, and moved with ``os.replace(temp, leaf, src_dir_fd=dir_fd,
-  dst_dir_fd=dir_fd)``; cleanup unlinks through ``dir_fd`` and the
-  trusted descriptor is fsynced.  A parent rename+symlink swap after
-  the anchor cannot redirect the write.  A failed replace preserves
-  the previous token and removes the temp file; the underlying OSError
-  propagates.
+  fsynced, and then published with the SAME atomic NO-REPLACE rename
+  primitive ``_rename_noreplace_at`` used by removal.  There is no
+  ordinary ``os.replace`` on the public leaf: a post-validation
+  substitute or a raced-in reoccupant answers the publish with
+  EEXIST and is left untouched (identity-preserving publication).
+  When a *safe existing* leaf is present it is validated at record
+  time AND re-verified at publish time by dev/inode identity, then
+  moved atomically no-replace to a random private backup name, its
+  moved-inode identity re-verified through the backup name, and only
+  then is the temp published onto the now-absent public name.  A
+  source-swap mismatch restores the foreign object under its public
+  name via no-replace (EEXIST on a reoccupant leaves it in the
+  retained backup) and fails without mutating it.  A publication
+  failure restores the previous token via no-replace while the public
+  name remains absent and never displaces a reoccupant.  The
+  predecessor's secret bytes are destroyed only THROUGH ITS VERIFIED
+  DESCRIPTOR (ftruncate + fsync) AFTER the new publication is durable
+  (directory fsync); the empty backup name is retained (unlinking a
+  mutable name is the exact race this eliminates).  Cleanup releases
+  the writer's own temp only after an identity check through
+  ``dir_fd``.  A parent rename+symlink swap after the anchor cannot
+  redirect the write.
 - ``remove_amsc_token`` (M-1 / Aegis IMP-01 + IMP-02) performs NO
   unlink and NO ordinary rename at all.  The verified public leaf is
   moved to a random tombstone name with the platform's ATOMIC
@@ -573,26 +590,293 @@ def token_status(home):
 # Public API — write (atomic, hierarchy-trusted, unsafe-leaf rejection)
 # ---------------------------------------------------------------------------
 
-def _reject_existing_unsafe_leaf(dir_fd, leaf_name):
-    """Reject an existing leaf before replacement (I-1), via the trusted
-    directory descriptor so the check cannot be fooled by path swaps."""
+def _record_existing_leaf(dir_fd, leaf_name):
+    """Open and verify an existing public leaf *before* publication.
+
+    Returns ``(fd, st)`` for a safe existing token, or ``(None, None)``
+    when the leaf is absent.  An unsafe, unopenable, or identity-
+    unverifiable existing leaf raises CredentialError with the object
+    left completely untouched.  The returned descriptor stays open for
+    the whole write so the predecessor's bytes can later be destroyed
+    THROUGH THE VERIFIED DESCRIPTOR (never through a mutable name).
+    """
     try:
-        st = os.lstat(leaf_name, dir_fd=dir_fd)
+        fd = os.open(
+            leaf_name,
+            os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=dir_fd,
+        )
     except FileNotFoundError:
-        return
+        return None, None
     except OSError:
         raise CredentialError(
-            "existing token could not be inspected; refusing to overwrite"
+            "existing token could not be opened without following "
+            "symlinks; refusing to overwrite"
         )
-    if stat.S_ISLNK(st.st_mode):
+    try:
+        st_fd = os.fstat(fd)
+        if not _token_stat_is_safe(st_fd):
+            raise CredentialError(
+                "existing token is not a regular file owned by the "
+                "current user with private mode; refusing to overwrite"
+            )
+        try:
+            st_anchor = os.lstat(leaf_name, dir_fd=dir_fd)
+        except OSError:
+            raise CredentialError(
+                "existing token identity could not be verified before "
+                "publication; refusing to overwrite"
+            )
+        if not _identity_matches(st_fd, st_anchor):
+            raise CredentialError(
+                "existing token in the trusted directory is not the "
+                "file that was opened; refusing to overwrite"
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st_fd
+
+
+def _release_temp_leaf(dir_fd, temp_name, temp_st):
+    """Release the writer's own temp leaf ONLY if the name still names
+    the verified temp inode (identity-preserving cleanup).
+
+    A substitute planted at the unpredictable temp name by a same-UID
+    racer is identity-mismatched and is left untouched — cleanup never
+    destroys an object this operation did not verify.
+    """
+    if temp_st is None:
+        return
+    try:
+        st_now = os.lstat(temp_name, dir_fd=dir_fd)
+    except OSError:
+        return
+    if not _identity_matches(temp_st, st_now):
+        return
+    try:
+        os.unlink(temp_name, dir_fd=dir_fd)
+    except OSError:
+        pass
+
+
+def _restore_backup_no_replace(dir_fd, backup_name, leaf_name):
+    """Move a held backup back onto the public name with the atomic
+    NO-REPLACE primitive.
+
+    Returns True when the predecessor was restored.  Returns False when
+    the public name was reoccupied (EEXIST or any other failure): the
+    reoccupant is left untouched and the backup name is RETAINED —
+    restoring or unlinking onto/over a reoccupant is never attempted.
+    """
+    try:
+        _rename_noreplace_at(dir_fd, backup_name, dir_fd, leaf_name)
+    except OSError:
+        return False
+    return True
+
+
+def write_amsc_token(home, token):
+    """Atomically persist ``token`` at the exact approved path.
+
+    The hierarchy below the supplied home is walked/created through
+    no-follow descriptor opens anchored at the supplied home; a
+    symlinked home or unsafe component aborts before any token content
+    touches the filesystem.
+
+    Publication is IDENTITY-PRESERVING and never overwrites the public
+    leaf (Aegis I-1): every namespace move goes through the atomic
+    NO-REPLACE primitive ``_rename_noreplace_at`` — there is no
+    ordinary ``os.replace``/``os.rename``/``os.unlink`` on the public
+    path, so a post-validation substitute or a raced-in reoccupant is
+    answered with EEXIST and survives byte-identical.
+
+    1. An existing leaf, if any, is opened no-follow through the
+       trusted esnet ``dir_fd``, validated from its descriptor and
+       cross-checked against the directory view (unsafe ⇒ reject,
+       untouched).
+    2. The new content is written to an unpredictable exclusive temp
+       leaf in the same trusted directory, fchmod 0600, fsynced.
+    3. Absent destination: the temp is published temp -> public with
+       the atomic no-replace primitive; EEXIST (a racer occupied the
+       name after validation) fails closed with the reoccupant
+       untouched and the writer's temp released only after an identity
+       check.
+    4. Existing safe destination: the verified predecessor is moved
+       public -> random private backup name with the SAME primitive
+       (an object already answering the backup name yields EEXIST and
+       leaves both endpoints untouched); the moved object's dev/inode
+       is re-verified through the backup name.  A source-swap
+       mismatch restores the foreign object under the public name via
+       no-replace — EEXIST on a reoccupant leaves it in the retained
+       backup — and fails without mutating it.  Only once the backup
+       provably holds the verified predecessor is the public name
+       absent, and the temp is published temp -> public via no-replace.
+    5. After publication is durable (directory fsync) the
+       predecessor's secret bytes are destroyed THROUGH ITS VERIFIED
+       DESCRIPTOR (ftruncate + fsync).  The empty backup name is
+       RETAINED — reclaiming a mutable name would require the exact
+       unsafe unlink this design eliminates.
+    6. A publication failure restores the predecessor backup -> public
+       via no-replace while the public name remains absent, and never
+       displaces a reoccupant (the backup is retained instead).  A
+       failed write therefore always preserves the previous token
+       whenever no adversarial reoccupation occurred.
+
+    Exactly one terminal CRLF/LF is removed; an empty result is
+    rejected.  Platforms offering no atomic no-replace rename
+    primitive fail closed — the trust boundary is never weakened to an
+    overwriting rename.  Returns the (display) full path.
+    """
+    normalized = _normalize_token(token)
+    path = amsc_token_path(home)
+    leaf_name = os.path.basename(AMSC_TOKEN_RELATIVE_PATH)
+    if _rename_noreplace_libc() is None:
         raise CredentialError(
-            "existing token is a symlink; refusing to overwrite"
+            "platform offers no atomic no-replace rename primitive; "
+            "refusing to write with an overwriting rename"
         )
-    if not _token_stat_is_safe(st):
+    try:
+        dir_fd = _credential_dir_fd(home, create=True)
+    except FileNotFoundError:
         raise CredentialError(
-            "existing token is not a regular file owned by the current "
-            "user with private mode; refusing to overwrite"
+            "credential home does not exist; refusing to create it"
         )
+    existing_fd = None
+    try:
+        existing_fd, existing_st = _record_existing_leaf(dir_fd, leaf_name)
+        temp_fd, temp_name = _create_temp_leaf_in_dir(dir_fd)
+        fd_owned = True
+        # Identity of the writer's own temp, captured at creation so
+        # cleanup can prove the name still names OUR inode before any
+        # unlink (a substitute planted at the temp name survives).
+        temp_st = None
+        try:
+            temp_st = os.fstat(temp_fd)
+            os.fchmod(temp_fd, _TOKEN_FILE_MODE)
+            with open(temp_fd, "w", encoding="utf-8", closefd=True) as handle:
+                fd_owned = False
+                handle.write(normalized)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            if fd_owned:
+                try:
+                    os.close(temp_fd)
+                except OSError:
+                    pass
+            _release_temp_leaf(dir_fd, temp_name, temp_st)
+            raise
+        if existing_fd is None:
+            # Absent destination: publish temp -> public with the
+            # atomic NO-REPLACE primitive.  A reoccupant planted after
+            # validation answers EEXIST and is left byte-identical.
+            try:
+                _rename_noreplace_at(dir_fd, temp_name, dir_fd, leaf_name)
+            except FileExistsError:
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
+                raise CredentialError(
+                    "public token name was occupied at publication "
+                    "time; refusing to overwrite an unverified object"
+                )
+            except OSError:
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
+                raise CredentialError(
+                    "credential publication could not complete an "
+                    "atomic no-replace move; refusing to overwrite"
+                )
+            os.fsync(dir_fd)
+        else:
+            # Existing safe leaf: move the verified predecessor to a
+            # random private backup name (no-replace), verify the
+            # moved inode, publish onto the now-absent public name,
+            # and only then destroy the predecessor bytes through the
+            # verified descriptor.
+            backup_name = ".amsc-token.%s" % _random_tombstone_suffix()
+            try:
+                _rename_noreplace_at(dir_fd, leaf_name, dir_fd, backup_name)
+            except FileExistsError:
+                raise CredentialError(
+                    "backup destination name already exists; refusing "
+                    "to overwrite an unverified object"
+                )
+            except FileNotFoundError:
+                raise CredentialError(
+                    "existing token vanished before publication; "
+                    "refusing to publish into an unknown namespace state"
+                )
+            except OSError:
+                raise CredentialError(
+                    "existing token could not be moved with an atomic "
+                    "no-replace rename; refusing to overwrite"
+                )
+            # Verify the backup holds exactly the verified predecessor
+            # before the public name is treated as absent.
+            try:
+                verify_fd = os.open(
+                    backup_name,
+                    os.O_RDONLY | os.O_NOFOLLOW
+                    | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=dir_fd,
+                )
+            except OSError:
+                _restore_backup_no_replace(dir_fd, backup_name, leaf_name)
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
+                raise CredentialError(
+                    "moved credential leaf could not be verified; "
+                    "refusing to publish"
+                )
+            try:
+                st_backup = os.fstat(verify_fd)
+            finally:
+                os.close(verify_fd)
+            if not _identity_matches(existing_st, st_backup):
+                # Source-swap race: a foreign object answered the
+                # public name at rename time.  Give it its public name
+                # back with the SAME atomic no-replace primitive —
+                # EEXIST leaves a reoccupant untouched and the foreign
+                # object stays in the retained backup.  No byte of any
+                # unverified object is destroyed.
+                _restore_backup_no_replace(dir_fd, backup_name, leaf_name)
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
+                raise CredentialError(
+                    "renamed credential leaf is not the verified "
+                    "object; refusing to publish"
+                )
+            try:
+                _rename_noreplace_at(dir_fd, temp_name, dir_fd, leaf_name)
+            except OSError:
+                # Publication failed while the public name is absent
+                # (or reoccupied): restore the predecessor via
+                # no-replace only if the public name is free; a
+                # reoccupant is never displaced (backup retained).
+                _restore_backup_no_replace(dir_fd, backup_name, leaf_name)
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
+                raise CredentialError(
+                    "credential publication failed; previous token was "
+                    "restored when the public name remained absent"
+                )
+            # Publication is durable from here on: make the namespace
+            # change durable, then destroy the predecessor's secret
+            # bytes THROUGH ITS VERIFIED DESCRIPTOR.  The empty backup
+            # name is retained by design (see module docstring).
+            os.fsync(dir_fd)
+            try:
+                os.ftruncate(existing_fd, 0)
+                os.fsync(existing_fd)
+            except OSError:
+                raise CredentialError(
+                    "previous credential bytes could not be destroyed "
+                    "through the verified descriptor"
+                )
+    finally:
+        if existing_fd is not None:
+            try:
+                os.close(existing_fd)
+            except OSError:
+                pass
+        os.close(dir_fd)
+    return path
 
 
 def _create_temp_leaf_in_dir(dir_fd):
@@ -618,74 +902,6 @@ def _create_temp_leaf_in_dir(dir_fd):
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
     fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
     return fd, name
-
-
-def write_amsc_token(home, token):
-    """Atomically persist ``token`` at the exact approved path.
-
-    The hierarchy below the supplied home is walked/created through
-    no-follow descriptor opens anchored at the supplied home; a
-    symlinked home or unsafe component aborts before any token content
-    touches the filesystem.  An existing unsafe leaf is rejected before
-    replacement (descriptor-relative lstat on the trusted dir_fd).
-
-    Every leaf operation is descriptor-relative to the trusted esnet
-    dir_fd so a parent rename+symlink swap after anchoring cannot
-    redirect the write: the temp leaf is created exclusively inside
-    that directory fd, written, fchmod 0600, fsynced, then moved with
-    ``os.replace(temp, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)``.
-    Platforms lacking descriptor-relative ``os.replace`` support fail by
-    propagating the underlying exception; there is no path-based fallback.
-    Cleanup unlinks through dir_fd and the trusted directory is fsynced
-    before the descriptor is closed.  Exactly one terminal CRLF/LF is
-    removed; an empty result is rejected.  On a failed replace the
-    previous token stays in place, the temp file is removed, and the
-    original OSError propagates.  Returns the (display) full path.
-    """
-    normalized = _normalize_token(token)
-    path = amsc_token_path(home)
-    leaf_name = os.path.basename(AMSC_TOKEN_RELATIVE_PATH)
-    try:
-        dir_fd = _credential_dir_fd(home, create=True)
-    except FileNotFoundError:
-        raise CredentialError(
-            "credential home does not exist; refusing to create it"
-        )
-    try:
-        _reject_existing_unsafe_leaf(dir_fd, leaf_name)
-        fd, temp_name = _create_temp_leaf_in_dir(dir_fd)
-        fd_owned = True
-        try:
-            os.fchmod(fd, _TOKEN_FILE_MODE)
-            with open(fd, "w", encoding="utf-8", closefd=True) as handle:
-                fd_owned = False
-                handle.write(normalized)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except BaseException:
-            if fd_owned:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            try:
-                os.unlink(temp_name, dir_fd=dir_fd)
-            except OSError:
-                pass
-            raise
-        try:
-            os.replace(temp_name, leaf_name,
-                       src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        except OSError:
-            try:
-                os.unlink(temp_name, dir_fd=dir_fd)
-            except OSError:
-                pass
-            raise
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-    return path
 
 
 # ---------------------------------------------------------------------------

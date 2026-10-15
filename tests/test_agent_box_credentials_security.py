@@ -78,6 +78,36 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             with self.assertRaises(CredentialError):
                 write_amsc_token(home, SECRET)
 
+    def test_write_never_overwrites_post_validation_substitute(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, "trusted-original")
+            path = amsc_token_path(home)
+            directory = os.path.dirname(path)
+            foreign = os.path.join(directory, "foreign")
+            with open(foreign, "w", encoding="utf-8") as handle:
+                handle.write("foreign-data")
+            os.chmod(foreign, 0o600)
+            real_publish = credentials._rename_noreplace_at
+            injected = {"done": False}
+
+            def swap_before_publish(src_fd, src, dst_fd, dst):
+                if src.startswith(".amsc-token.") and dst == "amsc-token":
+                    injected["done"] = True
+                    os.replace(foreign, path)
+                return real_publish(src_fd, src, dst_fd, dst)
+
+            with mock.patch.object(
+                credentials, "_rename_noreplace_at", side_effect=swap_before_publish
+            ):
+                with self.assertRaises(CredentialError):
+                    write_amsc_token(home, "new-secret")
+
+            self.assertTrue(injected["done"])
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "foreign-data")
+
     def test_existing_unsafe_leaf_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as home:
             path = amsc_token_path(home)
@@ -886,6 +916,234 @@ class RenameNoReplacePrimitiveTests(unittest.TestCase):
                     remove_amsc_token(home)
             with open(token_path, encoding="utf-8") as h:
                 self.assertEqual(h.read(), "verified-token")
+
+
+class WritePublicationSecurityTests(unittest.TestCase):
+    """Aegis I-1 write-publication semantics: identity-preserving
+    publication via the atomic no-replace primitive, never an ordinary
+    os.replace onto the public leaf."""
+
+    def test_write_fails_closed_without_noreplace_primitive(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.object(credentials, "_rename_noreplace_libc",
+                                   return_value=None):
+                with self.assertRaises(CredentialError):
+                    write_amsc_token(home, "token")
+
+    def test_write_publish_procedure_uses_no_overwriting_rename(self):
+        # Structural guard for the Aegis I-1 write-publication fix:
+        # the write procedure must contain no os.replace/os.rename/
+        # os.link call at all (every namespace move goes through the
+        # atomic no-replace helper) and it must actually call the
+        # no-replace helper.
+        import ast
+        import inspect
+
+        import agent_box_credentials as credentials
+
+        tree = ast.parse(inspect.getsource(credentials.write_amsc_token))
+        helper_calls = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if (isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"):
+                self.assertNotIn(
+                    node.func.attr, ("rename", "replace", "link"),
+                    "write_amsc_token must never perform an ordinary "
+                    "rename/replace/link move on the public leaf "
+                    "(Aegis I-1), line %d" % node.lineno)
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id == "_rename_noreplace_at"):
+                helper_calls += 1
+        self.assertGreaterEqual(
+            helper_calls, 1,
+            "write_amsc_token must publish through the atomic no-replace "
+            "primitive (Aegis I-1)")
+
+    def test_absent_destination_publish_is_exact_mode_and_clean(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = write_amsc_token(home, "first-token")
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "first-token")
+            st = os.stat(path)
+            self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+            # No temp or backup debris after a clean absent publish.
+            leftovers = [
+                name for name in os.listdir(os.path.dirname(path))
+                if name != "amsc-token"
+            ]
+            self.assertEqual(leftovers, [])
+
+    def test_existing_publish_replaces_token_and_empties_backup(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = write_amsc_token(home, "old-secret")
+            old_stat = os.stat(path)
+            write_amsc_token(home, "new-secret")
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "new-secret")
+            st = os.stat(path)
+            self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+            self.assertNotEqual(st.st_ino, old_stat.st_ino)
+            # The predecessor lives on only as a RETAINED empty backup
+            # name — its secret bytes were destroyed through the
+            # verified descriptor after the new publication was durable.
+            backups = [
+                name for name in os.listdir(os.path.dirname(path))
+                if name != "amsc-token"
+            ]
+            self.assertEqual(len(backups), 1)
+            with open(os.path.join(os.path.dirname(path), backups[0]),
+                      encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "")
+
+    def test_write_publication_never_displaces_public_reoccupant(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            path = amsc_token_path(home)
+            directory = os.path.dirname(path)
+            # Build the credential chain through a real write+remove so
+            # every component carries the required private mode, then
+            # start from an absent leaf.
+            write_amsc_token(home, "seed")
+            self.assertTrue(remove_amsc_token(home))
+            before = set(os.listdir(directory))
+            foreign = os.path.join(directory, "foreign")
+            with open(foreign, "w", encoding="utf-8") as handle:
+                handle.write("reoccupant-data")
+            os.chmod(foreign, 0o600)
+            real_publish = credentials._rename_noreplace_at
+            injected = {"done": False}
+
+            def occupy_before_publish(src_fd, src, dst_fd, dst):
+                # Absent-destination flow: a racer occupies the public
+                # name right before the temp -> public publish.
+                if src.startswith(".amsc-token.") and dst == "amsc-token":
+                    injected["done"] = True
+                    os.link(foreign, path)
+                return real_publish(src_fd, src, dst_fd, dst)
+
+            with mock.patch.object(
+                credentials, "_rename_noreplace_at",
+                side_effect=occupy_before_publish
+            ):
+                with self.assertRaises(CredentialError):
+                    write_amsc_token(home, "new-secret")
+            self.assertTrue(injected["done"])
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "reoccupant-data")
+            # The writer's temp was released by identity; the
+            # reoccupant and its sibling survive untouched, and the
+            # namespace gained nothing but the attacker's own objects.
+            self.assertEqual(
+                set(os.listdir(directory)), before | {"foreign", "amsc-token"})
+            with open(foreign, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "reoccupant-data")
+
+    def test_source_swap_at_backup_move_never_mutates_foreign_object(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            path = write_amsc_token(home, "trusted-original")
+            directory = os.path.dirname(path)
+            foreign = os.path.join(directory, "foreign")
+            with open(foreign, "w", encoding="utf-8") as handle:
+                handle.write("foreign-object")
+            os.chmod(foreign, 0o600)
+            real_move = credentials._rename_noreplace_at
+            swapped = {"done": False}
+
+            def swap_before_backup_move(src_fd, src, dst_fd, dst):
+                # Source-swap race: at the public -> backup move the
+                # public name answers a FOREIGN object, not the
+                # verified predecessor.
+                if src == "amsc-token" and dst.startswith(".amsc-token."):
+                    swapped["done"] = True
+                    os.replace(foreign, path)
+                return real_move(src_fd, src, dst_fd, dst)
+
+            with mock.patch.object(
+                credentials, "_rename_noreplace_at",
+                side_effect=swap_before_backup_move
+            ):
+                with self.assertRaises(CredentialError):
+                    write_amsc_token(home, "new-secret")
+            self.assertTrue(swapped["done"])
+            # The foreign object (moved into the backup name) must be
+            # restored to the public name via no-replace and survive
+            # byte-identical; nothing was destroyed.
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "foreign-object")
+
+    def test_dir_fsync_failure_after_publish_preserves_backup_bytes(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            path = write_amsc_token(home, "old-secret")
+            directory = os.path.dirname(path)
+            real_fsync = os.fsync
+            state = {"calls": 0}
+
+            def fail_dir_fsync(fd):
+                state["calls"] += 1
+                if state["calls"] == 2:
+                    # Second fsync in the existing-leaf flow is the
+                    # directory fsync that makes publication durable.
+                    # A failure there must NOT destroy the predecessor
+                    # bytes (destruction happens only after durability).
+                    raise OSError("injected directory fsync failure")
+                return real_fsync(fd)
+
+            with mock.patch.object(credentials.os, "fsync",
+                                   side_effect=fail_dir_fsync):
+                with self.assertRaises(OSError):
+                    write_amsc_token(home, "new-secret")
+            self.assertEqual(state["calls"], 2)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "new-secret")
+            backups = [
+                name for name in os.listdir(directory)
+                if name != "amsc-token"
+            ]
+            self.assertEqual(len(backups), 1)
+            with open(os.path.join(directory, backups[0]),
+                      encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "old-secret")
+
+    def test_failed_write_does_not_leak_file_descriptors(self):
+        fd_root = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+        if not os.path.isdir(fd_root):
+            self.skipTest("no process fd directory")
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, "old-token")
+            baseline = len(os.listdir(fd_root))
+            real_publish = credentials._rename_noreplace_at
+            state = {"publish": 0}
+
+            def fail_publish(src_fd, src, dst_fd, dst):
+                if src.startswith(".amsc-token.") and dst == "amsc-token":
+                    state["publish"] += 1
+                    if state["publish"] == 1:
+                        # Only the temp -> public publication fails;
+                        # the backup -> public restore must run for real.
+                        raise OSError("injected publication failure")
+                return real_publish(src_fd, src, dst_fd, dst)
+
+            with mock.patch.object(
+                credentials, "_rename_noreplace_at", side_effect=fail_publish
+            ):
+                with self.assertRaises(CredentialError):
+                    write_amsc_token(home, "new-token")
+            observed = len(os.listdir(fd_root))
+            self.assertLessEqual(observed, baseline + 1)
+            # Rollback preserved the previous token (no reoccupation).
+            self.assertEqual(read_amsc_token(home), "old-token")
 
 
 if __name__ == "__main__":
