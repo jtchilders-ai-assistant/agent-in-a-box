@@ -349,8 +349,14 @@ def reconfigure_amsc_credential_interactive(home, input_stream,
         output_stream.write("Really remove the stored AmSC token? [y/N] ")
         answer = _read_line(input_stream)
         if answer is not None and answer.lower() in ("y", "yes"):
-            remove_amsc_token(home)
-            output_stream.write("Stored AmSC token removed.\n")
+            removed = remove_amsc_token(home)
+            if removed:
+                output_stream.write("Stored AmSC token removed.\n")
+            else:
+                output_stream.write(
+                    "Stored AmSC token was not removed; inspect credential status.\n"
+                )
+                return token_status(home)
         else:
             output_stream.write("Removal cancelled; token kept.\n")
         return token_status(home)

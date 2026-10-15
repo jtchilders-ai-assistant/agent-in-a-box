@@ -265,6 +265,306 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             observed = len(os.listdir(fd_root))
             self.assertLessEqual(observed, baseline + 2)
 
+    def test_remove_reports_failure_truthfully_in_reconfigure_ui(self):
+        from agent_box_setup import reconfigure_amsc_credential_interactive
+
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, "token")
+            output = io.StringIO()
+            with mock.patch("agent_box_setup.remove_amsc_token", return_value=False):
+                status = reconfigure_amsc_credential_interactive(
+                    home,
+                    input_stream=io.StringIO("remove\ny\n"),
+                    output_stream=output,
+                )
+            self.assertIn("was not removed", output.getvalue())
+            self.assertNotIn("token removed.", output.getvalue())
+            self.assertEqual(status, "present")
+
+    def test_remove_never_overwrites_preexisting_tombstone_destination(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            directory = os.path.dirname(token_path)
+            suffix = "fixed-collision"
+            tombstone = os.path.join(directory, ".amsc-token.%s" % suffix)
+            with open(tombstone, "w", encoding="utf-8") as handle:
+                handle.write("unverified-destination")
+            os.chmod(tombstone, 0o600)
+
+            with mock.patch.object(credentials, "_random_tombstone_suffix", return_value=suffix):
+                try:
+                    result = remove_amsc_token(home)
+                except CredentialError:
+                    result = False
+
+            self.assertFalse(result)
+            with open(tombstone, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "unverified-destination")
+            with open(token_path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "verified-token")
+
+    def test_remove_never_restores_over_reoccupied_public_path_on_fsync_failure(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            real_fsync = os.fsync
+            state = {"fsyncs": 0, "planted": False}
+
+            def fail_first_fsync(fd):
+                state["fsyncs"] += 1
+                if state["fsyncs"] == 1:
+                    raise OSError("injected token fsync failure")
+                return real_fsync(fd)
+
+            real_rename = os.rename
+
+            def plant_before_restore(source, destination, *args, **kwargs):
+                if (
+                    isinstance(source, str)
+                    and source.startswith(".amsc-token.")
+                    and destination == "amsc-token"
+                    and not state["planted"]
+                ):
+                    state["planted"] = True
+                    with open(token_path, "w", encoding="utf-8") as handle:
+                        handle.write("unverified-public")
+                    os.chmod(token_path, 0o600)
+                return real_rename(source, destination, *args, **kwargs)
+
+            with mock.patch.object(credentials.os, "fsync", side_effect=fail_first_fsync), mock.patch.object(
+                credentials.os, "rename", side_effect=plant_before_restore
+            ):
+                with self.assertRaises(OSError):
+                    remove_amsc_token(home)
+
+            # A secure implementation never attempts restoration onto the
+            # mutable public path. If a legacy restore seam was reached, the
+            # planted object must still survive unchanged.
+            if state["planted"]:
+                with open(token_path, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "unverified-public")
+
+    def test_write_closes_temp_fd_when_fchmod_fails(self):
+        fd_root = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+        if not os.path.isdir(fd_root):
+            self.skipTest("no process fd directory")
+        with tempfile.TemporaryDirectory() as home:
+            baseline = len(os.listdir(fd_root))
+            with mock.patch(
+                "agent_box_credentials.os.fchmod",
+                side_effect=OSError("injected fchmod failure"),
+            ):
+                with self.assertRaises(OSError):
+                    write_amsc_token(home, "token")
+            observed = len(os.listdir(fd_root))
+            self.assertLessEqual(observed, baseline + 1)
+
+    def test_remove_fails_closed_when_tombstone_name_raced_after_generation(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            directory = os.path.dirname(token_path)
+            suffix = "raced-into"
+            racer_path = os.path.join(directory, ".amsc-token.%s" % suffix)
+
+            def plant_racer_after_suffix_generation():
+                # Deterministically simulate a same-UID racer that
+                # creates an object under the tombstone name after the
+                # suffix is generated but before the exclusive claim.
+                with open(racer_path, "w", encoding="utf-8") as handle:
+                    handle.write("racer-object")
+                os.chmod(racer_path, 0o600)
+                return suffix
+
+            with mock.patch.object(
+                credentials,
+                "_random_tombstone_suffix",
+                side_effect=plant_racer_after_suffix_generation,
+            ) as suffix_calls:
+                with self.assertRaises(CredentialError):
+                    remove_amsc_token(home)
+            # The exclusive claim was genuinely attempted under the
+            # generated name (name was generated, then raced).
+            suffix_calls.assert_called_once_with()
+            with open(racer_path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "racer-object")
+            with open(token_path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "verified-token")
+
+    def test_remove_mismatch_restore_never_links_over_public_reoccupant(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            directory = os.path.dirname(token_path)
+            swapped = {"done": False}
+            real_rename = os.rename
+
+            def race_before_move(source, destination, *args, **kwargs):
+                # Deterministic namespace race: after the implementation
+                # has verified the leaf, a same-UID racer swaps a
+                # foreign object under the public name so the rename
+                # moves the wrong inode, and once the rename has
+                # completed the racer reoccupies the public path with
+                # an unrelated object the restore must never displace.
+                if source == "amsc-token" and kwargs.get("src_dir_fd") is not None:
+                    original = os.path.join(directory, "original-inode")
+                    os.rename(token_path, original)
+                    foreign = os.path.join(directory, "foreign-object")
+                    with open(foreign, "w", encoding="utf-8") as handle:
+                        handle.write("foreign-token")
+                    os.chmod(foreign, 0o600)
+                    os.rename(foreign, token_path)
+                    result = real_rename(source, destination, *args, **kwargs)
+                    with open(token_path + ".reoccupant", "w",
+                              encoding="utf-8") as handle:
+                        handle.write("unverified-reoccupant")
+                    os.chmod(token_path + ".reoccupant", 0o600)
+                    os.rename(token_path + ".reoccupant", token_path)
+                    swapped["done"] = True
+                    return result
+                return real_rename(source, destination, *args, **kwargs)
+
+            with mock.patch.object(
+                credentials.os, "rename", side_effect=race_before_move
+            ):
+                with self.assertRaises(CredentialError):
+                    remove_amsc_token(home)
+            self.assertTrue(swapped["done"])
+            # The no-replace hard-link restore must fail EEXIST and
+            # must never displace the public reoccupant.
+            with open(token_path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "unverified-reoccupant")
+            # The moved foreign object is never destroyed: it survives
+            # intact under the retained tombstone name and nowhere
+            # else.
+            directory = os.path.dirname(token_path)
+            survivors = [
+                name for name in os.listdir(directory)
+                if name.startswith(".amsc-token.")
+            ]
+            self.assertEqual(len(survivors), 1)
+            with open(os.path.join(directory, survivors[0]),
+                      encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "foreign-token")
+            # The implementation never destroys any object: the
+            # original credential inode also survives untouched.
+            with open(os.path.join(directory, "original-inode"),
+                      encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "verified-token")
+
+    def test_remove_ftruncate_failure_never_restores_over_public_path(self):
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            directory = os.path.dirname(token_path)
+            with mock.patch(
+                "agent_box_credentials.os.ftruncate",
+                side_effect=OSError("injected ftruncate failure"),
+            ):
+                with self.assertRaises(OSError):
+                    remove_amsc_token(home)
+            # Destruction had already been attempted through the
+            # verified descriptor: no restore of any kind is attempted
+            # onto the public path afterwards.
+            self.assertFalse(os.path.lexists(token_path))
+            survivors = [
+                name for name in os.listdir(directory)
+                if name.startswith(".amsc-token.")
+            ]
+            self.assertTrue(survivors)
+
+    def test_remove_token_fsync_failure_never_restores_over_public_path(self):
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            directory = os.path.dirname(token_path)
+            real_fsync = os.fsync
+            state = {"fsyncs": 0}
+
+            def fail_first_fsync(fd):
+                state["fsyncs"] += 1
+                if state["fsyncs"] == 1:
+                    raise OSError("injected token fsync failure")
+                return real_fsync(fd)
+
+            with mock.patch("agent_box_credentials.os.fsync", side_effect=fail_first_fsync):
+                with self.assertRaises(OSError):
+                    remove_amsc_token(home)
+            self.assertEqual(state["fsyncs"], 1)
+            # No rename-back onto the public path is attempted after
+            # destruction began: the public name stays absent.
+            self.assertFalse(os.path.lexists(token_path))
+            survivors = [
+                name for name in os.listdir(directory)
+                if name.startswith(".amsc-token.")
+            ]
+            self.assertTrue(survivors)
+
+    def test_remove_dir_fsync_failure_never_restores_over_public_path(self):
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            directory = os.path.dirname(token_path)
+            real_fsync = os.fsync
+            state = {"token_fsynced": False}
+
+            def fail_dir_fsync(fd):
+                if state["token_fsynced"]:
+                    raise OSError("injected directory fsync failure")
+                state["token_fsynced"] = True
+                return real_fsync(fd)
+
+            with mock.patch("agent_box_credentials.os.fsync", side_effect=fail_dir_fsync):
+                with self.assertRaises(OSError):
+                    remove_amsc_token(home)
+            self.assertTrue(state["token_fsynced"])
+            # The credential inode was destroyed; the directory entry
+            # update may not be durable, but no restore is attempted
+            # onto the public path.
+            self.assertFalse(os.path.lexists(token_path))
+            survivors = [
+                name for name in os.listdir(directory)
+                if name.startswith(".amsc-token.")
+            ]
+            self.assertTrue(survivors)
+
+    def test_removal_procedure_uses_no_unlink_or_restore_rename(self):
+        # Structural guard for the Aegis IMP-01/IMP-02 invariants: the
+        # removal procedure must contain no unlink call at all, and no
+        # rename call that targets the mutable public leaf name as its
+        # destination (an ordinary rename could clobber a reoccupant).
+        import ast
+        import inspect
+
+        import agent_box_credentials as credentials
+
+        tree = ast.parse(inspect.getsource(credentials.remove_amsc_token))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)):
+                continue
+            fname = getattr(node.func, "value", None)
+            if not (isinstance(fname, ast.Name) and fname.id == "os"):
+                continue
+            self.assertNotEqual(
+                node.func.attr, "unlink",
+                "remove_amsc_token must never call os.unlink "
+                "(Aegis IMP-01)")
+            if node.func.attr == "rename":
+                self.assertGreaterEqual(len(node.args), 2)
+                destination = ast.dump(node.args[1])
+                self.assertNotIn(
+                    "leaf_name", destination,
+                    "remove_amsc_token must never rename onto the "
+                    "public leaf name (Aegis IMP-02), line %d"
+                    % node.lineno)
+                for keyword in node.keywords:
+                    if keyword.arg == "dst_dir_fd":
+                        self.assertNotIn(
+                            "leaf_name", ast.dump(keyword.value))
+
     def test_remove_never_unlinks_a_post_verification_substitute(self):
         with tempfile.TemporaryDirectory() as home:
             token_path = write_amsc_token(home, "original-token")
