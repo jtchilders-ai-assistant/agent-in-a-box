@@ -17,6 +17,7 @@ from agent_box_credentials import (
     write_amsc_token,
 )
 from agent_box_setup import LEGACY_CONFIG_RELATIVE_PATH, run_first_setup
+import agent_box
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -213,6 +214,84 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             with self.assertRaises(CredentialError):
                 remove_amsc_token(home)
             self.assertTrue(os.path.exists(path))
+
+    def test_management_cli_exposes_credential_reconfiguration(self):
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, "old-token")
+            output = io.StringIO()
+            errors = io.StringIO()
+            rc = agent_box.main(
+                ["credentials", "esnet", "configure"],
+                home=home,
+                registry_path=REGISTRY_PATH,
+                input_stream=io.StringIO("keep\n"),
+                output_stream=output,
+                error_stream=errors,
+                is_tty=True,
+                environ={},
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(read_amsc_token(home), "old-token")
+            self.assertNotIn("old-token", output.getvalue())
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_management_cli_reconfiguration_requires_tty(self):
+        with tempfile.TemporaryDirectory() as home:
+            rc = agent_box.main(
+                ["credentials", "esnet", "configure"],
+                home=home,
+                registry_path=REGISTRY_PATH,
+                input_stream=io.StringIO(""),
+                output_stream=io.StringIO(),
+                error_stream=io.StringIO(),
+                is_tty=False,
+                environ={},
+            )
+            self.assertNotEqual(rc, 0)
+
+    def test_credential_operations_do_not_leak_file_descriptors(self):
+        fd_root = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+        if not os.path.isdir(fd_root):
+            self.skipTest("no process fd directory")
+        with tempfile.TemporaryDirectory() as home:
+            baseline = len(os.listdir(fd_root))
+            for index in range(40):
+                write_amsc_token(home, "token-%d" % index)
+                self.assertEqual(read_amsc_token(home), "token-%d" % index)
+                from agent_box_credentials import token_status
+                self.assertEqual(token_status(home), "present")
+                self.assertTrue(remove_amsc_token(home))
+                self.assertEqual(token_status(home), "absent")
+            observed = len(os.listdir(fd_root))
+            self.assertLessEqual(observed, baseline + 2)
+
+    def test_remove_does_not_unlink_replacement_leaf(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = write_amsc_token(home, "original-token")
+            replacement = os.path.join(os.path.dirname(path), "replacement")
+            with open(replacement, "w", encoding="utf-8") as handle:
+                handle.write("replacement-token")
+            os.chmod(replacement, 0o600)
+            real_unlink = os.unlink
+            swapped = False
+
+            def swap_before_unlink(candidate, *args, **kwargs):
+                nonlocal swapped
+                if candidate == "amsc-token" and kwargs.get("dir_fd") is not None:
+                    swapped = True
+                    os.replace(replacement, path)
+                return real_unlink(candidate, *args, **kwargs)
+
+            with mock.patch("agent_box_credentials.os.unlink", side_effect=swap_before_unlink):
+                try:
+                    result = remove_amsc_token(home)
+                except CredentialError:
+                    result = False
+            self.assertTrue(swapped)
+            self.assertFalse(result)
+            self.assertTrue(os.path.exists(path))
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "replacement-token")
 
 
 if __name__ == "__main__":

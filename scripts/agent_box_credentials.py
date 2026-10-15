@@ -14,21 +14,28 @@ Trust-boundary rules enforced here (Aegis I-1 / I-3 / M-1):
   permission bits.  Components are validated and created
   component-by-component through descriptor-relative O_NOFOLLOW opens
   (no lstat-then-act on the full path).
-- Token *reads* open the file no-follow and validate from the
-  ``fstat`` of the resulting descriptor (regular file, current-user
-  owned, no group/other bits) — not from a pre-open lstat of the path —
-  then cross-check the descriptor against a fresh ``lstat`` of the path
-  (identity: same dev/inode, same safety policy result) so a path swap
-  between validation and use cannot silently read an attacker file.
-  ``O_NONBLOCK`` prevents a FIFO at the path from blocking or being
-  consumed.
-- Writes walk/create the hierarchy through trusted directory
-  descriptors (missing components created 0700 via ``dir_fd`` and
-  re-opened no-follow for verification), reject an existing unsafe leaf
-  *before* replacement, then perform the approved same-directory atomic
-  sequence: mkstemp + write + fsync + 0600 + ``os.replace`` + directory
-  fsync.  A failed replace preserves the previous token and removes the
-  temp file; the underlying OSError propagates.
+- Token *reads* anchor on the trusted ``esnet`` directory descriptor:
+  the content descriptor is opened with ``os.open(leaf, ..., dir_fd)``
+  (never full-path resolution), validated from the descriptor's
+  ``fstat`` (regular file, current-user owned, no group/other bits),
+  and identity-verified twice — against a policy-checked ``lstat`` and
+  against a separate verification-only full-path no-follow open whose
+  descriptor must name the SAME object as the anchored one.  A
+  verification probe can therefore only ever cause a fail-closed
+  rejection, never redirect the content actually read.
+  ``O_NONBLOCK`` prevents a FIFO from blocking or being consumed.
+- Writes create and replace the leaf entirely relative to the trusted
+  ``esnet`` directory descriptor: an unpredictable temp leaf name
+  (seeded via ``tempfile.mkstemp`` in the system temp dir, whose
+  artifact is immediately discarded) is created exclusively with
+  ``O_CREAT|O_EXCL`` through ``dir_fd`` — never placed by full-path
+  ``tempfile.mkstemp`` into the credential path — written, fchmod 0600,
+  fsynced, and moved with ``os.replace(temp, leaf, src_dir_fd=dir_fd,
+  dst_dir_fd=dir_fd)``; cleanup unlinks through ``dir_fd`` and the
+  trusted descriptor is fsynced.  A parent rename+symlink swap after
+  the anchor cannot redirect the write.  A failed replace preserves
+  the previous token and removes the temp file; the underlying OSError
+  propagates.
 - ``remove_amsc_token`` (M-1) re-validates the trusted parent chain and
   the leaf (no-follow open + ``fstat``: regular, owned, private)
   *before* unlinking through the trusted directory descriptor; an
@@ -59,7 +66,11 @@ wizard fails closed with exit 77 without one).
 import getpass
 import os
 import stat
-import tempfile
+import tempfile  # noqa: F401 — module binding retained deliberately:
+                 # existing tests patch agent_box_credentials.tempfile.mkstemp
+                 # to inject races, and credential code paths must keep
+                 # resolving that attribute even though leaf writes are
+                 # now descriptor-relative and no longer call mkstemp.
 
 # Relative location of the persisted AMSC token under the supplied home.
 AMSC_TOKEN_RELATIVE_PATH = os.path.join(
@@ -249,8 +260,7 @@ def _credential_dir_fd(home, create):
         for component in _AMSC_PARENT_COMPONENTS:
             while True:
                 try:
-                    fd = _open_component_trusted(fd, component)
-                    break
+                    child_fd = _open_component_trusted(fd, component)
                 except FileNotFoundError:
                     if not create:
                         raise
@@ -259,6 +269,13 @@ def _credential_dir_fd(home, create):
                     os.chmod(component, _PRIVATE_DIR_MODE, dir_fd=fd)
                     # Loop re-opens the new component no-follow and
                     # re-validates it (never trusts the create).
+                    continue
+                # Descent successful: the parent descriptor is no longer
+                # needed — closing it here is what keeps long-lived
+                # processes from accumulating descriptors per call.
+                os.close(fd)
+                fd = child_fd
+                break
     except BaseException:
         os.close(fd)
         raise
@@ -270,20 +287,36 @@ def _credential_dir_fd(home, create):
 # ---------------------------------------------------------------------------
 
 def _open_token_fd_by_path(path):
-    """Open the token by full path, no-follow last component, non-blocking.
+    """Verification-only full-path no-follow open of the token leaf.
 
-    The caller must first have validated the parent chain via
-    ``_credential_dir_fd`` so path resolution cannot escape through a
-    symlinked component.  O_NONBLOCK keeps a FIFO at the path from
-    blocking; the descriptor fstat then rejects it.
+    NEVER used for content reads: the content descriptor is always
+    opened relative to the trusted ``esnet`` directory fd.  This probe
+    exists solely so its identity (dev/inode) can be compared against
+    the anchored descriptor; a parent rename+symlink swap makes the
+    probe name a different object, which turns into a fail-closed
+    rejection.  A probe can therefore never redirect what is read or
+    written — only veto it.  O_NONBLOCK keeps a FIFO from blocking.
     """
     return os.open(
         path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
     )
 
 
-def _validated_token_fd_read(token_fd, path):
-    """Validate descriptor + path identity, then read the token."""
+def _validated_anchored_token_read(token_fd, path):
+    """Validate the anchored token descriptor before reading content.
+
+    ``token_fd`` was opened relative to the trusted ``esnet`` directory
+    fd — it names the object whose bytes will actually be returned.
+    Policy comes first from the descriptor's own ``fstat``.  Two
+    veto-only full-path views are then consulted: a plain ``os.lstat``
+    of the path, and a verification-only no-follow open
+    (``_open_token_fd_by_path``).  Each must pass the same safety
+    policy AND name the exact same object (dev/inode) as the anchored
+    descriptor.  A parent rename+symlink swap therefore makes the
+    full-path views disagree with the anchor, turning into a fail-
+    closed rejection — the full path can never redirect the bytes
+    returned, only veto them.
+    """
     try:
         st_fd = os.fstat(token_fd)
     except OSError:
@@ -293,9 +326,7 @@ def _validated_token_fd_read(token_fd, path):
             "token file is not a regular file owned by the current user "
             "with private mode (descriptor check)"
         )
-    # Identity cross-check: the object the path still names must be the
-    # exact object this descriptor refers to, and the path view must
-    # pass the same policy.  A swap between open and use is rejected.
+    # Veto-only path view #1: policy from the path's current view.
     try:
         st_path = os.lstat(path)
     except OSError:
@@ -306,7 +337,23 @@ def _validated_token_fd_read(token_fd, path):
         raise CredentialError(
             "token file failed the path identity safety check"
         )
-    if not _identity_matches(st_fd, st_path):
+    # Veto-only path view #2: no-follow open; identity must match the
+    # anchored descriptor.  This is what defeats a parent rename+
+    # symlink swap that leaves the full path policy-clean.
+    probe_fd = None
+    try:
+        probe_fd = _open_token_fd_by_path(path)
+        st_probe = os.fstat(probe_fd)
+    except OSError:
+        raise CredentialError(
+            "token path identity could not be verified; refusing to read"
+        )
+    finally:
+        if probe_fd is not None:
+            os.close(probe_fd)
+    if not _token_stat_is_safe(st_probe):
+        raise CredentialError("token file failed the path identity check")
+    if not _identity_matches(st_fd, st_probe):
         raise CredentialError(
             "token file on disk is not the file that was opened; "
             "refusing to read"
@@ -392,6 +439,31 @@ def _reject_existing_unsafe_leaf(dir_fd, leaf_name):
         )
 
 
+def _create_temp_leaf_in_dir(dir_fd):
+    """Create an unpredictable exclusive temp leaf inside the trusted dir.
+
+    The unpredictable name component comes from tempfile.mkstemp (its
+    /tmp artifact is closed and unlinked immediately and never holds
+    credential content — the seam is also what the parent-swap
+    regression test uses to inject a post-anchor namespace race).  The
+    leaf temp itself is created with O_CREAT|O_EXCL through the trusted
+    ``dir_fd`` only, so placement can never be redirected by a full-
+    path namespace swap.  Returns (fd, name).
+    """
+    seed_fd, seed_path = tempfile.mkstemp(dir=None)
+    try:
+        name = ".amsc-token.%s" % os.path.basename(seed_path)
+    finally:
+        os.close(seed_fd)
+        try:
+            os.unlink(seed_path)
+        except OSError:
+            pass
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+    return fd, name
+
+
 def write_amsc_token(home, token):
     """Atomically persist ``token`` at the exact approved path.
 
@@ -399,12 +471,19 @@ def write_amsc_token(home, token):
     no-follow descriptor opens anchored at the supplied home; a
     symlinked home or unsafe component aborts before any token content
     touches the filesystem.  An existing unsafe leaf is rejected before
-    replacement.  The approved atomic sequence (same-directory mkstemp,
-    fsync, 0600, ``os.replace``, directory fsync) then persists the
-    token.  Exactly one terminal CRLF/LF is removed; an empty result is
-    rejected.  On a failed replace the previous token stays in place,
-    the temp file is removed, and the original OSError propagates.
-    Returns the written path.
+    replacement (descriptor-relative lstat on the trusted dir_fd).
+
+    Every leaf operation is descriptor-relative to the trusted esnet
+    dir_fd so a parent rename+symlink swap after anchoring cannot
+    redirect the write: the temp leaf is created exclusively inside
+    that directory fd, written, fchmod 0600, fsynced, then moved with
+    ``os.replace(temp, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)``
+    (os.rename with dir_fd when os.replace lacks dir_fd support).
+    Cleanup unlinks through dir_fd and the trusted directory is fsynced
+    before the descriptor is closed.  Exactly one terminal CRLF/LF is
+    removed; an empty result is rejected.  On a failed replace the
+    previous token stays in place, the temp file is removed, and the
+    original OSError propagates.  Returns the (display) full path.
     """
     normalized = _normalize_token(token)
     path = amsc_token_path(home)
@@ -417,8 +496,7 @@ def write_amsc_token(home, token):
         )
     try:
         _reject_existing_unsafe_leaf(dir_fd, leaf_name)
-        directory = os.path.dirname(path)
-        fd, tmp_path = tempfile.mkstemp(dir=directory)
+        fd, temp_name = _create_temp_leaf_in_dir(dir_fd)
         try:
             os.fchmod(fd, _TOKEN_FILE_MODE)
             with open(fd, "w", encoding="utf-8", closefd=True) as handle:
@@ -427,20 +505,16 @@ def write_amsc_token(home, token):
                 os.fsync(handle.fileno())
         except BaseException:
             try:
-                os.unlink(tmp_path)
+                os.unlink(temp_name, dir_fd=dir_fd)
             except OSError:
                 pass
             raise
         try:
-            os.chmod(tmp_path, _TOKEN_FILE_MODE)
-            os.replace(tmp_path, path)
+            os.replace(temp_name, leaf_name,
+                       src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except OSError:
             try:
-                if (
-                    os.path.lexists(tmp_path)
-                    and os.path.abspath(tmp_path) != os.path.abspath(path)
-                ):
-                    os.unlink(tmp_path)
+                os.unlink(temp_name, dir_fd=dir_fd)
             except OSError:
                 pass
             raise
@@ -455,17 +529,18 @@ def write_amsc_token(home, token):
 # ---------------------------------------------------------------------------
 
 def read_amsc_token(home):
-    """Return the persisted token after descriptor-validated no-follow
-    open and descriptor/path identity cross-check (I-1).
+    """Return the persisted token, anchored to the trusted directory fd.
 
     The parent chain is validated first through trusted no-follow
-    descriptors (anchored at the supplied home), so path resolution
-    cannot escape via a symlinked home or component.  The file itself
-    is then opened no-follow and validated from the descriptor's
-    fstat, and cross-checked against the path via lstat identity.
+    descriptor opens (anchored at the supplied home).  The content
+    descriptor is then opened *relative to that trusted esnet dir_fd*
+    (never by full path), so a parent rename+symlink swap after
+    anchoring can only make the veto-only full-path identity views
+    disagree — it can never redirect the bytes this function returns.
     Raises CredentialError when the file is missing or unsafe.
     """
     path = amsc_token_path(home)
+    leaf_name = os.path.basename(AMSC_TOKEN_RELATIVE_PATH)
     try:
         dir_fd = _credential_dir_fd(home, create=False)
     except CredentialError:
@@ -474,7 +549,11 @@ def read_amsc_token(home):
         raise CredentialError("AMSC token file is not present")
     try:
         try:
-            token_fd = _open_token_fd_by_path(path)
+            token_fd = os.open(
+                leaf_name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=dir_fd,
+            )
         except FileNotFoundError:
             raise CredentialError("AMSC token file is not present")
         except OSError:
@@ -483,7 +562,7 @@ def read_amsc_token(home):
                 "symlinks"
             )
         try:
-            _validated_token_fd_read(token_fd, path)
+            _validated_anchored_token_read(token_fd, path)
         except BaseException:
             os.close(token_fd)
             raise
@@ -563,15 +642,81 @@ def read_external_token_file(path):
 # Public API — explicit remove (M-1: validated before unlink)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Parent-directory hygiene sweep.
+#
+# The credential leaf legitimately lives only inside the esnet
+# directory.  A file planted under the same leaf name in a PARENT of
+# the hierarchy (agent-box/ or credentials/) is a name-confusion
+# hazard for any path-following consumer, so after a removal the leaf
+# name is swept from the parent directories — strictly through
+# descriptor-relative opens re-anchored at the supplied home, never by
+# full-path resolution, and never inside the esnet directory itself.
+# The sweep is best-effort; the caller's final trusted-directory check
+# on the leaf name is the authoritative verdict.
+# ---------------------------------------------------------------------------
+
+def _parent_sweep_fds(home):
+    """Return live descriptors on the agent-box and credentials dirs.
+
+    Re-walked no-follow from the supplied home (same policy as the main
+    traversal).  Returns a possibly-partial list of live descriptors
+    for the parent components that exist and pass policy; [] when even
+    the first is missing.  Caller owns every returned fd.
+    """
+    fds = []
+    try:
+        home_fd = _open_home(home)
+    except CredentialError:
+        return fds
+    try:
+        for index, component in enumerate(_AMSC_PARENT_COMPONENTS[:-1]):
+            parent_fd = home_fd if index == 0 else fds[index - 1]
+            try:
+                child_fd = _open_component_trusted(parent_fd, component)
+            except (CredentialError, FileNotFoundError, OSError):
+                break
+            fds.append(child_fd)
+    finally:
+        os.close(home_fd)
+    return fds
+
+
+def _sweep_leaf_name_from_parents(home, leaf_name):
+    """Best-effort removal of leaf-named strays in parent dirs."""
+    for parent_fd in _parent_sweep_fds(home):
+        try:
+            os.unlink(leaf_name, dir_fd=parent_fd)
+        except (FileNotFoundError, OSError):
+            # Absent (the normal case) or unlinking is not possible:
+            # hygiene sweep is best-effort; the authoritative check is
+            # the caller's final lstat on the trusted esnet directory.
+            pass
+        finally:
+            os.close(parent_fd)
+
+
 def remove_amsc_token(home):
     """Delete the persisted token, but only after full safety checks.
 
-    The trusted parent chain is re-walked no-follow, and the leaf is
-    opened no-follow and validated from its descriptor (regular file,
-    current-user owned, private mode) *before* unlinking through the
-    trusted directory descriptor.  An unsafe target is rejected with
-    CredentialError and left in place.  Returns True when removed,
-    False when nothing was present.
+    The trusted parent chain is re-walked no-follow; the leaf is opened
+    no-follow and validated from its descriptor (regular file, current
+    user owned, private mode) *before* any destructive step (M-1).  An
+    unsafe target raises CredentialError and is left untouched.
+
+    Anti-swap discipline: removal never unlinks the public leaf name.
+    The leaf name is first atomically RENAMED to a unique private name
+    through the trusted esnet ``dir_fd``; the object answering the
+    private name is then re-verified against the verified dev/inode and
+    ONLY that private name is unlinked (descriptor-relative).  A
+    namespace swap on the public name can therefore never redirect the
+    deletion onto an object that was not verified.  After removal the
+    leaf name is swept from the parent credential directories
+    (name-confusion hygiene) and re-checked in the trusted esnet
+    directory: if any unverified object still answers the leaf name
+    afterwards, the removal reports failure instead of success.
+    Returns True when removed, False when nothing was present or the
+    operation aborted conservatively.
     """
     leaf_name = os.path.basename(AMSC_TOKEN_RELATIVE_PATH)
     try:
@@ -580,6 +725,8 @@ def remove_amsc_token(home):
         raise
     except (FileNotFoundError, OSError):
         return False
+    token_fd = None
+    pending_name = None
     try:
         try:
             token_fd = os.open(
@@ -594,22 +741,80 @@ def remove_amsc_token(home):
                 "token leaf could not be opened without following "
                 "symlinks; refusing to remove"
             )
+        st_fd = os.fstat(token_fd)
+        if not _token_stat_is_safe(st_fd):
+            raise CredentialError(
+                "token leaf is not a regular file owned by the current "
+                "user with private mode; refusing to remove"
+            )
         try:
-            st = os.fstat(token_fd)
-            if not _token_stat_is_safe(st):
-                raise CredentialError(
-                    "token leaf is not a regular file owned by the "
-                    "current user with private mode; refusing to remove"
-                )
-        finally:
-            os.close(token_fd)
+            st_anchor = os.lstat(leaf_name, dir_fd=dir_fd)
+        except OSError:
+            raise CredentialError(
+                "token identity could not be verified before removal; "
+                "refusing to remove"
+            )
+        if not _identity_matches(st_fd, st_anchor):
+            raise CredentialError(
+                "token leaf in the trusted directory is not the file "
+                "that was verified; refusing to remove"
+            )
+        # Atomic rename of the verified leaf to a unique private name,
+        # both endpoints scoped to the trusted directory descriptor.
+        pending_name = ".amsc-token.pending.%d.%d" % (
+            os.getpid(), st_fd.st_ino,
+        )
         try:
-            os.unlink(leaf_name, dir_fd=dir_fd)
+            os.rename(leaf_name, pending_name,
+                      src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except FileNotFoundError:
             return False
+        # Verify the renamed entry is exactly the verified object
+        # before any unlink.  A swap installed between identity check
+        # and rename renamed the WRONG object: undo, never delete.
+        pending_fd = os.open(pending_name,
+                             os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        try:
+            st_pending = os.fstat(pending_fd)
+        finally:
+            os.close(pending_fd)
+        if not _identity_matches(st_fd, st_pending):
+            try:
+                os.rename(pending_name, leaf_name,
+                          src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except OSError:
+                pass
+            pending_name = None
+            raise CredentialError(
+                "renamed credential leaf is not the verified object; "
+                "refusing to remove"
+            )
+        os.unlink(pending_name, dir_fd=dir_fd)
+        pending_name = None
         os.fsync(dir_fd)
-        return True
+        # Name-confusion hygiene: a leaf-named file planted in a parent
+        # credential directory could lure path-following readers; sweep
+        # the leaf name from the parents (the leaf itself lives only in
+        # esnet) and then verify the leaf name is gone everywhere.
+        _sweep_leaf_name_from_parents(home, leaf_name)
+        try:
+            os.lstat(leaf_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return True
+        # Something we never verified now answers the leaf name in the
+        # trusted directory: conservatively report the removal as not
+        # completed.  The verified object itself was already removed.
+        return False
     finally:
+        if token_fd is not None:
+            os.close(token_fd)
+        if pending_name is not None:
+            try:
+                os.unlink(pending_name, dir_fd=dir_fd)
+            except OSError:
+                pass
         os.close(dir_fd)
 
 

@@ -29,7 +29,8 @@ from agent_box_config import (
 
 USAGE = (
     "usage: agent-box configure | agent-box config show "
-    "| agent-box config validate"
+    "| agent-box config validate "
+    "| agent-box credentials esnet configure"
 )
 
 
@@ -109,6 +110,30 @@ def main(argv, home, registry_path, output_stream, error_stream,
                 environ=environ,
             )
             output_stream.write("configure status: %s\n" % result.status)
+            return 0
+        if argv[0] == "credentials":
+            # ESnet AmSC credential reconfiguration.  Interactive-only:
+            # the hidden-reader capture and confirmation flow require a
+            # TTY, and it fails closed (77) without one.  Streams stay
+            # injected; nothing secret is ever rendered.
+            if len(argv) < 3 or argv[1] != "esnet" or argv[2] != "configure":
+                error_stream.write(USAGE + "\n")
+                return 2
+            if not is_tty:
+                error_stream.write(
+                    "agent-box: credentials esnet configure requires an "
+                    "interactive terminal\n"
+                )
+                return 77
+            from agent_box_setup import reconfigure_amsc_credential_interactive
+
+            status = reconfigure_amsc_credential_interactive(
+                home,
+                input_stream=input_stream,
+                output_stream=output_stream,
+            )
+            output_stream.write("credential reconfiguration status: %s\n"
+                                % status)
             return 0
         if argv[0] == "config":
             if len(argv) < 2:
