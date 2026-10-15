@@ -805,16 +805,19 @@ def write_amsc_token(home, token):
             try:
                 _rename_noreplace_at(dir_fd, leaf_name, dir_fd, backup_name)
             except FileExistsError:
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
                 raise CredentialError(
                     "backup destination name already exists; refusing "
                     "to overwrite an unverified object"
                 )
             except FileNotFoundError:
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
                 raise CredentialError(
                     "existing token vanished before publication; "
                     "refusing to publish into an unknown namespace state"
                 )
             except OSError:
+                _release_temp_leaf(dir_fd, temp_name, temp_st)
                 raise CredentialError(
                     "existing token could not be moved with an atomic "
                     "no-replace rename; refusing to overwrite"

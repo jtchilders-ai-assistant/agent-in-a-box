@@ -90,6 +90,51 @@ class AmscSecurityRegressionTests(unittest.TestCase):
                 with self.assertRaises(CredentialError):
                     remove_amsc_token(home)
 
+    def test_backup_move_failures_clean_candidate_without_mutating_predecessor(self):
+        import agent_box_credentials as credentials
+
+        for kind in ("collision", "oserror"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as home:
+                path = write_amsc_token(home, "old-token")
+                directory = os.path.dirname(path)
+                collision = os.path.join(directory, ".amsc-token.fixed")
+                if kind == "collision":
+                    with open(collision, "w", encoding="utf-8") as handle:
+                        handle.write("foreign-backup")
+                    os.chmod(collision, 0o600)
+                    suffix_patch = mock.patch.object(
+                        credentials, "_random_tombstone_suffix", return_value="fixed"
+                    )
+                    move_patch = mock.patch.object(
+                        credentials, "_rename_noreplace_at", wraps=credentials._rename_noreplace_at
+                    )
+                else:
+                    suffix_patch = mock.patch.object(
+                        credentials, "_random_tombstone_suffix", return_value="move-failure"
+                    )
+                    real_move = credentials._rename_noreplace_at
+
+                    def fail_backup(src_fd, src, dst_fd, dst):
+                        if src == "amsc-token" and dst.startswith(".amsc-token."):
+                            raise OSError("injected backup failure")
+                        return real_move(src_fd, src, dst_fd, dst)
+
+                    move_patch = mock.patch.object(
+                        credentials, "_rename_noreplace_at", side_effect=fail_backup
+                    )
+                with suffix_patch, move_patch:
+                    with self.assertRaises(CredentialError) as raised:
+                        write_amsc_token(home, "rejected-candidate")
+                self.assertNotIn("rejected-candidate", str(raised.exception))
+                with open(path, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "old-token")
+                if kind == "collision":
+                    with open(collision, encoding="utf-8") as handle:
+                        self.assertEqual(handle.read(), "foreign-backup")
+                for name in os.listdir(directory):
+                    with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                        self.assertNotEqual(handle.read(), "rejected-candidate")
+
     def test_write_never_overwrites_post_validation_substitute(self):
         import agent_box_credentials as credentials
 
