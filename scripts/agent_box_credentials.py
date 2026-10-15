@@ -642,78 +642,6 @@ def read_external_token_file(path):
 # Public API — explicit remove (M-1: validated before unlink)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Parent-directory leaf-name check with absent-only reap.
-#
-# Deletion authority is the exact esnet/amsc-token object verified via
-# the trusted esnet dir_fd.  A file under the same name in a parent
-# credential directory is a candidate for legitimate user data, so an
-# entry whose PRESENCE is observed is never touched here — it is
-# recorded as an anomaly only, and never affects the removal verdict.
-# The single narrow exception: when a descriptor-relative lstat has
-# just CONFIRMED the reserved leaf name absent in a credential parent,
-# one idempotent descriptor-relative unlink of that exact name runs.
-# It can therefore delete only an entry that appeared in the instant
-# between the check and the unlink — never anything this function ever
-# observed, and never anything outside the credential hierarchy or
-# under any other name.  This is the last-line defense against an
-# attacker re-planting the reserved name during removal; it is not a
-# general "hygiene" sweep and performs no deletion of observed
-# entries.
-# ---------------------------------------------------------------------------
-
-def _parent_dir_fds(home):
-    """Return live descriptors on the parent credential directories.
-
-    Re-walked no-follow from the supplied home (same policy as the main
-    traversal).  Returns a possibly-partial list of live descriptors
-    for the parent components that exist and pass policy; [] when even
-    the first is missing.  Caller owns every returned fd.
-    """
-    fds = []
-    try:
-        home_fd = _open_home(home)
-    except CredentialError:
-        return fds
-    try:
-        for index, component in enumerate(_AMSC_PARENT_COMPONENTS[:-1]):
-            parent_fd = home_fd if index == 0 else fds[index - 1]
-            try:
-                child_fd = _open_component_trusted(parent_fd, component)
-            except (CredentialError, FileNotFoundError, OSError):
-                break
-            fds.append(child_fd)
-    finally:
-        os.close(home_fd)
-    return fds
-
-
-def _check_leaf_name_in_parents(home, leaf_name):
-    """Observed-present parent entries are NEVER touched.
-
-    For each reachable credential parent: lstat the reserved leaf name
-    through the trusted parent descriptor.  Present -> anomaly noted,
-    entry left completely in place, verdict unaffected.  Absent -> a
-    single idempotent descriptor-relative unlink of that exact name
-    (absent-only reap, see section comment) so a plant racing the
-    removal cannot persist.  Errors are fail-safe: treated as present.
-    """
-    for parent_fd in _parent_dir_fds(home):
-        try:
-            os.lstat(leaf_name, dir_fd=parent_fd)
-            present = True
-        except FileNotFoundError:
-            present = False
-        except OSError:
-            present = True
-        if not present:
-            try:
-                os.unlink(leaf_name, dir_fd=parent_fd)
-            except (FileNotFoundError, OSError):
-                pass
-        os.close(parent_fd)
-
-
 def remove_amsc_token(home):
     """Delete the persisted token, but only after full safety checks.
 
@@ -811,15 +739,10 @@ def remove_amsc_token(home):
         os.unlink(pending_name, dir_fd=dir_fd)
         pending_name = None
         os.fsync(dir_fd)
-        # Deletion authority over the esnet leaf was exercised exactly
-        # once, on the exact verified object.  Check the reserved leaf
-        # name in the credential parents: entries observed present are
-        # NEVER touched (they are outside deletion authority and may
-        # be user data); a name confirmed absent gets the idempotent
-        # absent-only reap that defeats a same-instant re-plant.
-        _check_leaf_name_in_parents(home, leaf_name)
         # Final authoritative verdict comes from the trusted esnet
-        # directory only.
+        # directory only.  No operation is performed in any parent or
+        # sibling directory: deletion authority is limited to the exact
+        # verified credential object inside this trusted dir_fd.
         try:
             os.lstat(leaf_name, dir_fd=dir_fd)
         except FileNotFoundError:

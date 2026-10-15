@@ -272,17 +272,17 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             with open(replacement, "w", encoding="utf-8") as handle:
                 handle.write("replacement-token")
             os.chmod(replacement, 0o600)
-            real_unlink = os.unlink
+            real_rename = os.rename
             swapped = False
 
-            def swap_before_unlink(candidate, *args, **kwargs):
+            def swap_before_rename(source, destination, *args, **kwargs):
                 nonlocal swapped
-                if candidate == "amsc-token" and kwargs.get("dir_fd") is not None:
+                if source == "amsc-token" and kwargs.get("src_dir_fd") is not None:
                     swapped = True
                     os.replace(replacement, path)
-                return real_unlink(candidate, *args, **kwargs)
+                return real_rename(source, destination, *args, **kwargs)
 
-            with mock.patch("agent_box_credentials.os.unlink", side_effect=swap_before_unlink):
+            with mock.patch("agent_box_credentials.os.rename", side_effect=swap_before_rename):
                 try:
                     result = remove_amsc_token(home)
                 except CredentialError:
