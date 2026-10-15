@@ -293,6 +293,46 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             with open(path, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "replacement-token")
 
+    def test_remove_never_deletes_same_named_files_outside_esnet_directory(self):
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, "real-token")
+            agent_box_dir = os.path.join(home, "agent-box")
+            credentials_dir = os.path.join(agent_box_dir, "credentials")
+            unrelated = [
+                os.path.join(agent_box_dir, "amsc-token"),
+                os.path.join(credentials_dir, "amsc-token"),
+            ]
+            for index, path in enumerate(unrelated):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("unrelated-%d" % index)
+                os.chmod(path, 0o600)
+
+            self.assertTrue(remove_amsc_token(home))
+            for index, path in enumerate(unrelated):
+                self.assertTrue(os.path.exists(path))
+                with open(path, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "unrelated-%d" % index)
+
+    def test_management_cli_redacts_credential_errors(self):
+        with tempfile.TemporaryDirectory() as home:
+            errors = io.StringIO()
+            with mock.patch(
+                "agent_box_setup.reconfigure_amsc_credential_interactive",
+                side_effect=CredentialError(SECRET),
+            ):
+                rc = agent_box.main(
+                    ["credentials", "esnet", "configure"],
+                    home=home,
+                    registry_path=REGISTRY_PATH,
+                    input_stream=io.StringIO(""),
+                    output_stream=io.StringIO(),
+                    error_stream=errors,
+                    is_tty=True,
+                    environ={},
+                )
+            self.assertEqual(rc, 77)
+            self.assertNotIn(SECRET, errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

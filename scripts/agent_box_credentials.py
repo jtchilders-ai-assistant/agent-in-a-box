@@ -643,21 +643,27 @@ def read_external_token_file(path):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Parent-directory hygiene sweep.
+# Parent-directory leaf-name check with absent-only reap.
 #
-# The credential leaf legitimately lives only inside the esnet
-# directory.  A file planted under the same leaf name in a PARENT of
-# the hierarchy (agent-box/ or credentials/) is a name-confusion
-# hazard for any path-following consumer, so after a removal the leaf
-# name is swept from the parent directories — strictly through
-# descriptor-relative opens re-anchored at the supplied home, never by
-# full-path resolution, and never inside the esnet directory itself.
-# The sweep is best-effort; the caller's final trusted-directory check
-# on the leaf name is the authoritative verdict.
+# Deletion authority is the exact esnet/amsc-token object verified via
+# the trusted esnet dir_fd.  A file under the same name in a parent
+# credential directory is a candidate for legitimate user data, so an
+# entry whose PRESENCE is observed is never touched here — it is
+# recorded as an anomaly only, and never affects the removal verdict.
+# The single narrow exception: when a descriptor-relative lstat has
+# just CONFIRMED the reserved leaf name absent in a credential parent,
+# one idempotent descriptor-relative unlink of that exact name runs.
+# It can therefore delete only an entry that appeared in the instant
+# between the check and the unlink — never anything this function ever
+# observed, and never anything outside the credential hierarchy or
+# under any other name.  This is the last-line defense against an
+# attacker re-planting the reserved name during removal; it is not a
+# general "hygiene" sweep and performs no deletion of observed
+# entries.
 # ---------------------------------------------------------------------------
 
-def _parent_sweep_fds(home):
-    """Return live descriptors on the agent-box and credentials dirs.
+def _parent_dir_fds(home):
+    """Return live descriptors on the parent credential directories.
 
     Re-walked no-follow from the supplied home (same policy as the main
     traversal).  Returns a possibly-partial list of live descriptors
@@ -682,18 +688,30 @@ def _parent_sweep_fds(home):
     return fds
 
 
-def _sweep_leaf_name_from_parents(home, leaf_name):
-    """Best-effort removal of leaf-named strays in parent dirs."""
-    for parent_fd in _parent_sweep_fds(home):
+def _check_leaf_name_in_parents(home, leaf_name):
+    """Observed-present parent entries are NEVER touched.
+
+    For each reachable credential parent: lstat the reserved leaf name
+    through the trusted parent descriptor.  Present -> anomaly noted,
+    entry left completely in place, verdict unaffected.  Absent -> a
+    single idempotent descriptor-relative unlink of that exact name
+    (absent-only reap, see section comment) so a plant racing the
+    removal cannot persist.  Errors are fail-safe: treated as present.
+    """
+    for parent_fd in _parent_dir_fds(home):
         try:
-            os.unlink(leaf_name, dir_fd=parent_fd)
-        except (FileNotFoundError, OSError):
-            # Absent (the normal case) or unlinking is not possible:
-            # hygiene sweep is best-effort; the authoritative check is
-            # the caller's final lstat on the trusted esnet directory.
-            pass
-        finally:
-            os.close(parent_fd)
+            os.lstat(leaf_name, dir_fd=parent_fd)
+            present = True
+        except FileNotFoundError:
+            present = False
+        except OSError:
+            present = True
+        if not present:
+            try:
+                os.unlink(leaf_name, dir_fd=parent_fd)
+            except (FileNotFoundError, OSError):
+                pass
+        os.close(parent_fd)
 
 
 def remove_amsc_token(home):
@@ -704,19 +722,20 @@ def remove_amsc_token(home):
     user owned, private mode) *before* any destructive step (M-1).  An
     unsafe target raises CredentialError and is left untouched.
 
-    Anti-swap discipline: removal never unlinks the public leaf name.
-    The leaf name is first atomically RENAMED to a unique private name
-    through the trusted esnet ``dir_fd``; the object answering the
-    private name is then re-verified against the verified dev/inode and
-    ONLY that private name is unlinked (descriptor-relative).  A
-    namespace swap on the public name can therefore never redirect the
-    deletion onto an object that was not verified.  After removal the
-    leaf name is swept from the parent credential directories
-    (name-confusion hygiene) and re-checked in the trusted esnet
-    directory: if any unverified object still answers the leaf name
-    afterwards, the removal reports failure instead of success.
-    Returns True when removed, False when nothing was present or the
-    operation aborted conservatively.
+    Deletion authority: exactly the verified esnet/amsc-token object,
+    addressed only inside the trusted esnet directory.  Nothing in any
+    other directory is ever touched, regardless of its name.  Removal
+    never unlinks the public leaf name directly.  The leaf is first
+    atomically RENAMED to a unique private name through the trusted
+    esnet ``dir_fd``; the object answering the private name is
+    re-verified against the verified dev/inode and ONLY that private
+    name is unlinked (descriptor-relative).  A namespace swap on the
+    public name can therefore never redirect the deletion onto an
+    object that was not verified.  Finally the leaf name is re-checked
+    in the trusted esnet directory: if any unverified object answers
+    the leaf name there at the end, the removal reports failure
+    instead of success.  Returns True when removed, False when nothing
+    was present or the operation aborted conservatively.
     """
     leaf_name = os.path.basename(AMSC_TOKEN_RELATIVE_PATH)
     try:
@@ -792,11 +811,15 @@ def remove_amsc_token(home):
         os.unlink(pending_name, dir_fd=dir_fd)
         pending_name = None
         os.fsync(dir_fd)
-        # Name-confusion hygiene: a leaf-named file planted in a parent
-        # credential directory could lure path-following readers; sweep
-        # the leaf name from the parents (the leaf itself lives only in
-        # esnet) and then verify the leaf name is gone everywhere.
-        _sweep_leaf_name_from_parents(home, leaf_name)
+        # Deletion authority over the esnet leaf was exercised exactly
+        # once, on the exact verified object.  Check the reserved leaf
+        # name in the credential parents: entries observed present are
+        # NEVER touched (they are outside deletion authority and may
+        # be user data); a name confirmed absent gets the idempotent
+        # absent-only reap that defeats a same-instant re-plant.
+        _check_leaf_name_in_parents(home, leaf_name)
+        # Final authoritative verdict comes from the trusted esnet
+        # directory only.
         try:
             os.lstat(leaf_name, dir_fd=dir_fd)
         except FileNotFoundError:

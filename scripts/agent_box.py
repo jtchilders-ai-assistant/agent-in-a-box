@@ -13,8 +13,12 @@ Design constraints:
   testable without touching the real user home.
 - Output is secret-free by construction: it renders only facility names,
   enabled booleans, and IRI versions from the product config, which itself
-  is validated to carry no credential material.  This module never opens,
-  reads, or references credential files.
+  is validated to carry no credential material.  This module never opens
+  or reads credential files itself; credential operations it triggers
+  (credentials esnet configure) run inside agent_box_credentials/
+  agent_box_setup, and any CredentialError escaping them is reported as
+  a fixed, secret-free notice with exit 77 (credential messages may
+  carry sensitive context and are never rendered).
 - Facility listing follows the shipped registry's insertion order (the
   documented wizard order).
 """
@@ -26,6 +30,7 @@ from agent_box_config import (
     load_product_config,
     load_registry,
 )
+from agent_box_credentials import CredentialError
 
 USAGE = (
     "usage: agent-box configure | agent-box config show "
@@ -148,6 +153,15 @@ def main(argv, home, registry_path, output_stream, error_stream,
             return 2
         error_stream.write("unknown command: %s\n%s\n" % (argv[0], USAGE))
         return 2
+    except CredentialError:
+        # Credential failures may legitimately carry sensitive detail in
+        # their message (validator/capture context); the CLI surfaces a
+        # fixed, secret-free notice and the failure exit code only.
+        error_stream.write(
+            "agent-box: ESnet credential operation failed; no details "
+            "are reported.\n"
+        )
+        return 77
     except ConfigError as exc:
         error_stream.write("agent-box: %s\n" % exc)
         return exc.exit_code
