@@ -992,7 +992,8 @@ def remove_amsc_token(home):
         except FileNotFoundError:
             return True
         except OSError:
-            return True
+            # Final namespace state is unknown; never report success.
+            return False
         return False
     finally:
         if token_fd is not None:

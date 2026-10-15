@@ -266,6 +266,27 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             observed = len(os.listdir(fd_root))
             self.assertLessEqual(observed, baseline + 2)
 
+    def test_remove_final_namespace_io_error_never_reports_success(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            write_amsc_token(home, "verified-token")
+            real_lstat = os.lstat
+            calls = {"leaf": 0}
+
+            def fail_final_leaf_check(path, *args, **kwargs):
+                if path == "amsc-token" and kwargs.get("dir_fd") is not None:
+                    calls["leaf"] += 1
+                    if calls["leaf"] == 2:
+                        raise OSError(5, "injected final verification failure")
+                return real_lstat(path, *args, **kwargs)
+
+            with mock.patch.object(
+                credentials.os, "lstat", side_effect=fail_final_leaf_check
+            ):
+                self.assertFalse(remove_amsc_token(home))
+            self.assertEqual(calls["leaf"], 2)
+
     def test_remove_reports_failure_truthfully_in_reconfigure_ui(self):
         from agent_box_setup import reconfigure_amsc_credential_interactive
 
