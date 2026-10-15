@@ -36,10 +36,16 @@ Trust-boundary rules enforced here (Aegis I-1 / I-3 / M-1):
   the anchor cannot redirect the write.  A failed replace preserves
   the previous token and removes the temp file; the underlying OSError
   propagates.
-- ``remove_amsc_token`` (M-1) re-validates the trusted parent chain and
-  the leaf (no-follow open + ``fstat``: regular, owned, private)
-  *before* unlinking through the trusted directory descriptor; an
-  unsafe target is rejected, never removed.
+- ``remove_amsc_token`` (M-1 / Aegis IMP-01) performs NO unlink at all:
+  it renames the verified leaf to a random tombstone name inside the
+  trusted esnet directory, verifies the tombstone's dev/inode equals
+  the opened verified descriptor (restoring and failing closed on a
+  mismatch), then destroys the credential bytes THROUGH THAT VERIFIED
+  DESCRIPTOR (ftruncate + fsync + directory fsync).  The empty
+  tombstone is retained deliberately — reclaiming it would require an
+  unsafe name-based unlink again — so same-UID pathname races can
+  never redirect destruction or deletion onto an unverified object.
+  Unsafe targets are rejected before any destructive step.
 - Exactly one terminal line ending (CRLF or LF) is removed from a
   captured value; all other content, including leading/trailing
   whitespace, is preserved verbatim.  Empty values are rejected.
@@ -639,31 +645,55 @@ def read_external_token_file(path):
 
 
 # ---------------------------------------------------------------------------
-# Public API — explicit remove (M-1: validated before unlink)
+# Public API — explicit remove (fail-safe destruction semantics)
 # ---------------------------------------------------------------------------
 
+def _random_tombstone_suffix():
+    """Unpredictable, non-secret name suffix for removal tombstones."""
+    import secrets
+
+    return secrets.token_hex(16)
+
+
 def remove_amsc_token(home):
-    """Delete the persisted token, but only after full safety checks.
+    """Destroy the persisted token without ever unlinking a pathname.
 
     The trusted parent chain is re-walked no-follow; the leaf is opened
-    no-follow and validated from its descriptor (regular file, current
-    user owned, private mode) *before* any destructive step (M-1).  An
-    unsafe target raises CredentialError and is left untouched.
+    no-follow WRITABLE and validated from its descriptor (regular file,
+    current user owned, private mode) and against the trusted directory
+    view *before* any destructive step (M-1).  An unsafe target raises
+    CredentialError and is left untouched.
 
-    Deletion authority: exactly the verified esnet/amsc-token object,
-    addressed only inside the trusted esnet directory.  Nothing in any
-    other directory is ever touched, regardless of its name.  Removal
-    never unlinks the public leaf name directly.  The leaf is first
-    atomically RENAMED to a unique private name through the trusted
-    esnet ``dir_fd``; the object answering the private name is
-    re-verified against the verified dev/inode and ONLY that private
-    name is unlinked (descriptor-relative).  A namespace swap on the
-    public name can therefore never redirect the deletion onto an
-    object that was not verified.  Finally the leaf name is re-checked
-    in the trusted esnet directory: if any unverified object answers
-    the leaf name there at the end, the removal reports failure
-    instead of success.  Returns True when removed, False when nothing
-    was present or the operation aborted conservatively.
+    Destruction discipline (Aegis IMP-01): POSIX offers no
+    identity-conditional unlink, so removal performs NO unlink at all —
+    not of the public leaf, not of any pending/tombstone name.  Instead:
+
+    1. The public leaf is atomically RENAMED (descriptor-relative,
+       trusted esnet dir_fd on both endpoints) to an unpredictable,
+       non-secret random tombstone name.
+    2. The tombstone is re-opened descriptor-relative no-follow and its
+       dev/inode must equal the originally opened token descriptor.
+       A wrong object under the tombstone name (namespace race) means
+       the rename moved the wrong bytes: the tombstone is renamed back
+       (restore, current semantics) and the operation fails closed —
+       no bytes of any unverified object are destroyed.
+    3. Verified identity established, the credential bytes are destroyed
+       THROUGH THE ORIGINAL VERIFIED DESCRIPTOR: ftruncate(0) + fsync.
+       Destruction travels with the descriptor, not the name, so a
+       same-UID concurrent substitution of the tombstone pathname can
+       never redirect destruction onto — or deletion of — an object
+       that was not verified.
+    4. fsync of the trusted directory; the tombstone itself is RETAINED
+       (now empty).  Bounded tombstone accumulation is deliberately not
+       reclaimed: reaping it would require unlinking a mutable pathname
+       — the exact race this design eliminates — so empty tombstones
+       with random names are kept as the safe outcome.
+
+    Afterwards the public leaf name is re-checked in the trusted esnet
+    directory: if any object answers the leaf name at the end, the
+    removal reports failure instead of success.  Returns True when the
+    token was destroyed and the public path is absent, False when
+    nothing was present or the operation aborted conservatively.
     """
     leaf_name = os.path.basename(AMSC_TOKEN_RELATIVE_PATH)
     try:
@@ -673,12 +703,13 @@ def remove_amsc_token(home):
     except (FileNotFoundError, OSError):
         return False
     token_fd = None
-    pending_name = None
+    tombstone_name = None
+    tombstone_restored = False
     try:
         try:
             token_fd = os.open(
                 leaf_name,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
                 dir_fd=dir_fd,
             )
         except FileNotFoundError:
@@ -706,59 +737,65 @@ def remove_amsc_token(home):
                 "token leaf in the trusted directory is not the file "
                 "that was verified; refusing to remove"
             )
-        # Atomic rename of the verified leaf to a unique private name,
-        # both endpoints scoped to the trusted directory descriptor.
-        pending_name = ".amsc-token.pending.%d.%d" % (
-            os.getpid(), st_fd.st_ino,
-        )
+        # Atomic rename of the verified leaf to an unpredictable random
+        # tombstone name, both endpoints scoped to the trusted esnet
+        # directory descriptor.  No unlink follows — ever.
+        tombstone_name = ".amsc-token.%s" % _random_tombstone_suffix()
         try:
-            os.rename(leaf_name, pending_name,
+            os.rename(leaf_name, tombstone_name,
                       src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except FileNotFoundError:
+            tombstone_name = None
             return False
-        # Verify the renamed entry is exactly the verified object
-        # before any unlink.  A swap installed between identity check
-        # and rename renamed the WRONG object: undo, never delete.
-        pending_fd = os.open(pending_name,
-                             os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        # Verify the tombstone holds exactly the verified object before
+        # destroying any bytes.  A race that moved a different object
+        # gets restored (renamed back) and fails closed.
+        verify_fd = os.open(tombstone_name,
+                            os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
         try:
-            st_pending = os.fstat(pending_fd)
+            st_tombstone = os.fstat(verify_fd)
         finally:
-            os.close(pending_fd)
-        if not _identity_matches(st_fd, st_pending):
+            os.close(verify_fd)
+        if not _identity_matches(st_fd, st_tombstone):
             try:
-                os.rename(pending_name, leaf_name,
+                os.rename(tombstone_name, leaf_name,
                           src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                tombstone_restored = True
             except OSError:
                 pass
-            pending_name = None
+            tombstone_name = None
             raise CredentialError(
                 "renamed credential leaf is not the verified object; "
                 "refusing to remove"
             )
-        os.unlink(pending_name, dir_fd=dir_fd)
-        pending_name = None
+        # Destroy the credential bytes through the ORIGINAL verified
+        # descriptor: name-independent, unlink-free.
+        os.ftruncate(token_fd, 0)
+        os.fsync(token_fd)
         os.fsync(dir_fd)
-        # Final authoritative verdict comes from the trusted esnet
-        # directory only.  No operation is performed in any parent or
-        # sibling directory: deletion authority is limited to the exact
-        # verified credential object inside this trusted dir_fd.
+        # Public path must be gone; if anything answers the leaf name
+        # now, the removal reports failure conservatively.  The empty
+        # tombstone remains by design (see docstring).
+        tombstone_name = None
         try:
             os.lstat(leaf_name, dir_fd=dir_fd)
         except FileNotFoundError:
             return True
         except OSError:
             return True
-        # Something we never verified now answers the leaf name in the
-        # trusted directory: conservatively report the removal as not
-        # completed.  The verified object itself was already removed.
         return False
     finally:
         if token_fd is not None:
             os.close(token_fd)
-        if pending_name is not None:
+        if tombstone_name is not None and not tombstone_restored:
+            # Abnormal exit after a successful rename (e.g. the
+            # tombstone open/truncate path failed): attempt to restore
+            # the credential to its public path so user data is not
+            # orphaned; if restore fails the (possibly non-empty)
+            # tombstone is left in place — never unlinked.
             try:
-                os.unlink(pending_name, dir_fd=dir_fd)
+                os.rename(tombstone_name, leaf_name,
+                          src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             except OSError:
                 pass
         os.close(dir_fd)

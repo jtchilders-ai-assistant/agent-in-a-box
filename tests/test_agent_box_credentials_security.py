@@ -265,6 +265,47 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             observed = len(os.listdir(fd_root))
             self.assertLessEqual(observed, baseline + 2)
 
+    def test_remove_never_unlinks_a_post_verification_substitute(self):
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "original-token")
+            directory = os.path.dirname(token_path)
+            replacement = os.path.join(directory, "replacement-after-check")
+            with open(replacement, "w", encoding="utf-8") as handle:
+                handle.write("replacement-token")
+            os.chmod(replacement, 0o600)
+            real_unlink = os.unlink
+            swapped = False
+
+            def substitute_before_pending_unlink(candidate, *args, **kwargs):
+                nonlocal swapped
+                if (
+                    isinstance(candidate, str)
+                    and candidate.startswith(".amsc-token.pending.")
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    swapped = True
+                    # Resolve the trusted directory only for deterministic
+                    # attack injection; production code must not depend on it.
+                    pending_path = os.path.join(directory, candidate)
+                    os.replace(replacement, pending_path)
+                return real_unlink(candidate, *args, **kwargs)
+
+            with mock.patch(
+                "agent_box_credentials.os.unlink",
+                side_effect=substitute_before_pending_unlink,
+            ):
+                result = remove_amsc_token(home)
+
+            # A secure implementation may avoid the vulnerable unlink
+            # entirely; otherwise an injected substitute must survive and
+            # the operation must fail closed.
+            if swapped:
+                self.assertFalse(result)
+                self.assertTrue(os.path.exists(replacement))
+                with open(replacement, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "replacement-token")
+            self.assertFalse(os.path.exists(token_path))
+
     def test_remove_does_not_unlink_replacement_leaf(self):
         with tempfile.TemporaryDirectory() as home:
             path = write_amsc_token(home, "original-token")
