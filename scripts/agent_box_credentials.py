@@ -129,6 +129,17 @@ _PRIVATE_DIR_MODE = 0o700
 # Private mode for the token file itself.
 _TOKEN_FILE_MODE = 0o600
 
+# Capture the real stdlib function identities once. Tests and callers may
+# monkeypatch os.open/os.unlink to inject races; capability detection must
+# describe the platform, not the temporary mock objects.
+_REQUIRED_DIR_FD_FUNCTIONS = (
+    os.open,
+    os.mkdir,
+    os.unlink,
+    os.chmod,
+    os.stat,  # os.lstat(..., dir_fd=) uses stat-family capability
+)
+
 # Hidden prompt shown before a credential read; contains no secret.
 _TOKEN_PROMPT = "Enter your ESnet AmSC token (input hidden): "
 
@@ -147,15 +158,13 @@ def _require_nofollow():
     operate instead of silently falling back to path-based (symlink-
     following) equivalents.
     """
+    supports_dir_fd = getattr(os, "supports_dir_fd", frozenset())
     if not (
         getattr(os, "O_NOFOLLOW", 0)
         and getattr(os, "O_DIRECTORY", 0)
-        and callable(getattr(os, "open", None))
-        and callable(getattr(os, "mkdir", None))
-        and callable(getattr(os, "unlink", None))
+        and all(function in supports_dir_fd
+                for function in _REQUIRED_DIR_FD_FUNCTIONS)
         and callable(getattr(os, "lstat", None))
-        and callable(getattr(os, "link", None))
-        and callable(getattr(os, "rename", None))
         and callable(getattr(os, "ftruncate", None))
         and callable(getattr(os, "fsync", None))
     ):

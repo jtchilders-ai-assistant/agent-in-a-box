@@ -78,6 +78,18 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             with self.assertRaises(CredentialError):
                 write_amsc_token(home, SECRET)
 
+    def test_operations_fail_closed_without_dir_fd_capabilities(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.object(credentials.os, "supports_dir_fd", frozenset()):
+                with self.assertRaises(CredentialError):
+                    write_amsc_token(home, "token")
+                with self.assertRaises(CredentialError):
+                    read_amsc_token(home)
+                with self.assertRaises(CredentialError):
+                    remove_amsc_token(home)
+
     def test_write_never_overwrites_post_validation_substitute(self):
         import agent_box_credentials as credentials
 
