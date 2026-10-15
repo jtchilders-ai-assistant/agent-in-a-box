@@ -1,3 +1,4 @@
+import errno
 import io
 import os
 import stat
@@ -316,36 +317,60 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             def fail_first_fsync(fd):
                 state["fsyncs"] += 1
                 if state["fsyncs"] == 1:
-                    raise OSError("injected token fsync failure")
-                return real_fsync(fd)
-
-            real_rename = os.rename
-
-            def plant_before_restore(source, destination, *args, **kwargs):
-                if (
-                    isinstance(source, str)
-                    and source.startswith(".amsc-token.")
-                    and destination == "amsc-token"
-                    and not state["planted"]
-                ):
-                    state["planted"] = True
+                    # Deterministic racer: the instant token destruction
+                    # hits an fsync failure, an unverified object takes
+                    # the public path. A restore attempt would then have
+                    # to survive without displacing it.
                     with open(token_path, "w", encoding="utf-8") as handle:
                         handle.write("unverified-public")
                     os.chmod(token_path, 0o600)
-                return real_rename(source, destination, *args, **kwargs)
+                    state["planted"] = True
+                    raise OSError("injected token fsync failure")
+                return real_fsync(fd)
 
-            with mock.patch.object(credentials.os, "fsync", side_effect=fail_first_fsync), mock.patch.object(
-                credentials.os, "rename", side_effect=plant_before_restore
-            ):
+            real_noreplace = credentials._rename_noreplace_at
+            restore_calls = []
+
+            def track_restores(src_dir_fd, src, dst_dir_fd, dst):
+                # Any restore seam (tombstone -> public) is recorded so
+                # the assertion can prove the planted object survived
+                # even if such a seam were ever reached.
+                if isinstance(src, str) and src.startswith(".amsc-token.") \
+                        and dst == "amsc-token":
+                    restore_calls.append((src, dst))
+                    with open(os.path.join(os.path.dirname(token_path), src),
+                              encoding="utf-8") as handle:
+                        moved_content = handle.read()
+                    try:
+                        return real_noreplace(src_dir_fd, src,
+                                             dst_dir_fd, dst)
+                    finally:
+                        if os.path.lexists(token_path):
+                            with open(token_path, encoding="utf-8") as handle:
+                                if handle.read() == "unverified-public":
+                                    # Reoccupant present: restore cannot
+                                    # displace it; replant for the
+                                    # assertion below.
+                                    with open(os.path.join(
+                                            os.path.dirname(token_path), src),
+                                            "w", encoding="utf-8") as handle:
+                                        handle.write(moved_content)
+                return real_noreplace(src_dir_fd, src, dst_dir_fd, dst)
+
+            with mock.patch.object(credentials.os, "fsync",
+                                   side_effect=fail_first_fsync), \
+                    mock.patch.object(credentials, "_rename_noreplace_at",
+                                      side_effect=track_restores):
                 with self.assertRaises(OSError):
                     remove_amsc_token(home)
 
             # A secure implementation never attempts restoration onto the
-            # mutable public path. If a legacy restore seam was reached, the
-            # planted object must still survive unchanged.
-            if state["planted"]:
-                with open(token_path, encoding="utf-8") as handle:
-                    self.assertEqual(handle.read(), "unverified-public")
+            # mutable public path once destruction has begun. If a legacy
+            # restore seam was reached, the planted object must still
+            # survive unchanged.
+            self.assertTrue(state["planted"])
+            with open(token_path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "unverified-public")
 
     def test_write_closes_temp_fd_when_fchmod_fails(self):
         fd_root = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
@@ -395,23 +420,23 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             with open(token_path, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "verified-token")
 
-    def test_remove_mismatch_restore_never_links_over_public_reoccupant(self):
+    def test_remove_mismatch_restore_never_displaces_public_reoccupant(self):
         import agent_box_credentials as credentials
 
         with tempfile.TemporaryDirectory() as home:
             token_path = write_amsc_token(home, "verified-token")
             directory = os.path.dirname(token_path)
             swapped = {"done": False}
-            real_rename = os.rename
+            real_noreplace = credentials._rename_noreplace_at
 
-            def race_before_move(source, destination, *args, **kwargs):
+            def race_before_move(src_dir_fd, src, dst_dir_fd, dst):
                 # Deterministic namespace race: after the implementation
                 # has verified the leaf, a same-UID racer swaps a
-                # foreign object under the public name so the rename
-                # moves the wrong inode, and once the rename has
+                # foreign object under the public name so the move
+                # transports the wrong inode, and once the move has
                 # completed the racer reoccupies the public path with
                 # an unrelated object the restore must never displace.
-                if source == "amsc-token" and kwargs.get("src_dir_fd") is not None:
+                if src == "amsc-token":
                     original = os.path.join(directory, "original-inode")
                     os.rename(token_path, original)
                     foreign = os.path.join(directory, "foreign-object")
@@ -419,7 +444,8 @@ class AmscSecurityRegressionTests(unittest.TestCase):
                         handle.write("foreign-token")
                     os.chmod(foreign, 0o600)
                     os.rename(foreign, token_path)
-                    result = real_rename(source, destination, *args, **kwargs)
+                    result = real_noreplace(src_dir_fd, src,
+                                           dst_dir_fd, dst)
                     with open(token_path + ".reoccupant", "w",
                               encoding="utf-8") as handle:
                         handle.write("unverified-reoccupant")
@@ -427,22 +453,25 @@ class AmscSecurityRegressionTests(unittest.TestCase):
                     os.rename(token_path + ".reoccupant", token_path)
                     swapped["done"] = True
                     return result
-                return real_rename(source, destination, *args, **kwargs)
+                # The tombstone -> public restore attempt: honour real
+                # no-replace semantics (EEXIST if the public name is
+                # occupied) via the platform helper.
+                return real_noreplace(src_dir_fd, src, dst_dir_fd, dst)
 
             with mock.patch.object(
-                credentials.os, "rename", side_effect=race_before_move
+                credentials, "_rename_noreplace_at",
+                side_effect=race_before_move
             ):
                 with self.assertRaises(CredentialError):
                     remove_amsc_token(home)
             self.assertTrue(swapped["done"])
-            # The no-replace hard-link restore must fail EEXIST and
-            # must never displace the public reoccupant.
+            # The atomic no-replace restore must fail EEXIST and must
+            # never displace the public reoccupant.
             with open(token_path, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "unverified-reoccupant")
             # The moved foreign object is never destroyed: it survives
             # intact under the retained tombstone name and nowhere
             # else.
-            directory = os.path.dirname(token_path)
             survivors = [
                 name for name in os.listdir(directory)
                 if name.startswith(".amsc-token.")
@@ -530,40 +559,41 @@ class AmscSecurityRegressionTests(unittest.TestCase):
             ]
             self.assertTrue(survivors)
 
-    def test_removal_procedure_uses_no_unlink_or_restore_rename(self):
+    def test_removal_procedure_uses_no_unlink_or_overwriting_rename(self):
         # Structural guard for the Aegis IMP-01/IMP-02 invariants: the
-        # removal procedure must contain no unlink call at all, and no
-        # rename call that targets the mutable public leaf name as its
-        # destination (an ordinary rename could clobber a reoccupant).
+        # removal procedure must contain no unlink call at all, no
+        # os.rename/os.link call at all (every namespace move goes
+        # through the atomic no-replace helper), and it must actually
+        # call the no-replace helper.
         import ast
         import inspect
 
         import agent_box_credentials as credentials
 
         tree = ast.parse(inspect.getsource(credentials.remove_amsc_token))
+        helper_calls = 0
         for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)):
+            if not isinstance(node, ast.Call):
                 continue
-            fname = getattr(node.func, "value", None)
-            if not (isinstance(fname, ast.Name) and fname.id == "os"):
-                continue
-            self.assertNotEqual(
-                node.func.attr, "unlink",
-                "remove_amsc_token must never call os.unlink "
-                "(Aegis IMP-01)")
-            if node.func.attr == "rename":
-                self.assertGreaterEqual(len(node.args), 2)
-                destination = ast.dump(node.args[1])
+            if (isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"):
+                self.assertNotEqual(
+                    node.func.attr, "unlink",
+                    "remove_amsc_token must never call os.unlink "
+                    "(Aegis IMP-01)")
                 self.assertNotIn(
-                    "leaf_name", destination,
-                    "remove_amsc_token must never rename onto the "
-                    "public leaf name (Aegis IMP-02), line %d"
+                    node.func.attr, ("rename", "replace", "link"),
+                    "remove_amsc_token must never perform an ordinary "
+                    "rename/replace/link move (Aegis IMP-02), line %d"
                     % node.lineno)
-                for keyword in node.keywords:
-                    if keyword.arg == "dst_dir_fd":
-                        self.assertNotIn(
-                            "leaf_name", ast.dump(keyword.value))
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id == "_rename_noreplace_at"):
+                helper_calls += 1
+        self.assertGreaterEqual(
+            helper_calls, 1,
+            "remove_amsc_token must move through the atomic no-replace "
+            "primitive (Aegis IMP-02)")
 
     def test_remove_never_unlinks_a_post_verification_substitute(self):
         with tempfile.TemporaryDirectory() as home:
@@ -606,24 +636,26 @@ class AmscSecurityRegressionTests(unittest.TestCase):
                     self.assertEqual(handle.read(), "replacement-token")
             self.assertFalse(os.path.exists(token_path))
 
-    def test_remove_does_not_unlink_replacement_leaf(self):
+    def test_remove_does_not_move_replacement_leaf(self):
         with tempfile.TemporaryDirectory() as home:
             path = write_amsc_token(home, "original-token")
             replacement = os.path.join(os.path.dirname(path), "replacement")
             with open(replacement, "w", encoding="utf-8") as handle:
                 handle.write("replacement-token")
             os.chmod(replacement, 0o600)
-            real_rename = os.rename
+            import agent_box_credentials as credentials
+            real_noreplace = credentials._rename_noreplace_at
             swapped = False
 
-            def swap_before_rename(source, destination, *args, **kwargs):
+            def swap_before_move(src_dir_fd, src, dst_dir_fd, dst):
                 nonlocal swapped
-                if source == "amsc-token" and kwargs.get("src_dir_fd") is not None:
+                if src == "amsc-token":
                     swapped = True
                     os.replace(replacement, path)
-                return real_rename(source, destination, *args, **kwargs)
+                return real_noreplace(src_dir_fd, src, dst_dir_fd, dst)
 
-            with mock.patch("agent_box_credentials.os.rename", side_effect=swap_before_rename):
+            with mock.patch.object(credentials, "_rename_noreplace_at",
+                                   side_effect=swap_before_move):
                 try:
                     result = remove_amsc_token(home)
                 except CredentialError:
@@ -673,6 +705,166 @@ class AmscSecurityRegressionTests(unittest.TestCase):
                 )
             self.assertEqual(rc, 77)
             self.assertNotIn(SECRET, errors.getvalue())
+
+
+class RenameNoReplacePrimitiveTests(unittest.TestCase):
+    """Direct coverage of the atomic no-replace rename primitive.
+
+    These exercise the REAL libc call (renameatx_np RENAME_EXCL on
+    Darwin, renameat2 RENAME_NOREPLACE on Linux) — no mocks.
+    """
+
+    def setUp(self):
+        import agent_box_credentials as credentials
+
+        if credentials._rename_noreplace_libc() is None:
+            self.skipTest("platform lacks renameatx_np/renameat2")
+        self.credentials = credentials
+        self.tmp = tempfile.mkdtemp()
+        self.dfd = os.open(self.tmp, os.O_RDONLY)
+
+    def tearDown(self):
+        os.close(self.dfd)
+        for name in os.listdir(self.tmp):
+            os.unlink(os.path.join(self.tmp, name))
+        os.rmdir(self.tmp)
+
+    def _write(self, name, content="x"):
+        with open(os.path.join(self.tmp, name), "w", encoding="utf-8") as h:
+            h.write(content)
+
+    def test_primitive_symbol_matches_platform_header_value(self):
+        # Darwin flag bits are pinned to sys/stdio.h; Linux bit to the
+        # renameat2 uapi. A wrong constant silently disables the
+        # no-replace guarantee, so pin them here.
+        if sys.platform == "darwin":
+            self.assertEqual(self.credentials._DARWIN_RENAME_EXCL, 0x4)
+            self.assertEqual(
+                self.credentials._DARWIN_RENAME_NOFOLLOW_ANY, 0x10)
+            self.assertEqual(
+                self.credentials._DARWIN_RENAME_RESOLVE_BENEATH, 0x20)
+            for attempt in self.credentials._DARWIN_RENAME_FLAG_ATTEMPTS:
+                self.assertTrue(attempt
+                                & self.credentials._DARWIN_RENAME_EXCL)
+        self.assertEqual(self.credentials._LINUX_RENAME_NOREPLACE, 0x1)
+
+    def test_primitive_moves_when_destination_absent(self):
+        self._write("src", "payload")
+        self.credentials._rename_noreplace_at(self.dfd, "src",
+                                              self.dfd, "dst")
+        self.assertFalse(os.path.lexists(os.path.join(self.tmp, "src")))
+        with open(os.path.join(self.tmp, "dst"), encoding="utf-8") as h:
+            self.assertEqual(h.read(), "payload")
+
+    def test_primitive_refuses_existing_destination_both_sides_survive(
+            self):
+        self._write("src", "source-content")
+        self._write("dst", "destination-content")
+        with self.assertRaises(FileExistsError):
+            self.credentials._rename_noreplace_at(self.dfd, "src",
+                                                  self.dfd, "dst")
+        # BOTH endpoints untouched — this is the atomic guarantee an
+        # ordinary rename cannot offer.
+        with open(os.path.join(self.tmp, "src"), encoding="utf-8") as h:
+            self.assertEqual(h.read(), "source-content")
+        with open(os.path.join(self.tmp, "dst"), encoding="utf-8") as h:
+            self.assertEqual(h.read(), "destination-content")
+
+    def test_primitive_missing_source_raises_enoent(self):
+        with self.assertRaises(FileNotFoundError):
+            self.credentials._rename_noreplace_at(self.dfd, "absent",
+                                                  self.dfd, "dst")
+
+    def test_primitive_source_symlink_moves_link_not_target(self):
+        # The public leaf is verified before the move, but the
+        # primitive itself must never follow a source symlink: the
+        # link entry travels, the (unverified) target stays put.
+        outside_dir = tempfile.mkdtemp()
+        outside = os.path.join(outside_dir, "target")
+        try:
+            with open(outside, "w", encoding="utf-8") as h:
+                h.write("outside-target")
+            os.symlink(outside, os.path.join(self.tmp, "linksrc"))
+            self.credentials._rename_noreplace_at(self.dfd, "linksrc",
+                                                  self.dfd, "moved")
+            moved = os.readlink(os.path.join(self.tmp, "moved"))
+            self.assertEqual(moved, outside)
+            # Target untouched.
+            with open(outside, encoding="utf-8") as h:
+                self.assertEqual(h.read(), "outside-target")
+        finally:
+            link = os.path.join(self.tmp, "moved")
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.unlink(outside)
+            os.rmdir(outside_dir)
+
+    def test_primitive_destination_symlink_is_not_replaced_via_target(
+            self):
+        # A dangling destination symlink answers the name: RENAME_EXCL
+        # must refuse (EEXIST) on Darwin; on Linux RENAME_NOREPLACE
+        # replaces the symlink entry itself, never its target.  Assert
+        # only the invariant that holds on both: the symlink's target
+        # object (if any) is never overwritten.
+        target_dir = tempfile.mkdtemp()
+        try:
+            target = os.path.join(target_dir, "victim")
+            with open(target, "w", encoding="utf-8") as h:
+                h.write("victim")
+            os.symlink(target, os.path.join(self.tmp, "dstlink"))
+            self._write("src", "payload")
+            try:
+                self.credentials._rename_noreplace_at(self.dfd, "src",
+                                                      self.dfd,
+                                                      "dstlink")
+                replaced_dst_entry = True
+            except FileExistsError:
+                replaced_dst_entry = False
+            with open(target, encoding="utf-8") as h:
+                self.assertEqual(h.read(), "victim")
+            if not replaced_dst_entry:
+                self.assertTrue(os.path.lexists(
+                    os.path.join(self.tmp, "src")))
+        finally:
+            for name in os.listdir(self.tmp):
+                path = os.path.join(self.tmp, name)
+                if os.path.islink(path):
+                    os.unlink(path)
+            victim = os.path.join(target_dir, "victim")
+            if os.path.lexists(victim):
+                os.unlink(victim)
+            os.rmdir(target_dir)
+
+    def test_remove_fails_closed_without_primitive(self):
+        # ENOTSUP path: with no platform primitive discoverable, the
+        # removal must raise CredentialError and touch nothing — it
+        # must never fall back to an overwriting rename.
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+            with mock.patch.object(credentials, "_rename_noreplace_libc",
+                                   return_value=None):
+                with self.assertRaises(CredentialError):
+                    remove_amsc_token(home)
+            with open(token_path, encoding="utf-8") as h:
+                self.assertEqual(h.read(), "verified-token")
+
+    def test_remove_fails_closed_when_helper_reports_enotsup(self):
+        import agent_box_credentials as credentials
+
+        with tempfile.TemporaryDirectory() as home:
+            token_path = write_amsc_token(home, "verified-token")
+
+            def fake(src_dir_fd, src, dst_dir_fd, dst):
+                raise OSError(errno.ENOTSUP, "Operation not supported")
+
+            with mock.patch.object(credentials, "_rename_noreplace_at",
+                                   side_effect=fake):
+                with self.assertRaises(CredentialError):
+                    remove_amsc_token(home)
+            with open(token_path, encoding="utf-8") as h:
+                self.assertEqual(h.read(), "verified-token")
 
 
 if __name__ == "__main__":

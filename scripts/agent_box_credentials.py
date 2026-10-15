@@ -37,23 +37,31 @@ Trust-boundary rules enforced here (Aegis I-1 / I-3 / M-1):
   the previous token and removes the temp file; the underlying OSError
   propagates.
 - ``remove_amsc_token`` (M-1 / Aegis IMP-01 + IMP-02) performs NO
-  unlink at all and NO unconditional rename onto any destination it has
-  not verified ownership of.  It first CLAIMS the random tombstone name
-  exclusively with ``O_CREAT|O_EXCL`` (a pre-existing or raced-into
-  destination fails closed, untouched), verifies the claim's identity,
-  and only then renames the verified leaf onto that verified claim.
-  The moved object's dev/inode must equal the opened verified descriptor;
-  on a mismatch the object is given its public name back with a
-  no-replace hard link (``os.link`` fails EEXIST if the public path was
-  reoccupied — a link is never attempted over content destruction) and
-  the operation fails closed.  The credential bytes are destroyed only
-  THROUGH THE VERIFIED DESCRIPTOR (ftruncate + fsync + directory fsync);
-  after destruction has begun a restore rename onto the public path is
-  never attempted.  The empty tombstone is retained deliberately —
-  reclaiming it would require an unsafe name-based unlink again — so
-  same-UID pathname races can never redirect destruction or deletion
-  onto an unverified object.  Unsafe targets are rejected before any
-  destructive step.
+  unlink and NO ordinary rename at all.  The verified public leaf is
+  moved to a random tombstone name with the platform's ATOMIC
+  NO-REPLACE rename primitive (``_rename_noreplace_at``): Darwin
+  ``renameatx_np`` with ``RENAME_EXCL`` (plus ``RENAME_NOFOLLOW_ANY``
+  / ``RENAME_RESOLVE_BENEATH`` hardening where the OS accepts them)
+  and Linux ``renameat2`` with ``RENAME_NOREPLACE``.  The kernel
+  performs "move only if the destination does not exist" as one
+  indivisible operation — a pre-existing or raced-into destination
+  yields EEXIST and leaves BOTH endpoints untouched; there is no
+  check-then-rename window for a same-UID racer to exploit.  Both
+  endpoints are descriptor-relative leaf names scoped to the trusted
+  ``esnet`` directory descriptor.  After the move the tombstone's
+  dev/inode must equal the opened verified descriptor; on a
+  source-swap mismatch the moved object is restored tombstone ->
+  public through the SAME atomic no-replace helper (EEXIST leaves a
+  public reoccupant untouched) and the operation fails closed.  The
+  credential bytes are destroyed only THROUGH THE VERIFIED DESCRIPTOR
+  (ftruncate + fsync + directory fsync); after destruction has begun
+  a restore onto the public path is never attempted.  The empty
+  tombstone is retained deliberately — reclaiming it would require an
+  unsafe name-based unlink again — so same-UID pathname races can
+  never redirect destruction or deletion onto an unverified object.
+  Unsafe targets are rejected before any destructive step, and the
+  removal fails closed if the platform offers no atomic no-replace
+  primitive.
 - Exactly one terminal line ending (CRLF or LF) is removed from a
   captured value; all other content, including leading/trailing
   whitespace, is preserved verbatim.  Empty values are rejected.
@@ -77,9 +85,12 @@ The actual network validation client ships in a later task; callers
 that need validation must supply a validator callback (the setup
 wizard fails closed with exit 77 without one).
 """
+import ctypes
+import errno
 import getpass
 import os
 import stat
+import sys
 import tempfile  # noqa: F401 — module binding retained deliberately:
                  # existing tests patch agent_box_credentials.tempfile.mkstemp
                  # to inject races, and credential code paths must keep
@@ -135,6 +146,133 @@ def _require_nofollow():
             "platform lacks O_NOFOLLOW/dir_fd support; refusing to "
             "operate with a weakened trust boundary"
         )
+
+
+# ---------------------------------------------------------------------------
+# Atomic no-replace rename primitive (Aegis IMP-02)
+# ---------------------------------------------------------------------------
+
+# Darwin renameatx_np flag bits (sys/stdio.h).  RENAME_EXCL is the
+# atomic no-replace guarantee; the other two are hardening bits that
+# some OS/filesystem combinations reject outright.
+_DARWIN_RENAME_EXCL = 0x00000004
+_DARWIN_RENAME_NOFOLLOW_ANY = 0x00000010
+_DARWIN_RENAME_RESOLVE_BENEATH = 0x00000020
+
+# Linux renameat2 flag bit (uapi linux/renameBits.h).
+_LINUX_RENAME_NOREPLACE = 0x00000001
+
+# Darwin flag attempts in preference order: full hardening first, then
+# no-follow, then the bare atomic no-replace bit.  Every attempt keeps
+# RENAME_EXCL, so stepping down NEVER weakens the no-replace
+# guarantee — it only drops extra path-resolution hardening on an OS
+# that refuses the combination outright (ENOTSUP/EINVAL).
+_DARWIN_RENAME_FLAG_ATTEMPTS = (
+    _DARWIN_RENAME_EXCL | _DARWIN_RENAME_NOFOLLOW_ANY
+    | _DARWIN_RENAME_RESOLVE_BENEATH,
+    _DARWIN_RENAME_EXCL | _DARWIN_RENAME_NOFOLLOW_ANY,
+    _DARWIN_RENAME_EXCL,
+)
+
+# Last Darwin flag set that the kernel accepted (narrowed on first
+# unsupported-flags response; purely a syscall-cost cache — the
+# no-replace semantics are identical across the attempts).
+_darwin_rename_flags = None
+
+
+def _rename_noreplace_libc():
+    """The C library exposing the platform's no-replace rename, or None."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except (OSError, AttributeError):
+        return None
+    if sys.platform == "darwin":
+        primitive = getattr(libc, "renameatx_np", None)
+    else:
+        primitive = getattr(libc, "renameat2", None)
+    if primitive is None:
+        return None
+    primitive.argtypes = [
+        ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    primitive.restype = ctypes.c_int
+    return primitive
+
+
+def _rename_noreplace_at(src_dir_fd, src, dst_dir_fd, dst):
+    """Atomically rename src -> dst, NEVER replacing an existing dst.
+
+    The kernel enforces "move only if the destination name does not
+    exist" as one indivisible operation; there is no check-then-rename
+    window.  Both endpoints are descriptor-relative leaf names, scoped
+    to the supplied directory descriptors — no path resolution, no
+    symlink following by this call.
+
+    Darwin: ``renameatx_np`` with ``RENAME_EXCL`` (plus
+    ``RENAME_NOFOLLOW_ANY``/``RENAME_RESOLVE_BENEATH`` hardening while
+    the OS accepts them; the bare EXCL bit remains atomic and
+    dirfd-scoped on its own).  Linux: ``renameat2`` with
+    ``RENAME_NOREPLACE``.
+
+    Raises FileExistsError when any object answers the destination
+    name — BOTH endpoints are then untouched.  Raises
+    FileNotFoundError when the source is absent.  Raises OSError with
+    errno ENOTSUP when the platform offers no atomic no-replace
+    primitive: callers must fail closed, never fall back to an
+    ordinary overwriting rename.
+    """
+    primitive = _rename_noreplace_libc()
+    if primitive is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "platform offers no atomic no-replace rename primitive "
+            "(renameatx_np/renameat2 unavailable)",
+            src,
+        )
+    src_bytes = os.fsencode(src)
+    dst_bytes = os.fsencode(dst)
+    if sys.platform == "darwin":
+        global _darwin_rename_flags
+        attempts = (
+            (_darwin_rename_flags,) if _darwin_rename_flags is not None
+            else _DARWIN_RENAME_FLAG_ATTEMPTS
+        )
+    else:
+        attempts = (_LINUX_RENAME_NOREPLACE,)
+    last_errno = errno.ENOTSUP
+    for flags in attempts:
+        ctypes.set_errno(0)
+        result = primitive(src_dir_fd, src_bytes, dst_dir_fd, dst_bytes,
+                           flags)
+        if result == 0:
+            if sys.platform == "darwin":
+                _darwin_rename_flags = flags
+            return
+        err = ctypes.get_errno()
+        if not err:
+            err = errno.EIO
+        # A refused EXTRA flag (not an argument fault on our part)
+        # permits one step down to the next attempt.  Every attempt
+        # retains the no-replace guarantee, so this never degrades
+        # semantics — it only sheds hardening bits the OS rejects.
+        if (sys.platform == "darwin"
+                and err in (errno.EINVAL, errno.ENOTSUP)
+                and flags != _DARWIN_RENAME_EXCL
+                and _darwin_rename_flags is None):
+            last_errno = err
+            continue
+        if err == errno.EEXIST:
+            raise FileExistsError(err, os.strerror(err), src, None, dst)
+        if err == errno.ENOENT:
+            raise FileNotFoundError(err, os.strerror(err), src)
+        raise OSError(err, os.strerror(err), src)
+    raise OSError(
+        last_errno,
+        "no supported atomic no-replace rename flag combination",
+        src,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -682,39 +820,39 @@ def remove_amsc_token(home):
     no-follow WRITABLE and validated from its descriptor (regular file,
     current user owned, private mode) and against the trusted directory
     view *before* any destructive step (M-1).  An unsafe target raises
-    CredentialError and is left untouched.
+    CredentialError and is left untouched.  The platform must expose an
+    atomic no-replace rename primitive; without it the removal fails
+    closed instead of falling back to an overwriting rename.
 
-    Destruction discipline (Aegis IMP-01 + IMP-02): POSIX offers no
-    identity-conditional unlink and no RENAME_NOREPLACE, so removal
-    performs NO unlink at all and NO ordinary rename onto a destination
-    it has not verified ownership of.  Instead:
+    Destruction discipline (Aegis IMP-01 + IMP-02): removal performs
+    NO unlink and NO ordinary rename.  Instead:
 
-    1. The random tombstone name is CLAIMED exclusively with
-       ``O_CREAT|O_EXCL`` through the trusted directory descriptor and
-       its identity is established from the claim descriptor before it
-       is ever used as a rename destination.  A pre-existing (or
-       raced-into) destination name fails closed, untouched — the
-       rename never lands on, and never silently replaces, an object
-       the operation did not create and verify.
-    2. The public leaf is atomically RENAMED (descriptor-relative,
-       trusted esnet dir_fd on both endpoints) onto that verified
-       claim.  The name is then re-opened no-follow and its dev/inode
+    1. The verified public leaf is moved to an unpredictable,
+       non-secret random tombstone name with the platform's ATOMIC
+       NO-REPLACE rename primitive ``_rename_noreplace_at``
+       (descriptor-relative leaf names, trusted esnet dir_fd on both
+       endpoints).  The kernel enforces "rename only if the
+       destination does not exist" indivisibly: a pre-existing or
+       raced-into destination yields EEXIST and leaves BOTH endpoints
+       untouched — no object this operation does not own is ever
+       silently replaced, and there is no check-then-rename window.
+    2. The tombstone name is re-opened no-follow and its dev/inode
        must equal the originally opened token descriptor.
-    3. On a mismatch (namespace race) the moved object is given its
-       public name back with a NO-REPLACE hard link (``os.link`` fails
-       EEXIST if the public path was reoccupied): a link can never
-       overwrite or destroy an object that appeared at the public
-       path.  The tombstone name is then retained (pointing at the
-       same inode) and the operation fails closed — no bytes of any
-       unverified object are destroyed and nothing is renamed over a
-       reoccupant.
+    3. On a mismatch (source-swap race: a different object answered
+       the leaf name at rename time) the moved object is given its
+       public name back through the SAME atomic no-replace helper —
+       EEXIST means the public path was reoccupied and the restore
+       leaves the reoccupant untouched.  If the restore succeeds the
+       tombstone name is released; if it fails the object stays under
+       the retained tombstone name.  Either way the operation fails
+       closed — no bytes of any unverified object are destroyed.
     4. Verified identity established, the credential bytes are destroyed
        THROUGH THE ORIGINAL VERIFIED DESCRIPTOR: ftruncate(0) + fsync.
        Destruction travels with the descriptor, not the name.  Once
        destruction has begun, NO restore is attempted onto the public
        path by any mechanism — the tombstone simply stays in place on
-       failure (IMP-02: the old restore-rename could clobber a public
-       reoccupant on an fsync failure).
+       failure (IMP-02: a restore over a public reoccupant is never
+       attempted, and is pointless once content may be gone).
     5. fsync of the trusted directory; the tombstone itself is RETAINED
        (now empty).  Bounded tombstone accumulation is deliberately not
        reclaimed: reaping it would require unlinking a mutable pathname
@@ -726,18 +864,13 @@ def remove_amsc_token(home):
     removal reports failure instead of success.  Returns True when the
     token was destroyed and the public path is absent, False when
     nothing was present or the operation aborted conservatively.
-
-    Residual risk (documented, honest): between the pre-rename claim
-    identity check and the rename itself, a same-UID racer with write
-    access to the trusted directory could replace the claim entry under
-    the tombstone name; Darwin offers no RENAME_NOREPLACE, so the
-    rename would then silently replace that racer object.  The
-    tombstone name is unpredictable (32 hex chars) and the identity
-    re-check narrows the window; complete elimination is not available
-    with the platform primitives, and the operation fails closed on
-    every detectable variant.
     """
     leaf_name = os.path.basename(AMSC_TOKEN_RELATIVE_PATH)
+    if _rename_noreplace_libc() is None:
+        raise CredentialError(
+            "platform offers no atomic no-replace rename primitive; "
+            "refusing to remove with an overwriting rename"
+        )
     try:
         dir_fd = _credential_dir_fd(home, create=False)
     except CredentialError:
@@ -745,7 +878,6 @@ def remove_amsc_token(home):
     except (FileNotFoundError, OSError):
         return False
     token_fd = None
-    claim_fd = None
     tombstone_name = None
     tombstone_restored = False
     destroy_started = False
@@ -781,70 +913,35 @@ def remove_amsc_token(home):
                 "token leaf in the trusted directory is not the file "
                 "that was verified; refusing to remove"
             )
-        # IMP-02 step 1: claim the tombstone name exclusively.  O_EXCL
-        # is atomic: any object already answering the name (planted or
-        # raced-in) aborts the removal untouched, and the claim's own
-        # identity is established from the creation descriptor.
+        # IMP-02: atomic NO-REPLACE move of the verified leaf to an
+        # unpredictable random tombstone name, both endpoints
+        # descriptor-relative to the trusted esnet directory
+        # descriptor.  The kernel performs the existence check and the
+        # move as one operation: an object already answering the
+        # tombstone name (planted or raced-in) makes this raise
+        # FileExistsError with BOTH endpoints untouched — never an
+        # ordinary rename that silently replaces it.  No unlink
+        # follows — ever.
         tombstone_name = ".amsc-token.%s" % _random_tombstone_suffix()
         try:
-            claim_fd = os.open(
-                tombstone_name,
-                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                | getattr(os, "O_NONBLOCK", 0),
-                0o600,
-                dir_fd=dir_fd,
-            )
+            _rename_noreplace_at(dir_fd, leaf_name, dir_fd, tombstone_name)
         except FileExistsError:
             tombstone_name = None
             raise CredentialError(
                 "removal destination name already exists; refusing to "
                 "overwrite an unverified object"
             )
-        except OSError:
-            tombstone_name = None
-            raise CredentialError(
-                "removal destination could not be claimed exclusively; "
-                "refusing to remove"
-            )
-        st_claim = os.fstat(claim_fd)
-        if not stat.S_ISREG(st_claim.st_mode) or st_claim.st_uid != os.geteuid():
-            raise CredentialError(
-                "removal claim is not a private regular file; refusing "
-                "to remove"
-            )
-        # The destination is now this operation's own verified object.
-        # Confirm the tombstone name still resolves to the claim just
-        # before the rename (the residual same-UID window is documented
-        # in the docstring; every detectable swap fails closed).
-        try:
-            st_claim_name = os.lstat(tombstone_name, dir_fd=dir_fd)
-        except OSError:
-            raise CredentialError(
-                "removal claim could not be re-verified; refusing to "
-                "remove"
-            )
-        if not _identity_matches(st_claim, st_claim_name):
-            raise CredentialError(
-                "removal claim name no longer resolves to the claimed "
-                "object; refusing to remove"
-            )
-        # Atomic rename of the verified leaf onto the verified claim,
-        # both endpoints scoped to the trusted esnet directory
-        # descriptor.  No unlink follows — ever.
-        try:
-            os.rename(leaf_name, tombstone_name,
-                      src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except FileNotFoundError:
-            # Public leaf vanished before the move; the (empty) claim
-            # is retained — reclaiming it would need a name-based
-            # unlink again.
+            # Public leaf vanished before the move; nothing was
+            # touched.
             tombstone_name = None
             return False
-        # The claim descriptor now names a directory-entry-less inode
-        # (its name was replaced by the rename); it is no longer
-        # needed.  Destruction travels with token_fd, verified below.
-        os.close(claim_fd)
-        claim_fd = None
+        except OSError:
+            tombstone_name = None
+            raise CredentialError(
+                "removal could not complete an atomic no-replace move; "
+                "refusing to remove"
+            )
         # Verify the tombstone holds exactly the verified object before
         # destroying any bytes.
         verify_fd = os.open(tombstone_name,
@@ -854,20 +951,24 @@ def remove_amsc_token(home):
         finally:
             os.close(verify_fd)
         if not _identity_matches(st_fd, st_tombstone):
-            # Namespace race: a different object answered the leaf
+            # Source-swap race: a different object answered the leaf
             # name at rename time.  Give it its public name back with
-            # a NO-REPLACE hard link — a link can never overwrite an
-            # object that reoccupied the public path — and fail
-            # closed.  The tombstone name is retained (it still points
-            # at the same inode); reclaiming it would need an unsafe
-            # unlink.
+            # the SAME atomic no-replace primitive — EEXIST means the
+            # public path was reoccupied and the restore leaves the
+            # reoccupant untouched — and fail closed.  If the restore
+            # could not run the object stays under the retained
+            # tombstone name; reclaiming a tombstone would need an
+            # unsafe unlink.
             try:
-                os.link(tombstone_name, leaf_name,
-                        src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
-                        follow_symlinks=False)
+                _rename_noreplace_at(dir_fd, tombstone_name,
+                                     dir_fd, leaf_name)
                 tombstone_restored = True
             except OSError:
                 pass
+            # Either the object is back under the public name (restore
+            # succeeded) or it is safely retained under the tombstone
+            # name (restore hit EEXIST on a reoccupant); in both cases
+            # the finally-block must not attempt a second restore.
             tombstone_name = None
             raise CredentialError(
                 "renamed credential leaf is not the verified object; "
@@ -894,26 +995,20 @@ def remove_amsc_token(home):
             return True
         return False
     finally:
-        if claim_fd is not None:
-            try:
-                os.close(claim_fd)
-            except OSError:
-                pass
         if token_fd is not None:
             os.close(token_fd)
         if tombstone_name is not None and not tombstone_restored \
                 and not destroy_started:
             # Abnormal exit after a successful rename but BEFORE any
             # content destruction (e.g. the tombstone verification path
-            # raised): hand the object its public name back with a
-            # NO-REPLACE hard link so user data is not orphaned.  If
-            # the public path is occupied the link fails EEXIST and
-            # the tombstone is left in place — never renamed over the
-            # occupant, never unlinked.
+            # raised): hand the object its public name back with the
+            # SAME atomic no-replace primitive so user data is not
+            # orphaned.  If the public path is occupied the restore
+            # raises EEXIST and the tombstone is left in place — never
+            # renamed over the occupant, never unlinked.
             try:
-                os.link(tombstone_name, leaf_name,
-                        src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
-                        follow_symlinks=False)
+                _rename_noreplace_at(dir_fd, tombstone_name,
+                                     dir_fd, leaf_name)
             except OSError:
                 pass
         os.close(dir_fd)
