@@ -633,8 +633,9 @@ def write_amsc_token(home, token):
     dir_fd so a parent rename+symlink swap after anchoring cannot
     redirect the write: the temp leaf is created exclusively inside
     that directory fd, written, fchmod 0600, fsynced, then moved with
-    ``os.replace(temp, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)``
-    (os.rename with dir_fd when os.replace lacks dir_fd support).
+    ``os.replace(temp, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)``.
+    Platforms lacking descriptor-relative ``os.replace`` support fail by
+    propagating the underlying exception; there is no path-based fallback.
     Cleanup unlinks through dir_fd and the trusted directory is fsynced
     before the descriptor is closed.  Exactly one terminal CRLF/LF is
     removed; an empty result is rejected.  On a failed replace the
