@@ -153,8 +153,8 @@ PY
 nersc_authed() { "$NERSC_TOKENS" get-token iri --facilities nersc >/dev/null 2>&1; }
 if [[ "$nersc_enabled" == "1" ]] && ! nersc_authed; then
   log "NERSC selected: separate Globus login is required for NERSC IRI."
-  log "A NERSC authorization URL will be printed — complete it before startup continues."
-  "$NERSC_TOKENS" login iri --facilities nersc
+  log "A NERSC authorization URL will be printed; it forces identity-provider login so use your NERSC account."
+  "$NERSC_TOKENS" login iri --facilities nersc --prompt-login
   if ! nersc_authed; then
     err "NERSC authentication failed. Re-run the container to try again."
     exit 1
