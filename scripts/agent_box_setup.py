@@ -633,7 +633,7 @@ def main(argv=None):
     registry_path = os.environ.get(
         "AGENT_BOX_REGISTRY",
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "..", "config", "facilities.yaml"),
+                     "config", "facilities.yaml"),
     )
     try:
         registry, _ = load_registry(registry_path)
