@@ -63,6 +63,11 @@ export ALCF_BASE_URL
 
 mkdir -p "$HERMES_HOME"
 
+# First-run multi-facility setup: only if no product config exists.
+if [[ ! -f "$HERMES_HOME/agent-box/config.yaml" ]]; then
+  PYTHONPATH="/opt/alcf:$PYTHONPATH" "$PY" /opt/alcf/agent_box_setup.py --home "$HERMES_HOME"
+fi
+
 # --- 1b. Generic inference mode (opt-in via INFERENCE_URL) --------------------
 # Setting INFERENCE_URL points the agent's LLM brain at ANY OpenAI-compatible
 # endpoint instead of the ALCF Inference Service. This changes ONLY the model

@@ -1,0 +1,39 @@
+schema_version: 1
+facilities:
+  alcf:
+    iri:
+      default_version: v1
+      versions:
+        v1:
+          base_url: https://api.alcf.anl.gov/api/v1
+          auth_provider: alcf-tokens
+  nersc:
+    iri:
+      default_version: v2
+      versions:
+        v1:
+          base_url: https://api.iri.nersc.gov/api/v1
+          auth_provider: nersc-tokens
+        v2:
+          base_url: https://api.iri.nersc.gov/api/v2
+          auth_provider: nersc-tokens
+  esnet-east:
+    iri:
+      default_version: v2
+      versions:
+        v1:
+          base_url: https://iri-dev.ppg.es.net/api/v1
+          auth_provider: amsc-pat
+        v2:
+          base_url: https://iri-dev.ppg.es.net/api/v2
+          auth_provider: amsc-pat
+  esnet-west:
+    iri:
+      default_version: v2
+      versions:
+        v1:
+          base_url: https://esnet-west.sdn-sense.net/api/v1
+          auth_provider: amsc-pat
+        v2:
+          base_url: https://esnet-west.sdn-sense.net/api/v2
+          auth_provider: amsc-pat

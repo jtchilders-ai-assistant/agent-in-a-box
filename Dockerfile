@@ -66,7 +66,7 @@ RUN cd /opt/hermes \
 #    scope/policy contract.
 # ---------------------------------------------------------------------------
 RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache \
-    alcf-tokens==0.3.0 globus-compute-sdk requests
+    alcf-tokens==0.3.0 globus-compute-sdk requests nersc-tokens==0.1.1
 
 # ---------------------------------------------------------------------------
 # 3. ALCF content (changes most often -> last for cache friendliness).
@@ -80,6 +80,11 @@ COPY docs/    /opt/alcf/docs/
 COPY config/config.template.yaml /opt/alcf/config.template.yaml
 COPY config/SOUL.md /opt/alcf/SOUL.md
 COPY scripts/entrypoint.sh /opt/alcf/entrypoint.sh
+COPY scripts/agent_box_setup.py /opt/alcf/agent_box_setup.py
+COPY scripts/agent_box_config.py /opt/alcf/agent_box_config.py
+COPY scripts/agent_box_credentials.py /opt/alcf/agent_box_credentials.py
+COPY scripts/agent_box.py /opt/alcf/agent_box.py
+COPY config/facilities.yaml /opt/alcf/config/facilities.yaml
 COPY scripts/iri_hello_world.py /opt/alcf/iri_hello_world.py
 COPY scripts/alcf_facility.py /opt/alcf/alcf_facility.py
 COPY scripts/alcf_remote_bash.py /opt/alcf/alcf_remote_bash.py

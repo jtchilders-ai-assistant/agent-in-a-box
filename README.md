@@ -280,8 +280,9 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 | `ALCF_ENABLE_GLOBUS_COMPUTE` | `1` | Enable compute-node execution (the official combined login still requests the Compute credential when disabled) |
 | `ALCF_ENABLE_METIS` | `1` | Include the Metis cluster's models in the switchable list |
 | `ALCF_ENABLE_MINERVA` | `1` | Include the Minerva cluster's models in the switchable list |
-| `ALCF_SHOW_MODEL_STATUS` | `1` | Print the model availability banner (LIVE/QUEUED/OFFLINE + context windows) at startup |
-| `ALCF_BASH_ACCOUNT` | *(unset)* | **Recommended:** your default ALCF project for the compute-node `bash` tool. When set, the agent holds ONE warm compute node across the whole conversation instead of paying repeated cold starts; when unset, it must ask/look up a project first. |
+|  `ALCF_SHOW_MODEL_STATUS` | `1` | Print the model availability banner (LIVE/QUEUED/OFFLINE + context windows) at startup |
+|  `ALCF_BASH_ACCOUNT` | *(unset)* | **Recommended:** your default ALCF project for the compute-node `bash` tool. When set, the agent holds ONE warm compute node across the whole conversation instead of paying repeated cold starts; when unset, it must ask/look up a project first. |
+|  `AGENT_BOX_FACILITIES` | `alcf` | Facilities to enable (`alcf`, `nersc`, `esnet-east`, `esnet-west`). Default ALCF only. Multi-facility needs registry (`config/facilities.yaml`) and separate auth (`nersc-tokens` for NERSC; ESnet requires validated PAT route not yet active). |
 
 ## Generic OpenAI-compatible inference mode (optional)
 

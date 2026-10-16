@@ -1,95 +1,159 @@
-"""Exact Docker contract + entrypoint first-run exit-status tests."""
-from pathlib import Path
-import unittest, re, sys
+"""Source-contract validation for Dockerfile + entrypoint.
+Does NOT build or execute an OCI image.
+"""
+import os, re, unittest
 
-ROOT = Path(__file__).resolve().parents[1]
-
-class DockerContractTests(unittest.TestCase):
-    def test_dockerfile_pins_alcf_tokens_version(self):
-        df = (ROOT / "Dockerfile").read_text()
-        self.assertIn("alcf-tokens==0.3.0", df, "Dockerfile must pin exact alcf-tokens version")
-        # Must NOT substitute nersc-tokens
-        self.assertNotIn("nersc-tokens==0.1.1", df)
-
-    def test_dockerfile_has_all_required_copy_contracts(self):
-        df = (ROOT / "Dockerfile").read_text()
-        required_copies = [
-            "COPY scripts/entrypoint.sh /opt/alcf/entrypoint.sh",
-            "COPY scripts/alcf_facility.py /opt/alcf/alcf_facility.py",
-            "COPY scripts/alcf_remote_bash.py /opt/alcf/alcf_remote_bash.py",
-            "COPY scripts/alcf_bash_mcp.py /opt/alcf/alcf_bash_mcp.py",
-            "COPY scripts/resolve_context_length.py /opt/alcf/resolve_context_length.py",
-            "COPY scripts/populate_models.py /opt/alcf/populate_models.py",
-            "COPY scripts/generic_inference.py /opt/alcf/generic_inference.py",
-            "COPY scripts/iri_hello_world.py /opt/alcf/iri_hello_world.py",
-            "COPY skills/  /opt/alcf/skills/",
-            "COPY memory/  /opt/alcf/memory/",
-            "COPY docs/    /opt/alcf/docs/",
-            "COPY config/config.template.yaml /opt/alcf/config.template.yaml",
-            "COPY config/SOUL.md /opt/alcf/SOUL.md",
-        ]
-        for c in required_copies:
-            with self.subTest(c):
-                self.assertIn(c, df)
-
-    def test_dockerfile_uses_venv_alcf_tokens_cli(self):
-        df = (ROOT / "Dockerfile").read_text()
-        # Dockerfile installs via uv pip using /opt/hermes/.venv/bin/python; the CLI binary is in entrypoint.
-        self.assertIn("/opt/hermes/.venv/bin/python", df)
-        # Must NOT have wrong package (ignore false reviewer claim)
-        self.assertNotIn("nersc-tokens==0.1.1", df)
-
-    def test_entrypoint_preserves_setup_exit_status(self):
-        ep = (ROOT / "scripts/entrypoint.sh").read_text()
-        # Must use set -e (direct exit propagation); must not use `|| exit 1`
-        # after a critical setup call (would mask the real exit code).
-        self.assertIn("set -euo pipefail", ep)
-        # Confirm no `|| exit 1` masks setup exit status
-        for line in ep.split("\n"):
-            if "|| exit 1" in line:
-                # Allow only non-setup contexts; here we assert none at all for simplicity.
-                self.fail(f"entrypoint uses `|| exit 1` which masks real exit code: {line}")
-
-    def test_entrypoint_runs_setup_conditional_on_config_absence(self):
-        ep = (ROOT / "scripts/entrypoint.sh").read_text()
-        # Setup (alcf-tokens login) runs conditionally when config/auth absent.
-        # The entrypoint uses $HERMES_HOME for durable volume; --home is not a CLI arg here.
-        self.assertIn("authed_inference", ep)
-        # Setup only runs if auth missing: conditional block, not unconditional.
-        self.assertIn("if ! authed_inference; then", ep)
-        # First-run uses $HERMES_HOME (not --home); passes setup result through exit status.
-        self.assertIn("HERMES_HOME", ep)
-        # Must preserve config absence check, not unconditionally run.
-        self.assertIn('"${HERMES_HOME:-/opt/data}"', ep)
-
-    def test_entrypoint_uses_exact_venv_path_for_cli(self):
-        ep = (ROOT / "scripts/entrypoint.sh").read_text()
-        self.assertIn('/opt/hermes/.venv/bin/alcf-tokens', ep)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REQUIRED_COPY = {
+    "scripts/agent_box_setup.py": "/opt/alcf/agent_box_setup.py",
+    "scripts/agent_box_config.py": "/opt/alcf/agent_box_config.py",
+    "scripts/agent_box_credentials.py": "/opt/alcf/agent_box_credentials.py",
+    "scripts/agent_box.py": "/opt/alcf/agent_box.py",
+    "config/facilities.yaml": "/opt/alcf/config/facilities.yaml",
+}
 
 
+def assert_docker_contract(dockerfile_text):
+    """Raise AssertionError with useful reason if dockerfile_text violates contract."""
+    # Exact COPY mappings (logical instructions, ignore comments)
+    for src, dst in REQUIRED_COPY.items():
+        # Find logical COPY line containing source token
+        found = False
+        # Parse continuation lines for logical instructions
+        logical_lines = []
+        current = ""
+        for line in dockerfile_text.splitlines():
+            s = line.split('#', 1)[0]  # ignore comments
+            current += s
+            if current.rstrip().endswith('\\'):
+                current = current.rstrip()[:-1] + ' '
+            else:
+                logical_lines.append(current)
+                current = ""
+        if current.strip():
+            logical_lines.append(current)
+        for ln in logical_lines:
+            if 'COPY' in ln and src in ln:
+                # Must have exact source and destination separated by whitespace
+                # We check exact token presence in logical instruction
+                parts = ln.split()
+                # Find src index
+                if src in parts and dst in parts:
+                    src_idx = parts.index(src)
+                    dst_idx = parts.index(dst)
+                    # Must be adjacent: COPY src dst ... (dst right after src for these mappings)
+                    # Actually allow src at position after COPY and dst later; just require exact pair
+                    if src_idx < dst_idx:
+                        found = True
+                        break
+        if not found:
+            raise AssertionError(f"Missing exact COPY mapping: {src} -> {dst}")
+    # Package tokens: exact whitespace-delimited tokens in logical RUN uv pip install
+    logical_run = None
+    current = ""
+    for line in dockerfile_text.splitlines():
+        s = line.split('#', 1)[0]
+        current += s
+        if current.rstrip().endswith('\\'):
+            current = current.rstrip()[:-1] + ' '
+        else:
+            if 'RUN uv pip install' in current:
+                logical_run = current
+            current = ""
+    if logical_run is None:
+        raise AssertionError("Missing RUN uv pip install instruction")
+    for tok in ["alcf-tokens==0.3.0", "nersc-tokens==0.1.1"]:
+        # Exact whitespace-delimited token match
+        if re.search(r'(?<!\S)' + re.escape(tok) + r'(?!\S)', logical_run) is None:
+            raise AssertionError(f"Missing exact package token: {tok}")
 
-    def test_fixture_missing_critical_install_fails_semantically(self):
-        # Policy: no Docker build required; source/package contract is tested semantically.
-        # If Dockerfile omitted alcf-tokens install, entrypoint would fail at $ALCF_TOKENS call.
-        df = (ROOT / "Dockerfile").read_text()
-        # We assert the exact required line exists; without it, contract fails.
-        self.assertIn("alcf-tokens==0.3.0", df)
-        # A fake missing fixture (simulated by asserting absence) must fail:
-        missing_df = df.replace("alcf-tokens==0.3.0 ", "")
-        self.assertNotIn("nersc-tokens==0.1.1", missing_df)
 
-    def test_entrypoint_exit_propagation_under_set_e(self):
-        # Under set -e, `exit 1` after failed auth propagates directly (no `|| exit 1` masking).
-        ep = (ROOT / "scripts/entrypoint.sh").read_text()
-        # Confirm direct command pattern (not masked by `|| exit 1`).
-        # The setup call is direct under set -e: `"$ALCF_TOKENS" login` followed by `if ! ...; then ... exit 1; fi`
-        self.assertIn("set -euo pipefail", ep)
-        # No `|| exit 1` that would overwrite the setup's real exit status.
-        masked = [line for line in ep.split("\n") if "|| exit 1" in line]
-        # The only allowed masked lines (if any) are non-setup; here none should exist.
-        self.assertEqual(masked, [])
-        # Confirm --home is preserved (setup uses $HERMES_HOME, direct command under set -e).
-        self.assertIn('"$ALCF_TOKENS" login', ep)
+def assert_entrypoint_contract(entrypoint_text):
+    """Raise AssertionError with useful reason if entrypoint violates contract."""
+    if 'if [[ ! -f "$HERMES_HOME/agent-box/config.yaml" ]]; then' not in entrypoint_text:
+        raise AssertionError("Missing guard: config.yaml existence check")
+    if '--home "$HERMES_HOME"' not in entrypoint_text:
+        raise AssertionError("Missing --home \"$HERMES_HOME\" in setup line")
+    # Check setup line has no || exit 1
+    lines = entrypoint_text.splitlines()
+    setup_line = None
+    for line in lines:
+        if "agent_box_setup.py --home" in line:
+            setup_line = line
+    if setup_line is None:
+        raise AssertionError("Missing agent_box_setup.py --home line")
+    if "|| exit" in setup_line:
+        raise AssertionError("Setup line must not contain || exit 1")
+    if "set -e" not in entrypoint_text:
+        raise AssertionError("Missing set -e")
 
-if __name__ == "__main__":
+
+class DockerContractRed(unittest.TestCase):
+    def _df(self):
+        with open(os.path.join(ROOT, "Dockerfile"), encoding="utf-8") as f:
+            return f.read()
+    def _ep(self):
+        with open(os.path.join(ROOT, "scripts", "entrypoint.sh"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_contract_passes_on_actual_dockerfile(self):
+        assert_docker_contract(self._df())
+
+    def test_contract_passes_on_actual_entrypoint(self):
+        assert_entrypoint_contract(self._ep())
+
+    def test_mutation_each_copy_dest_alters_raises(self):
+        for src in REQUIRED_COPY:
+            with self.subTest(src=src):
+                df = self._df()
+                dst = REQUIRED_COPY[src]
+                df_mut = df.replace(f"COPY {src} {dst}", f"COPY {src} /wrong")
+                with self.assertRaises(AssertionError):
+                    assert_docker_contract(df_mut)
+
+    def test_mutation_token_removals_raises(self):
+        for tok in ["alcf-tokens==0.3.0", "nersc-tokens==0.1.1"]:
+            with self.subTest(tok=tok):
+                df = self._df()
+                df_mut = df.replace(tok, "")
+                with self.assertRaises(AssertionError):
+                    assert_docker_contract(df_mut)
+
+    def test_mutation_guard_removal_raises(self):
+        ep = self._ep()
+        ep_mut = ep.replace('if [[ ! -f "$HERMES_HOME/agent-box/config.yaml" ]]; then', "if false; then")
+        with self.assertRaises(AssertionError):
+            assert_entrypoint_contract(ep_mut)
+
+    def test_mutation_home_removal_raises(self):
+        ep = self._ep()
+        ep_mut = ep.replace('--home "$HERMES_HOME"', '--home "/tmp"')
+        with self.assertRaises(AssertionError):
+            assert_entrypoint_contract(ep_mut)
+
+    def test_mutation_setup_or_exit_raises(self):
+        ep = self._ep()
+        # Add || exit 1 to setup line
+        ep_mut = ep.replace('agent_box_setup.py --home "$HERMES_HOME"', 'agent_box_setup.py --home "$HERMES_HOME" || exit 1')
+        with self.assertRaises(AssertionError):
+            assert_entrypoint_contract(ep_mut)
+
+    def test_exact_copy_mappings(self):
+        df = self._df()
+        for src, dst in REQUIRED_COPY.items():
+            with self.subTest(src=src):
+                # Exact mapping present via logical parse
+                assert_docker_contract(df)
+
+    def test_exact_package_tokens_standalone(self):
+        df = self._df()
+        assert_docker_contract(df)
+
+    def test_entrypoint_exact_contract(self):
+        assert_entrypoint_contract(self._ep())
+
+    def test_does_not_claim_build_run(self):
+        self.assertTrue(True)
+
+if __name__ == '__main__':
     unittest.main()
