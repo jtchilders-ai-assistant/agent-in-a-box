@@ -173,20 +173,37 @@ if __name__ == "__main__":
 
 
 class RegistryPathRegressionTests(unittest.TestCase):
-    """Regression: default registry path must resolve to /opt/alcf/config/facilities.yaml equivalent."""
-    def test_default_registry_path_maps_to_config_under_script_parent_dir(self):
-        script_path = os.path.abspath(__file__)
-        # When script lives in scripts/, config/ is sibling under parent
-        script_dir = os.path.dirname(script_path)
-        while os.path.basename(script_dir) == "tests":
-            script_dir = os.path.dirname(script_dir)
-        # The fixed production code uses script_dir/config (no .. traversal)
-        # Verify mapping: for /opt/alcf/agent_box_setup.py -> /opt/alcf/config/facilities.yaml
-        expected_mapping = os.path.join(
-            os.path.dirname(os.path.dirname(script_dir)), "config", "facilities.yaml"
-        )
-        # The key regression evidence: the file referenced by fixed code exists
-        self.assertTrue(
-            os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(script_dir)), "config", "facilities.yaml")),
-            "default registry mapping must point to existing config/facilities.yaml"
-        )
+    """Registry default resolves deterministically via temp dirs, not test-file path."""
+    def test_packaged_sibling_preferred(self):
+        from agent_box_setup import _default_registry_path
+        with tempfile.TemporaryDirectory() as td:
+            script_dir = os.path.join(td, "bin")
+            config_dir = os.path.join(td, "config")
+            os.makedirs(script_dir)
+            os.makedirs(config_dir)
+            open(os.path.join(config_dir, "facilities.yaml"), "w").close()
+            script_path = os.path.join(script_dir, "agent_box_setup.py")
+            result = _default_registry_path(script_path)
+            self.assertEqual(result, os.path.join(config_dir, "facilities.yaml"))
+
+    def test_repo_parent_fallback(self):
+        from agent_box_setup import _default_registry_path
+        with tempfile.TemporaryDirectory() as td:
+            repo_config = os.path.join(td, "config")
+            scripts_dir = os.path.join(td, "scripts")
+            os.makedirs(repo_config)
+            os.makedirs(scripts_dir)
+            open(os.path.join(repo_config, "facilities.yaml"), "w").close()
+            script_path = os.path.join(scripts_dir, "agent_box_setup.py")
+            result = _default_registry_path(script_path)
+            self.assertEqual(result, os.path.join(repo_config, "facilities.yaml"))
+
+    def test_missing_returns_packaged_target(self):
+        from agent_box_setup import _default_registry_path
+        with tempfile.TemporaryDirectory() as td:
+            script_dir = os.path.join(td, "scripts")
+            os.makedirs(script_dir)
+            script_path = os.path.join(script_dir, "agent_box_setup.py")
+            result = _default_registry_path(script_path)
+            expected = os.path.join(script_dir, "config", "facilities.yaml")
+            self.assertEqual(result, expected)

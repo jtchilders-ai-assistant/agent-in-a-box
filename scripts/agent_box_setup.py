@@ -110,6 +110,17 @@ class SetupResult:
     resolved: "dict | None" = None
 
 
+def _default_registry_path(script_path):
+    script_dir = os.path.dirname(os.path.abspath(script_path))
+    sibling = os.path.join(script_dir, "config", "facilities.yaml")
+    if os.path.isfile(sibling):
+        return sibling
+    parent = os.path.abspath(os.path.join(script_dir, "..", "config", "facilities.yaml"))
+    if os.path.isfile(parent):
+        return parent
+    return sibling
+
+
 def _display_name(facility):
     return _DISPLAY_NAMES.get(facility, facility.replace("-", " ").title())
 
@@ -632,8 +643,7 @@ def main(argv=None):
             return 78
     registry_path = os.environ.get(
         "AGENT_BOX_REGISTRY",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "config", "facilities.yaml"),
+        _default_registry_path(__file__),
     )
     try:
         registry, _ = load_registry(registry_path)
