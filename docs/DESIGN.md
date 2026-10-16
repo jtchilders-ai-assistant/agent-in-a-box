@@ -74,20 +74,8 @@ login` has no `--force` flag; simply re-run to trigger a new login.
 Consequences baked into the design:
 - **No credentials in the image.** First run does one interactive `alcf-tokens login`;
   tokens live in the mounted `~/.globus` volume.
-- **ESnet credentials are independent.** When ESnet is selected, setup captures
-  one AmSC token through hidden input, validates a harmless protected read for
-  each selected site/version, and only then persists it at
-  `/opt/data/agent-box/credentials/esnet/amsc-token`. The private hierarchy is
-  owner-only (`0700`) and the regular token file is `0600`; symlinks, unsafe
-  owners/modes, and non-regular objects are rejected. Credential values never
-  enter product YAML, command arguments, environment variables, output, or
-  exception text. Reconfiguration exposes only `keep`, `replace`, and confirmed
-  `remove` status. Removal uses descriptor-anchored, kernel-enforced atomic
-  no-replace renames and verified-descriptor truncation; unsupported platforms
-  fail closed, and empty private tombstones are retained rather than unsafely
-  unlinking a mutable pathname.
-- **ESnet endpoint registry metadata only; PAT validation and ESnet capture+validator operations are not released.** The design claim at lines 77–88 (working ESnet capture + validator) is stale — it is not wired. Only endpoint selection (`esnet-east`/`esnet-west`, `v1`/`v2`) from `config/facilities.yaml` exists. The agent must fail closed and never claim it can submit ESnet operations.
-- **Precedence and architecture docs updated accordingly:** ALCF identity remains default; NERSC config/auth guidance is present (separate `nersc-tokens` login), but no generic NERSC IRI operation tool is wired; ESnet remains registry-only and intentionally unavailable operationally.
+- **ESnet support is registry metadata only.** Endpoint selection (`esnet-east`/`esnet-west`, `v1`/`v2`) is defined in `config/facilities.yaml`; PAT capture, validation, and ESnet operations are not released. The agent must fail closed and never claim it can submit ESnet operations.
+- **ALCF remains the working runtime.** NERSC configuration/auth guidance is present (separate `nersc-tokens` login), but no generic NERSC IRI operation tool is wired.
 - The entrypoint runs a **token-refresh loop** (every 6h) that re-renders the
   Hermes config with a fresh inference access token, because the token is the
   `api_key` and it rotates.

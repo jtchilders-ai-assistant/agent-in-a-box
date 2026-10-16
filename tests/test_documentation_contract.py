@@ -57,7 +57,7 @@ class DocContractTests(unittest.TestCase):
         for ln in content.splitlines():
             if ln.startswith("|| `"):
                 self.fail("README broken table row: " + ln)
-        self.assertIn("validated PAT route not yet active", content)
+        self.assertIn("ESnet has registry metadata only", content)
         # Exact user-facing configuration details required
         self.assertIn("facility configuration", content.lower())
         self.assertIn("product config", content.lower())
@@ -70,7 +70,7 @@ class DocContractTests(unittest.TestCase):
     def test_memory_contract(self):
         path = os.path.join(REPO, "memory", "MEMORY.md")
         content = self._read(path)
-        self.assertIn("ALCF identity", content)
+        self.assertIn("ALCF user-support agent", content)
         self.assertIn("fail closed", content)
         self.assertIn("NERSC", content)
         self.assertIn("ESnet", content)
