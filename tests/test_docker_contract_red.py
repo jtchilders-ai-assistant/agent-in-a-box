@@ -93,6 +93,13 @@ def assert_entrypoint_contract(entrypoint_text):
         raise AssertionError(
             "Setup line must tolerate an unset PYTHONPATH under set -u"
         )
+    # Selecting NERSC must cause a separate NERSC Globus login.  This must be
+    # conditional on the persisted resolved config so ALCF-only startup stays
+    # unchanged, and must not inherit ALCF's different token store.
+    if '"$NERSC_TOKENS" login' not in entrypoint_text:
+        raise AssertionError("Missing NERSC login invocation")
+    if 'nersc_enabled' not in entrypoint_text:
+        raise AssertionError("Missing resolved NERSC enablement check")
 
 
 class DockerContractRed(unittest.TestCase):

@@ -306,7 +306,7 @@ docker run --rm -v alcf-agent-home:/opt/data --entrypoint /opt/hermes/.venv/bin/
 
 Capabilities and limits (truthful):
 - ALCF remains the default identity and working runtime.
-- NERSC (`nersc-tokens==0.1.1`, `nersc-tokens login`) is packaged; auth/config guidance exists, but no generic NERSC IRI operation tool is wired — the agent explains NERSC endpoint/auth boundaries but does not claim it can submit NERSC IRI calls.
+- NERSC (`nersc-tokens==0.1.1`) is packaged. If NERSC is selected, startup performs a separate NERSC Globus login (`nersc-tokens login iri --facilities nersc`) after the ALCF login; it uses a separate token cache. Auth/config guidance exists, but no generic NERSC IRI operation tool is wired — the agent explains NERSC endpoint/auth boundaries but does not claim it can submit NERSC IRI calls.
 - ESnet (`esnet-east`/`esnet-west`) endpoint selection is registry-only; the validated PAT route is not released, validation/operations are unavailable, and the agent must fail closed rather than claim ESnet submission works.
 
 ## Generic OpenAI-compatible inference mode (optional)

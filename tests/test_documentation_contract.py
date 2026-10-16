@@ -66,6 +66,7 @@ class DocContractTests(unittest.TestCase):
         self.assertIn("AGENT_BOX_FACILITIES=alcf,nersc", content)
         self.assertIn("loopback", content.lower())
         self.assertIn("nersc-tokens", content)
+        self.assertIn("separate NERSC Globus login", content)
 
     def test_memory_contract(self):
         path = os.path.join(REPO, "memory", "MEMORY.md")

@@ -27,6 +27,7 @@ ALCF_DIR=/opt/alcf
 VENV_BIN=/opt/hermes/.venv/bin
 PY="$VENV_BIN/python"
 ALCF_TOKENS="$VENV_BIN/alcf-tokens"
+NERSC_TOKENS="$VENV_BIN/nersc-tokens"
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 CONFIG_OUT="$HERMES_HOME/config.yaml"
 
@@ -129,6 +130,36 @@ if ! authed_inference; then
     exit 1
   fi
   log "ALCF authentication OK (single login covered all services)."
+fi
+
+# --- 2a. NERSC IRI Globus auth (conditional, separate token store) ---------
+# NERSC uses a distinct Globus client and token cache. Selecting it in the
+# persisted product config must therefore produce its own browser flow; an ALCF
+# login never authorizes NERSC. Check the resolved config with the packaged
+# helper rather than parsing YAML in shell. `get-token` checks/refreshes only
+# the NERSC token cache and has no user-facing output here; it avoids prompting
+# again on later container starts while preserving a real NERSC login on first
+# use or after expiry.
+nersc_enabled="$(PYTHONPATH="/opt/alcf:${PYTHONPATH:-}" "$PY" - "$HERMES_HOME/agent-box/config.yaml" <<'PY'
+import sys
+from agent_box_config import load_product_config, load_registry
+
+config_path = sys.argv[1]
+registry, _ = load_registry('/opt/alcf/config/facilities.yaml')
+config = load_product_config(config_path, registry=registry)
+print('1' if config['facilities'].get('nersc', {}).get('enabled') is True else '0')
+PY
+)"
+nersc_authed() { "$NERSC_TOKENS" get-token iri --facilities nersc >/dev/null 2>&1; }
+if [[ "$nersc_enabled" == "1" ]] && ! nersc_authed; then
+  log "NERSC selected: separate Globus login is required for NERSC IRI."
+  log "A NERSC authorization URL will be printed — complete it before startup continues."
+  "$NERSC_TOKENS" login iri --facilities nersc
+  if ! nersc_authed; then
+    err "NERSC authentication failed. Re-run the container to try again."
+    exit 1
+  fi
+  log "NERSC authentication OK."
 fi
 
 # --- 3. Dashboard auth (required for a container 0.0.0.0 bind) ---------------
