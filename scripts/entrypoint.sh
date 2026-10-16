@@ -65,7 +65,7 @@ mkdir -p "$HERMES_HOME"
 
 # First-run multi-facility setup: only if no product config exists.
 if [[ ! -f "$HERMES_HOME/agent-box/config.yaml" ]]; then
-  PYTHONPATH="/opt/alcf:$PYTHONPATH" "$PY" /opt/alcf/agent_box_setup.py --home "$HERMES_HOME"
+  PYTHONPATH="/opt/alcf:${PYTHONPATH:-}" "$PY" /opt/alcf/agent_box_setup.py --home "$HERMES_HOME"
 fi
 
 # --- 1b. Generic inference mode (opt-in via INFERENCE_URL) --------------------

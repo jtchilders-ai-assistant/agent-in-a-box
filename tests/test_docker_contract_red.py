@@ -86,6 +86,13 @@ def assert_entrypoint_contract(entrypoint_text):
         raise AssertionError("Setup line must not contain || exit 1")
     if "set -e" not in entrypoint_text:
         raise AssertionError("Missing set -e")
+    # The entrypoint uses `set -u`; PYTHONPATH is not guaranteed to be preset
+    # by the official base image. The first-run setup must safely append to an
+    # absent value rather than expanding an unbound variable.
+    if 'PYTHONPATH="/opt/alcf:${PYTHONPATH:-}"' not in setup_line:
+        raise AssertionError(
+            "Setup line must tolerate an unset PYTHONPATH under set -u"
+        )
 
 
 class DockerContractRed(unittest.TestCase):
