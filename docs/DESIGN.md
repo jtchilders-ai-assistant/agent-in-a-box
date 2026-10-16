@@ -207,6 +207,10 @@ The image is shared, so it must carry only generic ALCF knowledge:
       patch (4 unit tests); no unrelated personal patches. Pin a dedicated clean
       tag if the branch later accumulates other commits.
 
+## Multi-facility boundary (Task 3)
+
+The registry (`config/facilities.yaml`) is the source of truth. Supported: ALCF (default `v1`), NERSC (`v2` default), ESnet East/West (`v2` default). NERSC uses `nersc-tokens==0.1.1` (`nersc-tokens login`) separately; ESnet (`amsc-pat`) is fail-closed until a validated PAT route is confirmed, uses `ESNET_AMSC_TOKEN_FILE`, never `AMSC_TOKEN` directly, and never claims a direct PAT is validated at release. Facility selection via `AGENT_BOX_FACILITIES`; ALCF remains the default.
+
 ## Open items
 
 Everything in the original build plan is done and verified (image built and
