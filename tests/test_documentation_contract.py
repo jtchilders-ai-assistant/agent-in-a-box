@@ -58,8 +58,27 @@ class DocContractTests(unittest.TestCase):
             if ln.startswith("|| `"):
                 self.fail("README broken table row: " + ln)
         self.assertIn("validated PAT route not yet active", content)
+        # Exact user-facing configuration details required
+        self.assertIn("facility configuration", content.lower())
+        self.assertIn("product config", content.lower())
+        self.assertIn("config show", content)
+        self.assertIn("config validate", content)
+        self.assertIn("AGENT_BOX_FACILITIES=alcf,nersc", content)
+        self.assertIn("loopback", content.lower())
+        self.assertIn("nersc-tokens", content)
 
-    def test_design_agrees(self):
+    def test_memory_contract(self):
+        path = os.path.join(REPO, "memory", "MEMORY.md")
+        content = self._read(path)
+        self.assertIn("ALCF identity", content)
+        self.assertIn("fail closed", content)
+        self.assertIn("NERSC", content)
+        self.assertIn("ESnet", content)
+        self.assertNotIn("submit there", content.lower())
+        # Must reference registry and fail-closed boundary explicitly
+        self.assertIn("registry", content.lower())
+
+    def test_soul_contract(self):
         path = os.path.join(REPO, "docs", "DESIGN.md")
         content = self._read(path)
         self.assertIn("ESnet", content)

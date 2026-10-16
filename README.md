@@ -282,7 +282,32 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 | `ALCF_ENABLE_MINERVA` | `1` | Include the Minerva cluster's models in the switchable list |
 |  `ALCF_SHOW_MODEL_STATUS` | `1` | Print the model availability banner (LIVE/QUEUED/OFFLINE + context windows) at startup |
 |  `ALCF_BASH_ACCOUNT` | *(unset)* | **Recommended:** your default ALCF project for the compute-node `bash` tool. When set, the agent holds ONE warm compute node across the whole conversation instead of paying repeated cold starts; when unset, it must ask/look up a project first. |
-|  `AGENT_BOX_FACILITIES` | `alcf` | Facilities to enable (`alcf`, `nersc`, `esnet-east`, `esnet-west`). Default ALCF only. Multi-facility needs registry (`config/facilities.yaml`) and separate auth (`nersc-tokens` for NERSC; ESnet requires validated PAT route not yet active). |
+||  `AGENT_BOX_FACILITIES` | `alcf` | Facilities to enable (`alcf`, `nersc`, `esnet-east`, `esnet-west`). Default ALCF only. Multi-facility needs registry (`config/facilities.yaml`) and separate auth (`nersc-tokens` for NERSC; ESnet requires validated PAT route not yet active). Facility configuration runs before ALCF login; `Enter`/no-TTY retains ALCF only. Product config (`/opt/data/config.yaml`) inspected with `docker run --rm -v alcf-agent-home:/opt/data --entrypoint /opt/hermes/.venv/bin/python <image> /opt/alcf/agent_box.py config show` / `config validate` (only if the path/image is actually valid). All runs stay loopback (`127.0.0.1`), named volume (`alcf-agent-home`), `--pull always`. Example multi-facility command: `AGENT_BOX_FACILITIES=alcf,nersc` with the same Docker args. NERSC helper login stays separate; no generic NERSC IRI runtime tool is wired. ESnet endpoint selection is registry-only, intentionally unavailable operationally. |
+
+## Facility configuration (multi-facility reality)
+
+On first start the container runs a facility-configuration step before ALCF login. With a TTY it prompts for facilities; pressing `Enter` (or running non-interactive / no TTY) retains ALCF only. The registry (`config/facilities.yaml`) is the source of truth. Multi-facility example stays loopback, named volume, `--pull always`:
+
+```bash
+AGENT_BOX_FACILITIES=alcf,nersc \
+docker run --pull=always -it --rm \
+  -p 127.0.0.1:8787:8787 \
+  -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
+  -v alcf-agent-home:/opt/data \
+  ghcr.io/jtchilders-ai-assistant/alcf-agent:latest
+```
+
+The product config (`/opt/data/config.yaml`) reflects the resolved settings. Inspect it (only if the image/config path is valid) with:
+
+```bash
+docker run --rm -v alcf-agent-home:/opt/data --entrypoint /opt/hermes/.venv/bin/python ghcr.io/jtchilders-ai-assistant/alcf-agent:latest /opt/alcf/agent_box.py config show
+docker run --rm -v alcf-agent-home:/opt/data --entrypoint /opt/hermes/.venv/bin/python ghcr.io/jtchilders-ai-assistant/alcf-agent:latest /opt/alcf/agent_box.py config validate
+```
+
+Capabilities and limits (truthful):
+- ALCF remains the default identity and working runtime.
+- NERSC (`nersc-tokens==0.1.1`, `nersc-tokens login`) is packaged; auth/config guidance exists, but no generic NERSC IRI operation tool is wired — the agent explains NERSC endpoint/auth boundaries but does not claim it can submit NERSC IRI calls.
+- ESnet (`esnet-east`/`esnet-west`) endpoint selection is registry-only; the validated PAT route is not released, validation/operations are unavailable, and the agent must fail closed rather than claim ESnet submission works.
 
 ## Generic OpenAI-compatible inference mode (optional)
 

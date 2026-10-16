@@ -86,6 +86,8 @@ Consequences baked into the design:
   no-replace renames and verified-descriptor truncation; unsupported platforms
   fail closed, and empty private tombstones are retained rather than unsafely
   unlinking a mutable pathname.
+- **ESnet endpoint registry metadata only; PAT validation and ESnet capture+validator operations are not released.** The design claim at lines 77–88 (working ESnet capture + validator) is stale — it is not wired. Only endpoint selection (`esnet-east`/`esnet-west`, `v1`/`v2`) from `config/facilities.yaml` exists. The agent must fail closed and never claim it can submit ESnet operations.
+- **Precedence and architecture docs updated accordingly:** ALCF identity remains default; NERSC config/auth guidance is present (separate `nersc-tokens` login), but no generic NERSC IRI operation tool is wired; ESnet remains registry-only and intentionally unavailable operationally.
 - The entrypoint runs a **token-refresh loop** (every 6h) that re-renders the
   Hermes config with a fresh inference access token, because the token is the
   `api_key` and it rotates.

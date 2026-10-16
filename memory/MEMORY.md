@@ -20,6 +20,14 @@ so the user can compare it to the repo
 (https://github.com/jtchilders-ai-assistant/alcf-agent-box). Do NOT guess a
 version — always read the file.
 
+- Facility configuration (`AGENT_BOX_FACILITIES`) selects which facilities are enabled; the registry (`config/facilities.yaml`) is the source of truth. Default is ALCF only (`AGENT_BOX_FACILITIES=alcf`). Multi-facility (e.g. `AGENT_BOX_FACILITIES=alcf,nersc`) requires the registry entries and separate auth (`nersc-tokens` for NERSC).
+- NERSC (`nersc-tokens==0.1.1`, `nersc-tokens login`) is packaged and configured separately; the agent explains NERSC endpoint/auth boundaries but does not claim it can submit NERSC IRI operations at runtime.
+- Fail closed: explain configured NERSC/ESnet endpoint/auth boundaries but never claim submission works at those endpoints. Registry (`config/facilities.yaml`) is the source of truth.
+- The agent retains ALCF identity and must fail closed: it explains configured NERSC/ESnet endpoint/auth boundaries but must not claim submission works at those endpoints.
+- Product config file (`/opt/data/config.yaml`) carries the resolved facility settings; use `docker run --rm -v alcf-agent-home:/opt/data --entrypoint /opt/hermes/.venv/bin/python <image> /opt/alcf/agent_box.py config show` and `config validate` (only when the image/config path is actually valid) to inspect it.
+- First start runs the facility configuration wizard before ALCF login; if no TTY (`Enter` / non-interactive), ALCF only is retained.
+- All runs use loopback (`127.0.0.1`), a named volume (`alcf-agent-home`), and `--pull always`.
+
 ## ALCF Inference Service (your own LLM backend)
 - Web UI for humans: https://inference.alcf.anl.gov/ (Open WebUI; log in with
   ALCF/ANL credentials).
