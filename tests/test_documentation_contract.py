@@ -42,7 +42,9 @@ class DocContractTests(unittest.TestCase):
         self.assertIn("validated route", content)
         self.assertIn("not yet active", content)
         self.assertNotIn("set AMSC_TOKEN", content)
-        self.assertNotIn("|| Facility", content)
+        self.assertNotIn("||", content)
+        table_lines = [line for line in content.splitlines() if line.startswith("|")]
+        self.assertEqual([line.count("|") for line in table_lines], [4, 4, 4, 4])
 
     def test_readme_contract(self):
         path = os.path.join(REPO, "README.md")

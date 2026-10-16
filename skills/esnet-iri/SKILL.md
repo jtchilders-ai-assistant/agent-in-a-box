@@ -8,10 +8,10 @@ category: research
 
 Facility selection boundary: choose either `esnet-east`, `esnet-west`, or both via the registry/config. Each has versions `v1` and `v2` (default `v2`). The registry endpoint table:
 
-| Facility | v1 base | v2 base |
-|---|---|---|---|
-| East | `esnet-east` | `https://iri-dev.ppg.es.net/api/v1` | `https://iri-dev.ppg.es.net/api/v2` |
-| West | `esnet-west` | `https://esnet-west.sdn-sense.net/api/v1` | `https://esnet-west.sdn-sense.net/api/v2` |
+| Facility key | v1 base | v2 base |
+|---|---|---|
+| `esnet-east` | `https://iri-dev.ppg.es.net/api/v1` | `https://iri-dev.ppg.es.net/api/v2` |
+| `esnet-west` | `https://esnet-west.sdn-sense.net/api/v1` | `https://esnet-west.sdn-sense.net/api/v2` |
 
 Auth provider: `amsc-pat` (AmSC PAT based). Boundary rules:
 
