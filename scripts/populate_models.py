@@ -8,10 +8,11 @@ mapping that carries every model's REAL serving context window:
   - ``alcf-sophia``   (vLLM,  full OpenAI-compat)  base_url .../sophia/vllm/v1
   - ``alcf-metis``    (SambaNova, chat-only)       base_url .../metis/api/v1
   - ``alcf-minerva``  (api framework)              base_url .../minerva/api/v1
+  - ``alcf-tara``     (api framework)              base_url .../tara/api/v1
 
-``tara`` also appears in list-endpoints but is still being provisioned
-(``/models`` -> ``[]``, ``/jobs`` -> HTTP 500), so it gets no provider; the status
-banner reports it as provisioning. Promote it in ``_clusters()`` once it serves.
+Tara is a serving cluster. Its current catalog does not publish context-window or
+reasoning metadata, so its two models use conservative, independently verified
+per-model values in ``TARA_CONTEXT`` until that metadata becomes available.
 
 Why this exists
 ---------------
@@ -86,15 +87,12 @@ INFER_HOST = "https://inference-api.alcf.anl.gov/resource_server"
 SOPHIA_BASE = f"{INFER_HOST}/sophia/vllm/v1"
 METIS_BASE = f"{INFER_HOST}/metis/api/v1"
 MINERVA_BASE = f"{INFER_HOST}/minerva/api/v1"
+TARA_BASE = f"{INFER_HOST}/tara/api/v1"
 
-# Clusters that appear in list-endpoints but are NOT yet serving models. We do
-# not build a provider for these; the status banner reports them as
-# "provisioning" so the user knows to check back rather than assuming a bug.
-# Verified 2026-08-24: tara /models -> [] and /jobs -> HTTP 500
-# ("Failed to read Tara router config: FIRST_V2_REDIS_URL is not set"), i.e.
-# the machine is still being accepted. Re-check and promote it to a real
-# cluster once /models returns entries.
-PROVISIONING_CLUSTERS = ("tara",)
+# All clusters currently registered upstream are handled by _clusters(). Keep
+# this empty unless a future cluster is deliberately known to have no serving
+# models; status_report renders such clusters as provisioning without a provider.
+PROVISIONING_CLUSTERS = ()
 
 PY = os.environ.get("ALCF_PY", sys.executable)
 # Fallback context window for a chat model that reports no server value.
@@ -186,6 +184,18 @@ METIS_DEFAULT_CONTEXT = 32768
 # reproduced: inkling-bf16 @ max_tokens=30 -> content:null finish_reason:length).
 MINERVA_DEFAULT_CONTEXT = 131072
 
+# Tara currently exposes only id/framework in its catalog. Direct authenticated
+# probes on 2026-10-21 established: gpt-oss-20b rejects a 150068-token request
+# with a 65536-token maximum, while nemotron accepts 150017 tokens. Configure a
+# conservative 131072 window for nemotron (well above the verified lower bound)
+# rather than claiming its exact ceiling. Both return a reasoning channel, and
+# nemotron's ID alone would not identify it as a reasoning model.
+TARA_CONTEXT = {
+    "openai/gpt-oss-20b": 65536,
+    "nemotron-3-ultra": 131072,
+}
+TARA_REASONING_MODELS = frozenset(TARA_CONTEXT)
+
 # Frameworks that are NOT chat completion endpoints — exclude outright.
 NON_CHAT_FRAMEWORKS = {"triton", "dinoserver", "sam3service"}
 
@@ -223,6 +233,11 @@ MINERVA_FALLBACK = {
     "gpt-oss-120b": (131072, True),
     "inkling-bf16": (262144, True),
     "nemotron-3-ultra": (262144, True),
+}
+# Tara catalog entries currently omit context/reasoning metadata; only include
+# the directly verified models, never guess a default for future catalog entries.
+TARA_FALLBACK = {
+    mid: (ctx, True) for mid, ctx in TARA_CONTEXT.items()
 }
 
 
@@ -364,6 +379,30 @@ def _select_minerva(models: list) -> dict:
     return out
 
 
+def _select_tara(models: list) -> dict:
+    """Select only Tara models with directly verified context metadata.
+
+    Unlike Minerva, Tara's current catalog reports neither ``capabilities`` nor
+    ``max_model_len``. Omitting an unknown model is safer than assigning a window
+    Hermes may overrun. The known entries are both reasoning-capable and must use
+    the larger provider output cap.
+    """
+    out = {}
+    for m in models:
+        mid = m.get("id")
+        if not mid or mid not in TARA_CONTEXT:
+            continue
+        fw = (m.get("framework") or "").lower()
+        if fw in NON_CHAT_FRAMEWORKS or _is_non_chat_id(mid):
+            continue
+        ctx = TARA_CONTEXT[mid]
+        if ctx < MIN_CONTEXT:
+            _note_excluded("tara", mid, ctx)
+            continue
+        out[mid] = (ctx, mid in TARA_REASONING_MODELS)
+    return out
+
+
 def _resolve_cluster(cluster: str, token: str, selector, fallback: dict) -> tuple:
     """Return (mapping, source) where source is 'live' or 'fallback'."""
     try:
@@ -436,8 +475,8 @@ def _clusters(include_metis: bool = True, include_minerva: bool = True) -> list:
 
     Single source of truth shared by build_block(), the status banner and the
     launch-provider resolver, so adding a cluster is a one-line change here.
-    Provisioning clusters (see PROVISIONING_CLUSTERS) are deliberately absent —
-    they have no models to offer; the banner reports them separately.
+    Only clusters in PROVISIONING_CLUSTERS are reported separately without a
+    provider.
     """
     out = [("sophia", "alcf-sophia", SOPHIA_BASE, _select_sophia, SOPHIA_FALLBACK)]
     if include_metis:
@@ -445,6 +484,7 @@ def _clusters(include_metis: bool = True, include_minerva: bool = True) -> list:
     if include_minerva:
         out.append(("minerva", "alcf-minerva", MINERVA_BASE,
                     _select_minerva, MINERVA_FALLBACK))
+    out.append(("tara", "alcf-tara", TARA_BASE, _select_tara, TARA_FALLBACK))
     return out
 
 

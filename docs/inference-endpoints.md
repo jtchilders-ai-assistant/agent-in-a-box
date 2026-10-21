@@ -119,13 +119,14 @@ Once authenticated, you can make a test call using cURL or Python.
 
 ### Available Clusters
 
-Three clusters are currently active, with additional systems coming soon:
+Four clusters are currently active:
 
 | Cluster | Status | Framework | Base URL | Supported Endpoints |
 |---------|--------|-----------|----------|---------------------|
 | **[NVIDIA A100 (Sophia)](https://docs.alcf.anl.gov/sophia/getting-started/)** | Active | vLLM | `/resource_server/sophia/vllm/v1` | `/chat/completions`<br>`/responses`<br>`/messages`<br>`/completions`<br>`/embeddings`<br>`/batches` |
 | **[SambaNova SN40L (Metis)](https://docs.alcf.anl.gov/ai-testbed/sn40l_inference/)** | Active | SambaNova API | `/resource_server/metis/api/v1` | `/chat/completions` |
 | **[NVIDIA B200 (Minerva)](https://www.alcf.anl.gov/minerva)** | Active | API | `/resource_server/minerva/api/v1` | `/chat/completions`<br>`/responses`<br>`/messages`<br>`/completions` |
+| **Tara** | Active | API | `/resource_server/tara/api/v1` | `/chat/completions`<br>`/responses`<br>`/messages`<br>`/completions` |
 
 
 !!! tip "Discovering Available Models"

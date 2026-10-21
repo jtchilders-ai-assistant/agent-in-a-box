@@ -491,8 +491,8 @@ provider (`hermes memory setup`) and ingest `docs/` into it.
 
 ## Switching models
 
-The ALCF Inference Service serves 40+ models across two clusters (**Sophia**,
-vLLM; **Metis**, SambaNova), but its gateway doesn't expose the standard OpenAI
+The ALCF Inference Service serves models across four clusters (**Sophia**, vLLM;
+**Metis**, **Minerva**, and **Tara**, API), but its gateway doesn't expose the standard OpenAI
 `/v1/models` discovery path in the place Hermes expects. So instead of shipping a
 hand-maintained list, the container **generates the switchable model list at
 startup** from the live ALCF catalog (`scripts/populate_models.py`) and writes it
@@ -510,10 +510,13 @@ providers are named by cluster and reasoning class:
   Metis providers with `-e ALCF_ENABLE_METIS=0`)
 - **`alcf-minerva-reasoning`** — Minerva models (`gpt-oss-120b`, `inkling-bf16`,
   `nemotron-3-ultra`; drop with `-e ALCF_ENABLE_MINERVA=0`)
+- **`alcf-tara-reasoning`** — Tara models (`nemotron-3-ultra`,
+  `openai/gpt-oss-20b`)
 
-A fourth ALCF cluster, **`tara`**, is registered upstream but is still being
-provisioned (it serves no models yet), so it gets no provider. The startup banner
-reports it as provisioning; it will appear automatically once it serves models.
+Tara is now serving both listed models. Its catalog does not yet publish complete
+context-window/reasoning metadata, so the box includes only these independently
+verified models with conservative safe context windows rather than guessing for
+future catalog additions.
 
 Three behaviors are worth knowing:
 

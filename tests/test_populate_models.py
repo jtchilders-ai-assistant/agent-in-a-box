@@ -56,6 +56,13 @@ MINERVA_MODELS = [
         "api_protocols": ["chat_completions", "responses"]}},
 ]
 
+# Tara became live in October 2026. Its catalog currently omits capabilities and
+# max_model_len, so selection must use the independently verified safe table.
+TARA_MODELS = [
+    {"id": "nemotron-3-ultra", "framework": "api"},
+    {"id": "openai/gpt-oss-20b", "framework": "api"},
+]
+
 # Sophia was fully down at capture time: nothing running, two queued jobs whose
 # estimated start was ~31 hours out.
 SOPHIA_JOBS = {
@@ -129,6 +136,14 @@ class TestSelectors(unittest.TestCase):
         self.assertEqual(sel["plain-chat-model"],
                          (pm.MINERVA_DEFAULT_CONTEXT, False))
 
+    def test_tara_uses_safe_windows_and_reasoning_class_when_metadata_is_absent(self):
+        sel = pm._select_tara(TARA_MODELS)
+        self.assertEqual(sel["openai/gpt-oss-20b"], (65536, True))
+        # nemotron does not match the ID heuristic; keep it in the reasoning
+        # provider because Tara responses carry a reasoning channel.
+        self.assertFalse(pm._is_reasoning_id("nemotron-3-ultra"))
+        self.assertEqual(sel["nemotron-3-ultra"], (131072, True))
+
 
 class TestJobClassification(unittest.TestCase):
     """_fetch_job_states parsing, exercised through the pure helpers."""
@@ -168,22 +183,20 @@ class TestFormatting(unittest.TestCase):
 
 
 class TestClusterRegistry(unittest.TestCase):
-    def test_default_registry_has_three_serving_clusters(self):
+    def test_default_registry_has_all_four_serving_clusters(self):
         names = [c[0] for c in pm._clusters()]
-        self.assertEqual(names, ["sophia", "metis", "minerva"])
+        self.assertEqual(names, ["sophia", "metis", "minerva", "tara"])
 
     def test_toggles_drop_clusters(self):
         self.assertEqual([c[0] for c in pm._clusters(include_minerva=False)],
-                         ["sophia", "metis"])
+                         ["sophia", "metis", "tara"])
         self.assertEqual([c[0] for c in pm._clusters(include_metis=False)],
-                         ["sophia", "minerva"])
+                         ["sophia", "minerva", "tara"])
 
-    def test_provisioning_cluster_has_no_provider(self):
-        # tara is registered upstream but serves nothing yet; it must never
-        # produce a provider block (its models list is empty).
+    def test_tara_is_a_serving_provider_not_a_provisioning_banner(self):
         names = [c[0] for c in pm._clusters()]
-        for cluster in pm.PROVISIONING_CLUSTERS:
-            self.assertNotIn(cluster, names)
+        self.assertIn("tara", names)
+        self.assertNotIn("tara", pm.PROVISIONING_CLUSTERS)
 
     def test_every_cluster_has_a_nonempty_fallback(self):
         for cluster, provider, base, _sel, fallback in pm._clusters():

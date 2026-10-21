@@ -109,9 +109,10 @@ dashboard:
 #   - alcf-sophia   (vLLM,   full OpenAI-compat)   .../sophia/vllm/v1
 #   - alcf-metis    (SambaNova, chat-only)         .../metis/api/v1
 #   - alcf-minerva  (api framework)                .../minerva/api/v1
+#   - alcf-tara     (api framework)                .../tara/api/v1
 #
-# (`tara` is registered upstream but serves no models yet, so it gets no
-# provider; the startup status banner reports it as provisioning.)
+# Tara's catalog currently omits context-window/reasoning metadata. The generator
+# includes only its directly verified models with conservative safe windows.
 #
 # It filters the catalog to CHAT models (dropping embeddings, vision, and science
 # models like GenSLM/dinov3/sam3) and gives each its REAL serving context window.
