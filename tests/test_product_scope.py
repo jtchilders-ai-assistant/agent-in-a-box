@@ -37,6 +37,11 @@ class ProductScopeTests(unittest.TestCase):
         self.assertNotIn("the second (IRI) Globus login", readme)
         self.assertNotIn("the separate **IRI Facility API**", readme)
 
+    def test_readme_documents_verbose_startup_and_diagnostic_log(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("--verbose", readme)
+        self.assertIn("startup.log", readme)
+
     def test_readme_documents_supported_local_runtimes(self):
         readme = (ROOT / "README.md").read_text()
         self.assertIn("## Run locally with Podman", readme)
