@@ -62,6 +62,23 @@ The single `alcf-agent-home` volume persists your Globus tokens **and** the
 agent's memory across restarts, so you only log in occasionally (tokens last 48h
 and auto-refresh; a full re-auth is required every 30 days).
 
+### Startup output
+
+By default the container prints concise milestones and ends with a prominent **READY — OPEN THIS URL** card containing the browser URL.
+
+For detailed diagnostics, append `--verbose` after the image name:
+
+```bash
+docker run --pull=always -it --rm \
+  -p 127.0.0.1:8787:8787 \
+  -e ALCF_DASHBOARD_PASSWORD='choose-a-password' \
+  -v alcf-agent-home:/opt/data \
+  ghcr.io/jtchilders-ai-assistant/alcf-agent:latest --verbose
+```
+
+Routine diagnostics are also stored at `/opt/data/startup.log` inside the container (persisted through the `alcf-agent-home` volume) and at `$HERMES_HOME/startup.log` on the volume.
+
+
 ## Run locally with Podman
 
 Podman accepts the same OCI image and run options. This command keeps the web

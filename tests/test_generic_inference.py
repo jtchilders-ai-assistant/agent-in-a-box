@@ -467,13 +467,30 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
 
     def test_dashboard_ready_banner_makes_public_url_prominent(self):
         body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
-        self.assertIn('log "================================================================"', body)
-        self.assertIn('log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"', body)
-        self.assertIn('log "================================================================"', body)
+        self.assertIn("READY — OPEN THIS URL", body)
+        self.assertIn("http://localhost:${PUB_PORT}", body)
         self.assertLess(
-            body.index('log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"'),
+            body.index("READY — OPEN THIS URL"),
             body.index("exec caddy run"),
         )
+
+    def test_entrypoint_supports_explicit_verbose_flag_parsing(self):
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn('case "${1:-}" in', body)
+        self.assertIn("-v|--verbose)", body)
+
+    def test_entrypoint_writes_diagnostic_startup_log_and_has_diag_helper(self):
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn('STARTUP_LOG="$HERMES_HOME/startup.log"', body)
+        self.assertIn("diag()", body)
+
+    def test_ready_card_is_password_free(self):
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn("READY — OPEN THIS URL", body)
+        ready_at = body.index("READY — OPEN THIS URL")
+        caddy_at = body.index("exec caddy run", ready_at)
+        ready_card = body[ready_at:caddy_at]
+        self.assertNotIn("${ALCF_DASHBOARD_PASSWORD}", ready_card)
 
     def test_readme_latest_docker_examples_force_a_fresh_pull(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

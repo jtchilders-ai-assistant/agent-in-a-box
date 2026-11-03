@@ -15,7 +15,8 @@ class ProductScopeTests(unittest.TestCase):
             "docs/CAPABILITY-IDEAS.md",
             "docs/REMOTE-AGENT-ARCHITECTURE.md",
             "docs/red-shirt-environment-catalog.md",
-            "docs/superpowers",
+            "docs/superpowers/plans",
+            "docs/superpowers/plans/2026-10-28-startup-output.md",
             "scripts/connect_proxy.py",
             "scripts/headscale_probe.sh",
             "scripts/patch_hermes_a2a_proxy.py",
@@ -36,6 +37,11 @@ class ProductScopeTests(unittest.TestCase):
         self.assertNotIn("a **separate** Globus login", readme)
         self.assertNotIn("the second (IRI) Globus login", readme)
         self.assertNotIn("the separate **IRI Facility API**", readme)
+
+    def test_readme_documents_verbose_startup_and_diagnostic_log(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("--verbose", readme)
+        self.assertIn("startup.log", readme)
 
     def test_readme_documents_supported_local_runtimes(self):
         readme = (ROOT / "README.md").read_text()

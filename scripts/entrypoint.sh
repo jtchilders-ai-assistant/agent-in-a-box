@@ -23,6 +23,14 @@
 # status banner, and token refresh are skipped.
 set -euo pipefail
 
+VERBOSE=0
+case "${1:-}" in
+  "") ;;
+  -v|--verbose) VERBOSE=1 ;;
+  *) printf 'Usage: %s [-v|--verbose]\n' "$0" >&2; exit 64 ;;
+esac
+shift "$#" 2>/dev/null || true
+
 ALCF_DIR=/opt/alcf
 VENV_BIN=/opt/hermes/.venv/bin
 PY="$VENV_BIN/python"
@@ -30,8 +38,15 @@ ALCF_TOKENS="$VENV_BIN/alcf-tokens"
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 CONFIG_OUT="$HERMES_HOME/config.yaml"
 
-log() { printf '\033[36m[alcf-agent]\033[0m %s\n' "$*"; }
-err() { printf '\033[31m[alcf-agent]\033[0m %s\n' "$*" >&2; }
+milestone() { printf '\033[36m[agent-in-a-box]\033[0m %s\n' "$*"; }
+diag() {
+  printf '%s\n' "$*" >> "$STARTUP_LOG"
+  if [[ "$VERBOSE" == "1" ]]; then
+    printf '\033[2m[diagnostic]\033[0m %s\n' "$*"
+  fi
+}
+err() { printf '\033[31m[agent-in-a-box]\033[0m %s\n' "$*" >&2; }
+log() { milestone "$*"; }
 
 # --- 0. Version banner ------------------------------------------------------
 # Print the ALCF-agent-box git revision + build date baked at image build, plus
@@ -61,7 +76,9 @@ case "${ALCF_CLUSTER:-sophia}" in
 esac
 export ALCF_BASE_URL
 
+STARTUP_LOG="$HERMES_HOME/startup.log"
 mkdir -p "$HERMES_HOME"
+: > "$STARTUP_LOG"
 
 # --- 1b. Generic inference mode (opt-in via INFERENCE_URL) --------------------
 # Setting INFERENCE_URL points the agent's LLM brain at ANY OpenAI-compatible
@@ -88,8 +105,8 @@ if [[ -n "${INFERENCE_URL:-}" ]]; then
     err "INFERENCE_MAX_TOKENS must be a positive integer (got '${INFERENCE_MAX_TOKENS}')."
     exit 78   # EX_CONFIG
   fi
-  log "Generic inference mode: endpoint from INFERENCE_URL, model '$INFERENCE_MODEL'"
-  log "(IRI / Globus Compute / Transfer still use the combined ALCF Globus login; the token itself is never logged)"
+  diag "Generic inference mode: endpoint from INFERENCE_URL, model '$INFERENCE_MODEL'"
+  diag "(IRI / Globus Compute / Transfer still use the combined ALCF Globus login; the token itself is never logged)"
 elif [[ -n "${INFERENCE_TOKEN:-}" || -n "${INFERENCE_MODEL:-}" ]]; then
   # PARTIAL GENERIC CONFIGURATION: generic settings are set but INFERENCE_URL
   # is absent. Silently entering default ALCF mode here would ignore settings
@@ -164,7 +181,7 @@ render_config() {
       exit 78   # EX_CONFIG: endpoint/token/model/catalog is unusable
     fi
     # Surface the per-model ENABLED/DISABLED report in the startup log.
-    while IFS= read -r _gline; do log "$_gline"; done </tmp/generic_inference.log
+    while IFS= read -r _gline; do diag "$_gline"; done </tmp/generic_inference.log
     ctxlen="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_context_length"])' "$gmanifest")"
     render_base_url="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_url"])' "$gmanifest")"
     # One named provider carrying EVERY catalog-enabled model with its real
@@ -205,7 +222,7 @@ GPYEOF
             "$ALCF_BASE_URL" "${ALCF_MODEL:-google/gemma-4-31B-it}" 2>>/tmp/ctxlen.log)"
   # Guard: if the resolver printed nothing usable, hard-default here too.
   case "$ctxlen" in ''|*[!0-9]*) ctxlen=128000 ;; esac
-  log "Model context window: $ctxlen tokens (from max_model_len; see /tmp/ctxlen.log)"
+  diag "Model context window: $ctxlen tokens (from max_model_len; see /tmp/ctxlen.log)"
 
   # Generate the switchable-model `custom_providers:` block from the LIVE ALCF
   # catalog on every serving cluster (sophia + metis + minerva). populate_models.py
@@ -223,7 +240,7 @@ GPYEOF
   # didn't (script crashed hard), leave $providers_block empty so the splice step
   # keeps the template's committed static fallback instead.
   case "$providers_block" in
-    custom_providers:*) log "Model list generated from live catalog (see /tmp/populate_models.log)" ;;
+    custom_providers:*) diag "Model list generated from live catalog (see /tmp/populate_models.log)" ;;
     *) providers_block=""; err "populate_models produced no block; keeping static fallback list" ;;
   esac
 
@@ -314,7 +331,7 @@ GPYEOF
   fi
   # Last-resort default so the config always has a valid provider.
   [ -n "$launch_provider" ] || launch_provider="custom:alcf-sophia"
-  log "Launch model '$launch_model' -> provider $launch_provider (per-model output cap)"
+  diag "Launch model '$launch_model' -> provider $launch_provider (per-model output cap)"
   # --- end launch-model provider resolution --------------------------------
   render_base_url="$ALCF_BASE_URL"
   fi
@@ -389,9 +406,9 @@ delegation:
   model: "$delegation_model"
 EOF
 )"
-    log "Delegation (subagents) -> $delegation_model via $delegation_provider"
+    diag "Delegation (subagents) -> $delegation_model via $delegation_provider"
   else
-    log "Base Hermes has no delegate_task; skipping delegation config"
+    diag "Base Hermes has no delegate_task; skipping delegation config"
   fi
 
   # (b) mcp_servers: expose remote-bash to the model as a native `bash` tool
@@ -433,15 +450,15 @@ mcp_servers:
       ALCF_ENABLE_GLOBUS_COMPUTE: "${ALCF_ENABLE_GLOBUS_COMPUTE:-1}"
 EOF
 )"
-    log "MCP bash tool enabled (endpoint=${ALCF_BASH_ENDPOINT:-polaris}, account=${ALCF_BASH_ACCOUNT:-<unset — model asks/looks up>})"
+    diag "MCP bash tool enabled (endpoint=${ALCF_BASH_ENDPOINT:-polaris}, account=${ALCF_BASH_ACCOUNT:-<unset — model asks/looks up>})"
     if [[ -z "${ALCF_BASH_ACCOUNT:-}" ]]; then
-      log "TIP: set -e ALCF_BASH_ACCOUNT=<project> at docker run — the bash tool then charges that project by default and holds one warm compute node without asking."
+      diag "TIP: set -e ALCF_BASH_ACCOUNT=<project> at docker run — the bash tool then charges that project by default and holds one warm compute node without asking."
     fi
   else
     if [[ "${ALCF_ENABLE_GLOBUS_COMPUTE:-1}" == "0" || "${ALCF_ENABLE_MCP_BASH:-1}" == "0" ]]; then
-      log "MCP bash tool disabled by env flag"
+      diag "MCP bash tool disabled by env flag"
     else
-      log "Base Hermes has no mcp_servers support; skipping MCP bash tool"
+      diag "Base Hermes has no mcp_servers support; skipping MCP bash tool"
     fi
   fi
   # --- end optional feature blocks ------------------------------------------
@@ -497,9 +514,9 @@ PYEOF
 }
 render_config
 if [[ "$GENERIC_MODE" == "1" ]]; then
-  log "Config rendered -> $CONFIG_OUT (mode 0600; generic endpoint from INFERENCE_URL, model '$INFERENCE_MODEL')"
+  diag "Config rendered -> $CONFIG_OUT (mode 0600; generic endpoint from INFERENCE_URL, model '$INFERENCE_MODEL')"
 else
-  log "Config rendered -> $CONFIG_OUT (mode 0600; cluster=$ALCF_CLUSTER model=${ALCF_MODEL:-google/gemma-4-31B-it})"
+  diag "Config rendered -> $CONFIG_OUT (mode 0600; cluster=$ALCF_CLUSTER model=${ALCF_MODEL:-google/gemma-4-31B-it})"
 fi
 
 # SECRET HYGIENE (generic mode): INFERENCE_TOKEN arrived in the container
@@ -534,7 +551,7 @@ if [ "$GENERIC_MODE" == "0" ] && [ "${ALCF_SHOW_MODEL_STATUS:-1}" != "0" ]; then
     ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
     ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
     "$PY" "$ALCF_DIR/populate_models.py" --status-report 2>>/tmp/populate_models.log \
-    | while IFS= read -r line; do log "$line"; done || true
+  | while IFS= read -r line; do diag "$line"; done || true
 fi
 
 # --- 5. Seed / refresh skills + memory ---------------------------------------
@@ -553,15 +570,15 @@ managed_seed() {  # $1=source file, $2=dest file, $3=label
   [[ -f "$src" ]] || return 0
   if [[ ! -f "$dst" ]]; then
     cp "$src" "$dst"; sha256sum "$src" | cut -d' ' -f1 > "$stamp"
-    log "Seeded $label"
+    diag "Seeded $label"
   elif [[ -f "$stamp" ]] && sha256sum -c <(echo "$(cat "$stamp")  $dst") >/dev/null 2>&1; then
     # on-disk copy is byte-identical to what we last seeded => safe to refresh
     if ! cmp -s "$src" "$dst"; then
       cp "$src" "$dst"; sha256sum "$src" | cut -d' ' -f1 > "$stamp"
-      log "Updated $label from image"
+      diag "Updated $label from image"
     fi
   else
-    log "Kept your edited $label (image has a newer version at $src)"
+    diag "Kept your edited $label (image has a newer version at $src)"
   fi
 }
 
@@ -593,7 +610,7 @@ SOUL_DST="$HERMES_HOME/SOUL.md"
 SOUL_STAMP="$STAMP_DIR/$(echo "$SOUL_DST" | md5sum | cut -d' ' -f1).sha"
 if [[ -f "$SOUL_DST" && ! -f "$SOUL_STAMP" ]] && is_stock_hermes_soul "$SOUL_DST"; then
   rm -f "$SOUL_DST"
-  log "Replacing stock Hermes SOUL.md with the ALCF Agent identity"
+  diag "Replacing stock Hermes SOUL.md with the ALCF Agent identity"
 fi
 
 managed_seed "$ALCF_DIR/memory/MEMORY.md" "$HERMES_HOME/memories/MEMORY.md" "ALCF knowledge base (memories/MEMORY.md)"
@@ -623,7 +640,7 @@ if [[ "$GENERIC_MODE" == "0" ]]; then
   while true; do
     sleep 21600
     if render_config 2>/dev/null; then
-      log "Refreshed inference access token."
+      diag "Refreshed inference access token."
       : > "$TOKEN_STATUS" 2>/dev/null || true   # healthy again
     else
       err "╔═══════════════════════════════════════════════════════════════╗"
@@ -650,7 +667,7 @@ PUB_PORT="${ALCF_DASHBOARD_PORT:-8787}"
 INT_PORT="${ALCF_DASHBOARD_INTERNAL_PORT:-9119}"
 mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" 2>/dev/null || true
 
-log "Starting dashboard (internal) on 0.0.0.0:${INT_PORT} (auth gate ON)"
+diag "Starting dashboard (internal) on 0.0.0.0:${INT_PORT} (auth gate ON)"
 # Bind 0.0.0.0 so Hermes engages the auth gate (loopback bind would skip it).
 # Only the public proxy port is published from the container, so the internal
 # port is not directly reachable from the host — Caddy proxies to it.
@@ -679,8 +696,11 @@ PYEOF
 # Make the user-facing URL visually dominant; Hermes and Caddy emit additional
 # startup lines immediately afterward, so a single ordinary log line is easy to
 # miss in terminal output.
-log "================================================================"
-log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"
-log "  LOGIN: user=${ALCF_DASHBOARD_USER}  (use your dashboard password)"
-log "================================================================"
+milestone "╔══════════════════════════════════════════════════════════════╗"
+milestone "║  READY — OPEN THIS URL                                       ║"
+milestone "║  http://localhost:${PUB_PORT}                                  ║"
+milestone "║                                                              ║"
+milestone "║  Sign in as: ${ALCF_DASHBOARD_USER}                             ║"
+milestone "║  Use the dashboard password supplied or generated at startup.║"
+milestone "╚══════════════════════════════════════════════════════════════╝"
 exec caddy run --config /opt/data/Caddyfile --adapter caddyfile
