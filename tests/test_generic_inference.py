@@ -467,11 +467,10 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
 
     def test_dashboard_ready_banner_makes_public_url_prominent(self):
         body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
-        self.assertIn('log "================================================================"', body)
-        self.assertIn('log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"', body)
-        self.assertIn('log "================================================================"', body)
+        self.assertIn("READY — OPEN THIS URL", body)
+        self.assertIn("http://localhost:${PUB_PORT}", body)
         self.assertLess(
-            body.index('log "  OPEN THE WEB UI:  http://localhost:${PUB_PORT}"'),
+            body.index("READY — OPEN THIS URL"),
             body.index("exec caddy run"),
         )
 
