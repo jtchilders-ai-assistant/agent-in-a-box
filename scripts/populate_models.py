@@ -250,7 +250,7 @@ MINERVA_FALLBACK = {
     "inkling-2-small": (1048576, True),
 }
 # Tara fallback: the Tara table of the ALCF "Available Models" doc as of
-# 2026-11-23 (plans/evidence/tara/alcf-models-doc-2026-11-23.md). Every model is
+# 2026-11-23, plus inkling-2-small from the live catalog the same day (plans/evidence/tara/alcf-models-doc-2026-11-23.md). Every model is
 # marked R (reasoning) and T, none H: Tara models are not kept always hot, so a
 # first request may wait for a cold start. Note the "openai/" prefix on the
 # gpt-oss ids, unlike Metis/Minerva.
@@ -264,6 +264,9 @@ TARA_FALLBACK = {
     "openai/gpt-oss-20b": (65536, True),
     "beam-1.0-fp8": (1048576, True),
     "inkling-bf16": (1048576, True),
+    # Not in the doc table; present in the LIVE Tara catalog and running
+    # (plans/evidence/tara/probe-live-2026-11-23.txt). Also on Minerva.
+    "inkling-2-small": (1048576, True),
 }
 
 

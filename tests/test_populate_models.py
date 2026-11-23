@@ -211,6 +211,7 @@ class TestTaraFallback(unittest.TestCase):
             "openai/gpt-oss-20b": (65536, True),
             "beam-1.0-fp8": (1048576, True),
             "inkling-bf16": (1048576, True),
+            "inkling-2-small": (1048576, True),
         })
 
     def test_catalog_failure_uses_fallback(self):

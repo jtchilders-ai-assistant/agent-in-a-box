@@ -149,8 +149,8 @@ RUN printf '%s\n%s\n' "${ALCF_GIT_SHA}" "${ALCF_BUILD_DATE}" > /opt/alcf/.alcf_v
 # The default model depends on ALCF_CLUSTER, so ALCF_MODEL is deliberately NOT
 # set here (an image-wide value would survive -e ALCF_CLUSTER=sophia). The
 # entrypoint picks it: tara (the default cluster) -> muse-spark-bf16 (1M-token
-# context, reasoning; the alcf-tara-reasoning 12288-token output cap); sophia,
-# metis, minerva -> google/gemma-4-31B-it. An explicit -e ALCF_MODEL wins.
+# context, reasoning; the alcf-tara-reasoning 12288-token output cap); sophia ->
+# google/gemma-4-31B-it; metis -> gemma-4-31B-it; minerva -> muse-spark-bf16. An explicit -e ALCF_MODEL wins.
 # TRADE-OFF: Tara models are not kept "always hot", so the first request after
 # a quiet period may wait for a cold start (HTTP 503 until loaded). For the
 # previous always-hot default, run with -e ALCF_CLUSTER=sophia. All models

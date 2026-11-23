@@ -287,7 +287,7 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `ALCF_MODEL` | depends on `ALCF_CLUSTER` | Model id on the inference service (the launch model). The default model depends on `ALCF_CLUSTER`: `muse-spark-bf16` on `tara`, `google/gemma-4-31B-it` on `sophia`, `metis` and `minerva`. An explicit `ALCF_MODEL` always wins. Tara models are not kept always hot, so the first request may wait for a cold start; `-e ALCF_CLUSTER=sophia` restores the previous always-hot default |
+| `ALCF_MODEL` | depends on `ALCF_CLUSTER` | Model id on the inference service (the launch model). The default model depends on `ALCF_CLUSTER`: `muse-spark-bf16` on `tara`, `google/gemma-4-31B-it` on `sophia`, `gemma-4-31B-it` on `metis`, `muse-spark-bf16` on `minerva`. An explicit `ALCF_MODEL` always wins. Tara models are not kept always hot, so the first request may wait for a cold start; `-e ALCF_CLUSTER=sophia` restores the previous always-hot default |
 | `ALCF_CLUSTER` | `tara` | `tara`, `sophia` (vLLM), `metis` (SambaNova) or `minerva`; anything else refuses to start (exit 78) |
 | `ALCF_MAX_TOKENS` | `2048` | Baseline per-response output cap for **plain chat** models |
 | `ALCF_REASONING_MAX_TOKENS` | `12288` | Per-response output cap for **reasoning** models (gpt-oss, gemma-4, nemotron-3-super, *-Thinking). They spend part of the output budget on a hidden reasoning channel, so they need more headroom than chat models. |
@@ -520,8 +520,8 @@ providers are named by cluster and reasoning class:
 
 The default model depends on `ALCF_CLUSTER`. The default launch is
 **`muse-spark-bf16` on Tara** (1M-token context, a reasoning model with the
-12288-token reasoning output cap); with `ALCF_CLUSTER=sophia` (or `metis` /
-`minerva`) and no `ALCF_MODEL`, it is `google/gemma-4-31B-it`. An explicit
+12288-token reasoning output cap); with no `ALCF_MODEL` it is `google/gemma-4-31B-it` on
+`sophia`, `gemma-4-31B-it` on `metis` and `muse-spark-bf16` on `minerva`. An explicit
 `ALCF_MODEL` always wins. The trade-off: Tara models are not "always hot", so
 the first request after a quiet period may wait for a cold start. To go back to
 the previous always-hot default, run with `-e ALCF_CLUSTER=sophia`.

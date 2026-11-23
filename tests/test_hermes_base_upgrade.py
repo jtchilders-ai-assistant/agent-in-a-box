@@ -1540,7 +1540,9 @@ class EntrypointClusterContract(AlcfEntrypointMixin, unittest.TestCase):
         body = (SCRIPTS / "entrypoint.sh").read_text(encoding="utf-8")
         code = [ln for ln in body.splitlines() if not ln.lstrip().startswith("#")]
         self.assertEqual(len([ln for ln in code if 'ALCF_MODEL="${ALCF_MODEL:-' in ln]), 1)
-        self.assertEqual(len([ln for ln in code if "muse-spark-bf16" in ln]), 1)
+        defaults = re.findall(r'^\s*(\w+)\).*?default_model="([^"]+)"', "\n".join(code), re.M | re.S)
+        self.assertEqual(dict(defaults), {"tara": "muse-spark-bf16", "sophia": "google/gemma-4-31B-it",
+                                          "metis": "gemma-4-31B-it", "minerva": "muse-spark-bf16"})
 
     def test_image_defaults_launch_muse_spark_on_tara(self):
         res = self.run_alcf(**image_model_env())
@@ -1580,6 +1582,19 @@ class EntrypointClusterContract(AlcfEntrypointMixin, unittest.TestCase):
                 # In the static fallback list, so nothing had to be injected.
                 self.assertNotIn("not verified against the catalog", res.stderr)
                 self.assertEqual(self.config()["model"]["base_url"], base)
+                self.assertEqual(self.config()["model"]["provider"], provider)
+
+    def test_metis_and_minerva_defaults_are_served_ids(self):
+        # Live catalogs 2026-11-23: Metis serves gemma-4-31B-it (no google/
+        # prefix); Minerva serves no gemma. Both defaults resolve without
+        # catalog-outage injection.
+        for cluster, model, provider in (("metis", "gemma-4-31B-it", "custom:alcf-metis-reasoning"),
+                                         ("minerva", "muse-spark-bf16", "custom:alcf-minerva-reasoning")):
+            with self.subTest(cluster=cluster):
+                res = self.run_alcf(**image_model_env(ALCF_CLUSTER=cluster))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertNotIn("not verified against the catalog", res.stderr)
+                self.assertEqual(self.config()["model"]["model"], model)
                 self.assertEqual(self.config()["model"]["provider"], provider)
 
     def test_sophia_default_model_is_unchanged(self):

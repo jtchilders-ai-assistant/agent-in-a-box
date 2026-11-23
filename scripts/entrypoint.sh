@@ -77,7 +77,9 @@ printf 'ALCF Agent in a Box\nalcf-agent-box commit: %s\nbuilt: %s\nhermes: %s\nr
 # --- 1. Resolve inference base_url ------------------------------------------
 # The ONE default-model table: the image sets no ALCF_MODEL, so the default
 # depends on ALCF_CLUSTER (default tara). An explicit ALCF_MODEL always wins.
-# metis/minerva keep the pre-Tara default (google/gemma-4-31B-it).
+# Per-cluster defaults are ids the cluster actually serves (live catalogs,
+# 2026-11-23): Metis serves gemma-4-31B-it WITHOUT the google/ prefix, and
+# Minerva serves no gemma at all, so it defaults to muse-spark-bf16 too.
 ALCF_CLUSTER="${ALCF_CLUSTER:-tara}"
 case "$ALCF_CLUSTER" in
   tara)    ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/tara/api/v1"
@@ -85,9 +87,9 @@ case "$ALCF_CLUSTER" in
   sophia)  ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
            default_model="google/gemma-4-31B-it" ;;
   metis)   ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/metis/api/v1"
-           default_model="google/gemma-4-31B-it" ;;
+           default_model="gemma-4-31B-it" ;;
   minerva) ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1"
-           default_model="google/gemma-4-31B-it" ;;
+           default_model="muse-spark-bf16" ;;
   *) err "Unknown ALCF_CLUSTER='$ALCF_CLUSTER' (expected sophia|metis|minerva|tara)"
      exit 78 ;;   # EX_CONFIG
 esac

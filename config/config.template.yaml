@@ -240,6 +240,8 @@ providers:
         context_length: 1048576
       google/gemma-4-31B-it-262k:
         context_length: 262144
+      inkling-2-small:
+        context_length: 1048576
       inkling-bf16:
         context_length: 1048576
       mistral-large-4:
