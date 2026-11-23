@@ -104,6 +104,14 @@ Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
    Reasoning classification uses the catalog `reasoning_parser` field plus an id
    heuristic. On any discovery failure it prints the committed static fallback
    block from the template, so the container always comes up with a usable list.
+   Two launch-model safeguards live here. First, the launch cluster
+   (`ALCF_CLUSTER`) is always generated, even if its `ALCF_ENABLE_<CLUSTER>`
+   flag is `0`; the override is logged. Second, if the launch cluster fell back
+   to its static list and that list lacks `ALCF_MODEL`, the model is added to
+   the matching plain or `-reasoning` provider, using the step-2 context window
+   (only if ≥ 64k), with a loud stderr notice. The launch cluster's state
+   (`live` / `fallback` / `fallback-injected` / `fallback-missing`) is handed to
+   the entrypoint through a small state file, for step 5.
 4. **Context-floor guard.** Hermes hard-refuses a model whose window is below
    `MINIMUM_CONTEXT_LENGTH` (64000). If the *launch* model is sub-floor, exit 78
    with an actionable list of valid models rather than a raw Hermes stacktrace.
@@ -114,7 +122,10 @@ Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
    how turn one inherits the correct per-model output cap given that Hermes has
    no per-model `max_tokens`. This is the second intentional hard stop: if no
    provider, or more than one, lists the model, exit 78 with the valid model
-   ids. A distinct `ALCF_DELEGATION_MODEL` is resolved the same way across all
+   ids. When the launch cluster is on its static fallback and the model could
+   not be added in step 3, or generation failed outright, the refusal instead
+   says "catalog unavailable; '<model>' is not in the static fallback list".
+   A distinct `ALCF_DELEGATION_MODEL` is resolved the same way across all
    providers and also exits 78 when unresolvable or ambiguous. (Before the
    v0.23.2 migration this step fell back to an id heuristic and then to
    `custom:alcf-sophia`; that silent fallback was removed.)

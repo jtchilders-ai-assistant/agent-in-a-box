@@ -232,20 +232,47 @@ GPYEOF
   # filters to chat models and assigns each its real serving context window; it
   # always prints a valid block (committed static fallback on any discovery
   # failure), so this is never fatal. ALCF_ENABLE_METIS=0 / ALCF_ENABLE_MINERVA=0
-  # drop those providers.
+  # drop those providers -- except the LAUNCH cluster's, which is always kept so
+  # the launch model can resolve on its own endpoint.
+  #
+  # Catalog outage: if the launch cluster fell back to its static list and that
+  # list lacks the launch model, populate_models.py adds the model (with the
+  # $ctxlen resolved above, only if >= the 64k floor) so a model ALCF really
+  # serves still starts. It reports the launch cluster's state (live | fallback
+  # | fallback-injected | fallback-missing) in $launch_source_file.
+  local launch_source_file=/tmp/alcf_launch_source launch_source
+  rm -f "$launch_source_file"
+  case "${ALCF_CLUSTER:-sophia}" in
+    metis)
+      if [ "${ALCF_ENABLE_METIS:-1}" = "0" ]; then
+        diag "ALCF_ENABLE_METIS=0 ignored for the launch cluster metis (its providers are always generated)"
+      fi ;;
+  esac
   providers_block="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
             ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
             ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
+            ALCF_LAUNCH_CLUSTER="${ALCF_CLUSTER:-sophia}" \
+            ALCF_LAUNCH_MODEL="${ALCF_MODEL:-google/gemma-4-31B-it}" \
+            ALCF_LAUNCH_CONTEXT="$ctxlen" \
+            ALCF_LAUNCH_SOURCE_FILE="$launch_source_file" \
             ALCF_MAX_TOKENS="${ALCF_MAX_TOKENS:-2048}" \
             ALCF_REASONING_MAX_TOKENS="${ALCF_REASONING_MAX_TOKENS:-12288}" \
-            "$PY" "$ALCF_DIR/populate_models.py" 2>>/tmp/populate_models.log)"
+            "$PY" "$ALCF_DIR/populate_models.py" 2>>/tmp/populate_models.log)" \
+    || providers_block=""   # a crash must reach the guard below, not abort under set -e
+  launch_source="$(cat "$launch_source_file" 2>/dev/null || true)"
   # Guard: a generated block MUST start with 'providers:'. If somehow it didn't
   # (script crashed hard), leave $providers_block empty so the splice step keeps
   # the template's committed static fallback instead.
   case "$providers_block" in
     providers:*) diag "Model list generated from live catalog (see /tmp/populate_models.log)" ;;
-    *) providers_block=""; err "populate_models produced no block; keeping static fallback list" ;;
+    *) providers_block=""; launch_source="generation-failed"
+       err "populate_models produced no block; keeping static fallback list" ;;
   esac
+  if [ "$launch_source" = "fallback-injected" ]; then
+    err "ALCF model catalog unavailable for ${ALCF_CLUSTER:-sophia}: using the static fallback list,"
+    err "with launch model '${ALCF_MODEL:-google/gemma-4-31B-it}' added to it (context $ctxlen; not verified against the catalog)."
+    diag "Catalog outage on ${ALCF_CLUSTER:-sophia}: launch model '${ALCF_MODEL:-google/gemma-4-31B-it}' injected into the static fallback list (context $ctxlen)"
+  fi
 
   # --- Launch-model context floor guard ------------------------------------
   # Hermes hard-refuses to start any model whose context window is below its
@@ -313,9 +340,23 @@ GPYEOF
   # reasoning_parser) lands in the -reasoning provider even though its id has no
   # reasoning keyword. Zero or several matches REFUSE to start: guessing would
   # silently apply the wrong cap (or a provider that does not list the model).
+  # During a catalog outage the model was added to the fallback list above when
+  # possible; if it could not be (or generation failed outright) the refusal
+  # says so, since the model may well be served once the catalog is back.
   if ! launch_provider="$(printf '%s\n' "$block_for_scan" \
         | "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$launch_model" \
           --base-url "$ALCF_BASE_URL" 2>/tmp/launch_provider.log)"; then
+    if [ "$launch_source" = "fallback-missing" ] || [ "$launch_source" = "generation-failed" ]; then
+      err "======================================================================"
+      err "REFUSING TO START: ALCF model catalog unavailable; '$launch_model' is not in the static fallback list"
+      err "for $ALCF_BASE_URL, and it could not be added (its context window is unknown"
+      err "or below Hermes' $floor-token minimum). Retry once the catalog is reachable."
+      err ""
+      err "Set ALCF_MODEL to one of these models in the static fallback list and restart the container:"
+      err "  $valid_list"
+      err "======================================================================"
+      exit 78   # EX_CONFIG: launch model unresolvable during a catalog outage
+    fi
     err "======================================================================"
     err "REFUSING TO START: launch model '$launch_model' does not map to exactly"
     err "one model provider on $ALCF_BASE_URL:"

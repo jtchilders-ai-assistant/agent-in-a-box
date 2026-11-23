@@ -76,6 +76,13 @@ network. Reads:
     ALCF_PY             python used to run the auth helper (default: this python)
     ALCF_ENABLE_METIS   include the Metis provider?   "1" (default) / "0"
     ALCF_ENABLE_MINERVA include the Minerva provider? "1" (default) / "0"
+    ALCF_LAUNCH_CLUSTER the launch cluster: always included, whatever its
+                        ALCF_ENABLE_<CLUSTER> flag says
+    ALCF_LAUNCH_MODEL   the launch model; with ALCF_LAUNCH_CONTEXT (its resolved
+    ALCF_LAUNCH_CONTEXT window), added to the launch cluster's static fallback if
+                        discovery failed and the fallback lacks it (>= 64k only)
+    ALCF_LAUNCH_SOURCE_FILE  where to write the launch cluster's state: live |
+                        fallback | fallback-injected | fallback-missing
 """
 import json
 import os
@@ -465,6 +472,54 @@ def _clusters(include_metis: bool = True, include_minerva: bool = True) -> list:
     return out
 
 
+def _include_flags(include_metis: bool, include_minerva: bool) -> tuple:
+    """Apply the launch-cluster override to the ALCF_ENABLE_<CLUSTER> flags.
+
+    The launch model must resolve on the launch endpoint, so the launch cluster
+    ($ALCF_LAUNCH_CLUSTER) is always generated; the flags only trim the OTHER
+    clusters. Logs one line when a flag is overridden.
+    """
+    launch = os.environ.get("ALCF_LAUNCH_CLUSTER", "")
+    for cluster, enabled in (("metis", include_metis), ("minerva", include_minerva)):
+        if launch == cluster and not enabled:
+            print(f"[populate_models] ALCF_ENABLE_{cluster.upper()}=0 overridden: "
+                  f"{cluster} is the launch cluster", file=sys.stderr)
+    return include_metis or launch == "metis", include_minerva or launch == "minerva"
+
+
+def _launch_context() -> int:
+    """$ALCF_LAUNCH_CONTEXT as a positive int, else 0 (unknown)."""
+    raw = os.environ.get("ALCF_LAUNCH_CONTEXT", "").strip()
+    return int(raw) if raw.isdigit() else 0
+
+
+def _ensure_launch_model(mapping: dict, src: str, cluster: str) -> str:
+    """Keep the launch model resolvable on its cluster during a catalog outage.
+
+    Returns the launch cluster's state: 'live' (discovered; an absent model is
+    really not served, so nothing is added), 'fallback' (static list already
+    lists it), 'fallback-injected' (the static list lacked it, so it was added
+    to ``mapping`` with the resolved launch context and its id-heuristic
+    reasoning class) or 'fallback-missing' (lacking, and the context is unknown
+    or below MIN_CONTEXT, so the entrypoint refuses).
+    """
+    model = os.environ.get("ALCF_LAUNCH_MODEL", "")
+    if src == "live":
+        return "live"
+    if model in mapping:
+        return "fallback"
+    ctx = _launch_context()
+    if ctx < MIN_CONTEXT:
+        print(f"[populate_models] {cluster}: catalog unavailable and launch model "
+              f"{model!r} is not in the static fallback list; its context ({ctx or 'unknown'}) "
+              f"is below the {MIN_CONTEXT} floor, so it is NOT added", file=sys.stderr)
+        return "fallback-missing"
+    mapping[model] = (ctx, _is_reasoning_id(model))
+    print(f"[populate_models] {cluster}: catalog unavailable; added launch model "
+          f"{model!r} to the static fallback list (context {ctx})", file=sys.stderr)
+    return "fallback-injected"
+
+
 def build_block(include_metis: bool = True, include_minerva: bool = True) -> str:
     try:
         token = _get_token()
@@ -473,6 +528,9 @@ def build_block(include_metis: bool = True, include_minerva: bool = True) -> str
               file=sys.stderr)
         token = None
 
+    include_metis, include_minerva = _include_flags(include_metis, include_minerva)
+    launch_cluster = os.environ.get("ALCF_LAUNCH_CLUSTER", "")
+    launch_state = None
     lines = ["providers:"]
     for cluster, provider, base, selector, fallback in _clusters(
             include_metis=include_metis, include_minerva=include_minerva):
@@ -480,10 +538,16 @@ def build_block(include_metis: bool = True, include_minerva: bool = True) -> str
             mapping, src = _resolve_cluster(cluster, token, selector, fallback)
         else:
             mapping, src = dict(fallback), "fallback"
+        if cluster == launch_cluster and os.environ.get("ALCF_LAUNCH_MODEL"):
+            launch_state = _ensure_launch_model(mapping, src, cluster)
         lines += _emit_cluster(provider, base, mapping)
         print(f"[populate_models] {cluster}: {len(mapping)} models ({src})",
               file=sys.stderr)
 
+    state_file = os.environ.get("ALCF_LAUNCH_SOURCE_FILE", "")
+    if state_file and launch_state:
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.write(launch_state + "\n")
     return "\n".join(lines) + "\n"
 
 
@@ -587,8 +651,9 @@ def status_report() -> int:
               file=sys.stderr)
         return 0
 
-    include_metis = os.environ.get("ALCF_ENABLE_METIS", "1") != "0"
-    include_minerva = os.environ.get("ALCF_ENABLE_MINERVA", "1") != "0"
+    include_metis, include_minerva = _include_flags(
+        os.environ.get("ALCF_ENABLE_METIS", "1") != "0",
+        os.environ.get("ALCF_ENABLE_MINERVA", "1") != "0")
 
     lines = ["Model availability (context window shown per model):"]
     any_live = False

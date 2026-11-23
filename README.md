@@ -296,7 +296,7 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 | `ALCF_DASHBOARD_PASSWORD` | *(auto-generated + printed)* | Dashboard login password (hashed at start; plaintext never stored) |
 | `ALCF_ENABLE_IRI` | `1` | Enable IRI job/filesystem tools (the official combined login still requests the IRI credential when disabled) |
 | `ALCF_ENABLE_GLOBUS_COMPUTE` | `1` | Enable compute-node execution (the official combined login still requests the Compute credential when disabled) |
-| `ALCF_ENABLE_METIS` | `1` | Include the Metis cluster's models in the switchable list |
+| `ALCF_ENABLE_METIS` | `1` | Include the Metis cluster's models in the switchable list (ignored when `ALCF_CLUSTER=metis`: the launch cluster is always included) |
 | `ALCF_ENABLE_MINERVA` | `1` | Include the Minerva cluster's models in the switchable list |
 | `ALCF_SHOW_MODEL_STATUS` | `1` | Print the model availability banner (LIVE/QUEUED/OFFLINE + context windows) at startup |
 | `ALCF_BASH_ACCOUNT` | *(unset)* | **Recommended:** your default ALCF project for the compute-node `bash` tool. When set, the agent holds ONE warm compute node across the whole conversation instead of paying repeated cold starts; when unset, it must ask/look up a project first. |
@@ -426,7 +426,10 @@ than aborting the launch.
      context floor, split each cluster into baseline vs. `-reasoning` providers,
      and stamp each provider's per-response output cap (`ALCF_MAX_TOKENS` /
      `ALCF_REASONING_MAX_TOKENS`). On discovery failure it emits the committed
-     static fallback block instead. (See **Switching models** above.)
+     static fallback block instead, adding the launch model to it if needed
+     (see **Choosing the launch and delegation models** below). The launch
+     cluster is always generated, whatever its `ALCF_ENABLE_<CLUSTER>` flag.
+     (See **Switching models** above.)
    - **Context-floor guard.** If the *launch* model's real window is under 64k,
      refuse to start (exit 78) with an actionable list of valid ≥64k models,
      instead of letting Hermes throw a raw stacktrace at load.
@@ -561,7 +564,11 @@ Three behaviors are worth knowing:
 subagent model) must each map to **exactly one** generated provider:
 
 - the **launch** model must be listed by exactly one provider on the launch
-  endpoint (the `ALCF_CLUSTER` base URL);
+  endpoint (the `ALCF_CLUSTER` base URL). The launch cluster's providers are
+  always generated, even if its `ALCF_ENABLE_<CLUSTER>` flag is `0` (e.g.
+  `ALCF_CLUSTER=metis` with `ALCF_ENABLE_METIS=0` still gets the Metis
+  providers; the override is noted in `startup.log`). The flags only trim the
+  other clusters;
 - the **delegation** model must be listed by exactly one provider across all
   generated providers, so a model served on more than one cluster (e.g.
   `gpt-oss-120b`, on both Metis and Minerva) is ambiguous and is refused. If
@@ -575,6 +582,16 @@ a model wasn't in the generated list.
 If the live catalog is unreachable at startup, the generator falls back to a
 committed static list in `config/config.template.yaml`, so the container always
 comes up with a usable (if possibly slightly stale) set of models.
+
+During such an outage the static list may not include your `ALCF_MODEL`. In
+that case the generator adds the launch model to the launch cluster's plain or
+`-reasoning` provider (classified by its id), using the context window resolved
+at startup, and prints a notice to stderr naming the outage and the added
+model. This only happens if that window is at least 64k. Otherwise startup
+refuses with exit 78 and a distinct message: "catalog unavailable; '<model>' is
+not in the static fallback list …". When the catalog *is* reachable, a launch
+model missing from it really is not served (or was excluded), so it is always
+refused, never added.
 
 For the **full live catalog** (embeddings, GenSLM science models, everything —
 including the sub-64k models that can't be the agent's brain), just ask the
