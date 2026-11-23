@@ -50,13 +50,19 @@ log() { milestone "$*"; }
 
 # --- 0. Version banner ------------------------------------------------------
 # Print the ALCF-agent-box git revision + build date baked at image build, plus
-# the underlying Hermes SHA, so you can confirm exactly which image is running.
+# the underlying Hermes version, so you can confirm exactly which image is
+# running. The Hermes line is recorded at image build (Dockerfile, from
+# `hermes --version`) into $ALCF_DIR/.hermes_version; older bases shipped
+# /opt/hermes/.hermes_build_sha instead. Never run `hermes --version` here.
 _alcf_sha="dev"; _alcf_date="unknown"
 if [[ -f "$ALCF_DIR/.alcf_version" ]]; then
   _alcf_sha="$(sed -n 1p "$ALCF_DIR/.alcf_version")"
   _alcf_date="$(sed -n 2p "$ALCF_DIR/.alcf_version")"
 fi
-_hermes_sha="$(cat /opt/hermes/.hermes_build_sha 2>/dev/null | cut -c1-12 || true)"
+_hermes_sha="$(sed -n 1p "$ALCF_DIR/.hermes_version" 2>/dev/null || true)"
+if [[ -z "$_hermes_sha" ]]; then
+  _hermes_sha="$(cat /opt/hermes/.hermes_build_sha 2>/dev/null | cut -c1-12 || true)"
+fi
 printf '\033[1;36m╔══════════════════════════════════════════════════════════╗\033[0m\n'
 printf '\033[1;36m║\033[0m  ALCF Agent in a Box\n'
 printf '\033[1;36m║\033[0m  version : %s  (built %s)\n' "$_alcf_sha" "$_alcf_date"
@@ -65,7 +71,7 @@ printf '\033[1;36m╚═══════════════════�
 # Drop a chat-readable copy on the volume (refreshed every start so it always
 # reflects the running image; the agent reads it when asked "what version?").
 mkdir -p "${HERMES_HOME:-/opt/data}" 2>/dev/null || true
-printf 'ALCF Agent in a Box\nalcf-agent-box commit: %s\nbuilt: %s\nhermes commit: %s\nrepo: https://github.com/jtchilders-ai-assistant/alcf-agent-box\n' \
+printf 'ALCF Agent in a Box\nalcf-agent-box commit: %s\nbuilt: %s\nhermes: %s\nrepo: https://github.com/jtchilders-ai-assistant/alcf-agent-box\n' \
   "$_alcf_sha" "$_alcf_date" "${_hermes_sha:-unknown}" > "${HERMES_HOME:-/opt/data}/ALCF_VERSION.txt" 2>/dev/null || true
 
 # --- 1. Resolve inference base_url ------------------------------------------
@@ -79,6 +85,34 @@ export ALCF_BASE_URL
 STARTUP_LOG="$HERMES_HOME/startup.log"
 mkdir -p "$HERMES_HOME"
 : > "$STARTUP_LOG"
+
+# Private run directory for this start's diagnostic and state files (catalog,
+# context-window and provider-resolution logs, the launch-cluster state).
+# mktemp -d creates it mode 0700 under an unpredictable name, so no other local
+# user can read, pre-create or symlink-swap these files the way fixed /tmp
+# names allowed. The files are pre-created under umask 077 (mode 0600); later
+# writes truncate or append in place, which keeps that mode.
+RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/aib-run.XXXXXX")" \
+  || { err "Cannot create a private run directory under ${TMPDIR:-/tmp}; refusing to start."; exit 1; }
+CTXLEN_LOG="$RUNDIR/ctxlen.log"
+POPULATE_LOG="$RUNDIR/populate_models.log"
+LAUNCH_SOURCE_FILE="$RUNDIR/launch_source"
+LAUNCH_PROVIDER_LOG="$RUNDIR/launch_provider.log"
+GENERIC_INFERENCE_LOG="$RUNDIR/generic_inference.log"
+(umask 077 && : > "$CTXLEN_LOG" && : > "$POPULATE_LOG" && : > "$LAUNCH_SOURCE_FILE" \
+   && : > "$LAUNCH_PROVIDER_LOG" && : > "$GENERIC_INFERENCE_LOG")
+diag "Run diagnostics directory: $RUNDIR"
+
+# Output caps. When set (non-empty), each must be a positive integer: a bad
+# value is refused here rather than silently replaced by the template default.
+for _cap_var in ALCF_MAX_TOKENS ALCF_REASONING_MAX_TOKENS; do
+  _cap_val="${!_cap_var:-}"
+  if [[ -n "$_cap_val" && ! "$_cap_val" =~ ^[1-9][0-9]*$ ]]; then
+    err "$_cap_var must be a positive integer when set; refusing to start."
+    exit 78   # EX_CONFIG: output cap is invalid
+  fi
+done
+unset _cap_var _cap_val
 
 # --- 1b. Generic inference mode (opt-in via INFERENCE_URL) --------------------
 # Setting INFERENCE_URL points the agent's LLM brain at ANY OpenAI-compatible
@@ -175,29 +209,32 @@ render_config() {
     if ! INFERENCE_TOKEN="$token" "$PY" "$ALCF_DIR/generic_inference.py" \
            --base-url "$INFERENCE_URL" --model "$INFERENCE_MODEL" \
            --max-tokens "${INFERENCE_MAX_TOKENS:-4096}" \
-           --output "$gmanifest" >/tmp/generic_inference.log 2>&1; then
+           --output "$gmanifest" >"$GENERIC_INFERENCE_LOG" 2>&1; then
       err "Generic inference setup failed — refusing to start. Details (token-free):"
-      sed 's/^/  /' /tmp/generic_inference.log >&2 || true
+      sed 's/^/  /' "$GENERIC_INFERENCE_LOG" >&2 || true
       exit 78   # EX_CONFIG: endpoint/token/model/catalog is unusable
     fi
     # Surface the per-model ENABLED/DISABLED report in the startup log.
-    while IFS= read -r _gline; do diag "$_gline"; done </tmp/generic_inference.log
+    while IFS= read -r _gline; do diag "$_gline"; done <"$GENERIC_INFERENCE_LOG"
     ctxlen="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_context_length"])' "$gmanifest")"
     render_base_url="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_url"])' "$gmanifest")"
     # One named provider carrying EVERY catalog-enabled model with its real
     # context window (static mapping — discover_models off, like ALCF mode).
     # The api_key stays a ${...} placeholder; the token is substituted once at
-    # template render, exactly like the ALCF path.
+    # template render, exactly like the ALCF path. The output cap lives in
+    # extra_body: Hermes v0.23.2 ignores a provider-level max_tokens.
     providers_block="$("$PY" - "$gmanifest" "${INFERENCE_MAX_TOKENS:-4096}" <<'GPYEOF'
 import json, sys
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 lines = [
-    "custom_providers:",
-    "  - name: generic-inference",
-    "    base_url: " + json.dumps(manifest["base_url"]),
+    "providers:",
+    "  generic-inference:",
+    "    name: generic-inference",
+    "    api: " + json.dumps(manifest["base_url"]),
     '    api_key: "${ALCF_ACCESS_TOKEN}"',
     "    discover_models: false",
-    "    max_tokens: %d" % int(sys.argv[2]),
+    "    extra_body:",
+    "      max_tokens: %d" % int(sys.argv[2]),
     "    models:",
 ]
 for model_id, ctx in sorted(manifest["enabled_models"].items()):
@@ -207,7 +244,7 @@ print("\n".join(lines))
 GPYEOF
 )"
     case "$providers_block" in
-      custom_providers:*) : ;;
+      providers:*) : ;;
       *) err "generic_inference produced no providers block; refusing to start"; exit 78 ;;
     esac
     block_for_scan="$providers_block"
@@ -219,30 +256,66 @@ GPYEOF
   # $ALCF_CONTEXT_LENGTH / 128000 if the lookup fails. Never fatal.
   ctxlen="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
             "$PY" "$ALCF_DIR/resolve_context_length.py" \
-            "$ALCF_BASE_URL" "${ALCF_MODEL:-google/gemma-4-31B-it}" 2>>/tmp/ctxlen.log)"
+            "$ALCF_BASE_URL" "${ALCF_MODEL:-google/gemma-4-31B-it}" 2>>"$CTXLEN_LOG")"
   # Guard: if the resolver printed nothing usable, hard-default here too.
   case "$ctxlen" in ''|*[!0-9]*) ctxlen=128000 ;; esac
-  diag "Model context window: $ctxlen tokens (from max_model_len; see /tmp/ctxlen.log)"
+  diag "Model context window: $ctxlen tokens (from max_model_len; see $CTXLEN_LOG)"
 
-  # Generate the switchable-model `custom_providers:` block from the LIVE ALCF
+  # Generate the switchable-model `providers:` block from the LIVE ALCF
   # catalog on every serving cluster (sophia + metis + minerva). populate_models.py
   # filters to chat models and assigns each its real serving context window; it
   # always prints a valid block (committed static fallback on any discovery
   # failure), so this is never fatal. ALCF_ENABLE_METIS=0 / ALCF_ENABLE_MINERVA=0
-  # drop those providers.
+  # drop those providers -- except the LAUNCH cluster's, which is always kept so
+  # the launch model can resolve on its own endpoint.
+  #
+  # Catalog outage: if the launch cluster fell back to its static list and that
+  # list lacks the launch model, populate_models.py adds the model (with the
+  # $ctxlen resolved above, only if >= the 64k floor) so a model ALCF really
+  # serves still starts. It reports the launch cluster's state (live | fallback
+  # | fallback-injected | fallback-missing) in $LAUNCH_SOURCE_FILE (empty when
+  # the launch cluster is not in the block); any other content refuses below.
+  local launch_source
+  (umask 077 && : > "$LAUNCH_SOURCE_FILE")
+  case "${ALCF_CLUSTER:-sophia}" in
+    metis)
+      if [ "${ALCF_ENABLE_METIS:-1}" = "0" ]; then
+        diag "ALCF_ENABLE_METIS=0 ignored for the launch cluster metis (its providers are always generated)"
+      fi ;;
+  esac
   providers_block="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
             ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
             ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
+            ALCF_LAUNCH_CLUSTER="${ALCF_CLUSTER:-sophia}" \
+            ALCF_LAUNCH_MODEL="${ALCF_MODEL:-google/gemma-4-31B-it}" \
+            ALCF_LAUNCH_CONTEXT="$ctxlen" \
+            ALCF_LAUNCH_SOURCE_FILE="$LAUNCH_SOURCE_FILE" \
             ALCF_MAX_TOKENS="${ALCF_MAX_TOKENS:-2048}" \
             ALCF_REASONING_MAX_TOKENS="${ALCF_REASONING_MAX_TOKENS:-12288}" \
-            "$PY" "$ALCF_DIR/populate_models.py" 2>>/tmp/populate_models.log)"
-  # Guard: a generated block MUST start with 'custom_providers:'. If somehow it
-  # didn't (script crashed hard), leave $providers_block empty so the splice step
-  # keeps the template's committed static fallback instead.
-  case "$providers_block" in
-    custom_providers:*) diag "Model list generated from live catalog (see /tmp/populate_models.log)" ;;
-    *) providers_block=""; err "populate_models produced no block; keeping static fallback list" ;;
+            "$PY" "$ALCF_DIR/populate_models.py" 2>>"$POPULATE_LOG")" \
+    || providers_block=""   # a crash must reach the guard below, not abort under set -e
+  launch_source="$(cat "$LAUNCH_SOURCE_FILE" 2>/dev/null || true)"
+  # The state steers the outage handling below, so only the values
+  # populate_models.py writes are accepted; anything else refuses (the content
+  # is not echoed).
+  case "$launch_source" in
+    ""|live|fallback|fallback-injected|fallback-missing) : ;;
+    *) err "REFUSING TO START: populate_models reported an unrecognised launch-cluster state (see $LAUNCH_SOURCE_FILE)."
+       exit 78 ;;   # EX_CONFIG: launch-cluster state is untrustworthy
   esac
+  # Guard: a generated block MUST start with 'providers:'. If somehow it didn't
+  # (script crashed hard), leave $providers_block empty so the splice step keeps
+  # the template's committed static fallback instead.
+  case "$providers_block" in
+    providers:*) diag "Model list generated from live catalog (see $POPULATE_LOG)" ;;
+    *) providers_block=""; launch_source="generation-failed"
+       err "populate_models produced no block; keeping static fallback list" ;;
+  esac
+  if [ "$launch_source" = "fallback-injected" ]; then
+    err "ALCF model catalog unavailable for ${ALCF_CLUSTER:-sophia}: using the static fallback list,"
+    err "with launch model '${ALCF_MODEL:-google/gemma-4-31B-it}' added to it (context $ctxlen; not verified against the catalog)."
+    diag "Catalog outage on ${ALCF_CLUSTER:-sophia}: launch model '${ALCF_MODEL:-google/gemma-4-31B-it}' injected into the static fallback list (context $ctxlen)"
+  fi
 
   # --- Launch-model context floor guard ------------------------------------
   # Hermes hard-refuses to start any model whose context window is below its
@@ -257,26 +330,32 @@ GPYEOF
   #     `case` above), and 128000 >= floor, so a broken/unreachable resolver
   #     NEVER trips this guard -- it fails OPEN (launch proceeds), never closed.
   #   * We only block on a genuine, positive sub-floor integer reading.
-  #   * The valid-model list is derived from the block we just generated; if that
-  #     extraction yields nothing (block empty/unparseable) we fall back to a
-  #     hardcoded hint so the message is always useful. No step here can abort
-  #     the launch except the one intentional `exit 78`.
-  local floor=64000 launch_model valid_list
+  #   * The valid-model list is read (structured, via populate_models.py
+  #     --list-models) from the providers on the launch endpoint in the block we
+  #     just generated, or the template's static fallback if generation failed;
+  #     if that yields nothing we fall back to a hardcoded hint so the message is
+  #     always useful. No step here can abort the launch except the intentional
+  #     `exit 78`s.
+  local floor=64000 launch_model valid_list launch_provider block_for_scan
   launch_model="${ALCF_MODEL:-google/gemma-4-31B-it}"
+  # The block that will be written (single source of truth); else the
+  # template's static fallback, which the splice step keeps in that case.
+  if [ -n "$providers_block" ]; then
+    block_for_scan="$providers_block"
+  else
+    block_for_scan="$(cat "$ALCF_DIR/config.template.yaml" 2>/dev/null || true)"
+  fi
+  # `|| true` so a parse failure can't abort under `set -e`.
+  valid_list="$(printf '%s\n' "$block_for_scan" \
+    | "$PY" "$ALCF_DIR/populate_models.py" --list-models --base-url "$ALCF_BASE_URL" \
+      2>>"$POPULATE_LOG" || true)"
+  if [ -z "$valid_list" ]; then
+    valid_list="openai/gpt-oss-120b, openai/gpt-oss-20b, google/gemma-4-31B-it, google/gemma-4-26B-A4B-it, nvidia/nemotron-3-super-120b, argonne/AuroraGPT-IT-v4-0125"
+  fi
   # Compare defensively: only treat $ctxlen as sub-floor when it is a clean
   # positive integer AND strictly less than the floor. `case` already guarantees
   # $ctxlen is all-digits, but re-check so this block is safe if moved.
   if printf '%s' "$ctxlen" | grep -Eq '^[0-9]+$' && [ "$ctxlen" -gt 0 ] && [ "$ctxlen" -lt "$floor" ]; then
-    # Extract the sophia provider's model ids from the generated block for the
-    # hint. `|| true` so a grep miss can't abort under `set -e`.
-    valid_list="$(printf '%s\n' "$providers_block" \
-      | sed -n '/name: alcf-sophia/,/name: alcf-metis/p' \
-      | grep -E '^      [A-Za-z0-9].*:$' \
-      | sed -E 's/^ +//; s/:$//' \
-      | sort | awk 'NR>1{printf ", "}{printf "%s",$0}END{print ""}' 2>/dev/null || true)"
-    if [ -z "$valid_list" ]; then
-      valid_list="openai/gpt-oss-120b, openai/gpt-oss-20b, google/gemma-4-31B-it, google/gemma-4-26B-A4B-it, nvidia/nemotron-3-super-120b, argonne/AuroraGPT-IT-v4-0125"
-    fi
     err "======================================================================"
     err "REFUSING TO START: model '$launch_model' has a context window of"
     err "$ctxlen tokens on the ALCF gateway, below Hermes' required minimum of"
@@ -294,43 +373,43 @@ GPYEOF
   # --- end launch-model context floor guard --------------------------------
 
   # --- Resolve the launch model's named provider (per-model output cap) -----
-  # The top-level model: block resolves through a NAMED custom provider so the
-  # LAUNCH turn inherits that provider's max_tokens (reasoning models get 12288,
-  # plain chat 2048). Hermes has no top-level per-model max_tokens, so this is how
-  # turn-one gets the right cap; /model switches on the dashboard then resolve the
-  # cap per-provider on their own.
+  # The top-level model: block resolves through a NAMED provider so the LAUNCH
+  # turn gets that provider's extra_body output cap (reasoning models 12288,
+  # plain chat 2048) -- the same cap a /model switch to it would get.
   #
-  # Derive the provider from the SAME block that will be written (single source of
-  # truth): find which `- name: alcf-*` section lists the launch model id, so a
-  # model the live catalog classified as reasoning (e.g. nemotron via its
+  # Derive the provider from the SAME block that will be written: exactly one
+  # provider on the launch endpoint must list the launch model id, so a model
+  # the live catalog classified as reasoning (e.g. nemotron via its
   # reasoning_parser) lands in the -reasoning provider even though its id has no
-  # reasoning keyword. Falls back to the id-heuristic Python resolver if the scan
-  # finds nothing (e.g. block unreadable), and finally to custom:alcf-sophia.
-  local launch_provider block_for_scan
-  # Scan the generated block if we have one; else the template's static fallback.
-  if [ -n "$providers_block" ]; then
-    block_for_scan="$providers_block"
-  else
-    block_for_scan="$(cat "$ALCF_DIR/config.template.yaml" 2>/dev/null || true)"
+  # reasoning keyword. Zero or several matches REFUSE to start: guessing would
+  # silently apply the wrong cap (or a provider that does not list the model).
+  # During a catalog outage the model was added to the fallback list above when
+  # possible; if it could not be (or generation failed outright) the refusal
+  # says so, since the model may well be served once the catalog is back.
+  if ! launch_provider="$(printf '%s\n' "$block_for_scan" \
+        | "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$launch_model" \
+          --base-url "$ALCF_BASE_URL" 2>"$LAUNCH_PROVIDER_LOG")"; then
+    if [ "$launch_source" = "fallback-missing" ] || [ "$launch_source" = "generation-failed" ]; then
+      err "======================================================================"
+      err "REFUSING TO START: ALCF model catalog unavailable; '$launch_model' is not in the static fallback list"
+      err "for $ALCF_BASE_URL, and it could not be added (its context window is unknown"
+      err "or below Hermes' $floor-token minimum). Retry once the catalog is reachable."
+      err ""
+      err "Set ALCF_MODEL to one of these models in the static fallback list and restart the container:"
+      err "  $valid_list"
+      err "======================================================================"
+      exit 78   # EX_CONFIG: launch model unresolvable during a catalog outage
+    fi
+    err "======================================================================"
+    err "REFUSING TO START: launch model '$launch_model' does not map to exactly"
+    err "one model provider on $ALCF_BASE_URL:"
+    while IFS= read -r _lline; do err "  $_lline"; done <"$LAUNCH_PROVIDER_LOG"
+    err ""
+    err "Set ALCF_MODEL to one of these models served on this endpoint and restart the container:"
+    err "  $valid_list"
+    err "======================================================================"
+    exit 78   # EX_CONFIG: launch model is unresolvable
   fi
-  launch_provider="$(printf '%s\n' "$block_for_scan" | awk -v m="$launch_model" '
-    /^  - name: / { prov = $3; next }
-    $0 ~ "^      " m ":$" { print prov; exit }
-  ')"
-  if [ -z "$launch_provider" ]; then
-    # Fallback: ask the Python resolver (id heuristic + best-effort catalog).
-    launch_provider="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
-        ALCF_BASE_URL="$ALCF_BASE_URL" \
-        "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$launch_model" \
-        2>>/tmp/populate_models.log || true)"
-    # awk printed a bare provider name (alcf-sophia-reasoning); the Python path
-    # already prints the custom: prefix. Normalise: prefix bare names.
-    case "$launch_provider" in custom:*) : ;; ?*) launch_provider="custom:$launch_provider" ;; esac
-  else
-    launch_provider="custom:$launch_provider"
-  fi
-  # Last-resort default so the config always has a valid provider.
-  [ -n "$launch_provider" ] || launch_provider="custom:alcf-sophia"
   diag "Launch model '$launch_model' -> provider $launch_provider (per-model output cap)"
   # --- end launch-model provider resolution --------------------------------
   render_base_url="$ALCF_BASE_URL"
@@ -342,7 +421,7 @@ GPYEOF
   # grep of the INSTALLED Hermes source: if this base image predates the
   # feature, we skip the block (with a log line) instead of risking an unknown
   # config key at dashboard startup. Same fail-open philosophy as the rest of
-  # this script, and the same grep-gate pattern the Dockerfile patch layer uses.
+  # this script.
   local extra_block=""
 
   # (a) delegation: route delegate_task subagents. Subagents get their own
@@ -362,10 +441,12 @@ GPYEOF
       # mapping — the provider block quotes model ids, so membership is
       # checked against the manifest, not by grepping the YAML block).
       # A delegation model not in that mapping has NO valid provider in
-      # generic mode, and the ALCF path below (populate_models.py with
-      # $token, plus the custom:alcf-sophia fallback) would leak the generic
-      # INFERENCE_TOKEN to the ALCF gateway and route subagents to a provider
-      # that does not exist in this config. Fail closed instead.
+      # generic mode, and routing subagents through the ALCF resolution
+      # below would point them at a provider that does not exist in this
+      # config (historically that path also passed the token to
+      # populate_models.py and fell back to custom:alcf-sophia, which would
+      # have leaked the generic INFERENCE_TOKEN to the ALCF gateway). Fail
+      # closed instead.
       if ! "$PY" -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1], encoding="utf-8"))["enabled_models"] else 1)' \
              "$gmanifest" "$delegation_model"; then
         err "======================================================================"
@@ -382,22 +463,26 @@ GPYEOF
       fi
       delegation_provider="custom:generic-inference"
     else
-      # Same provider scan as the launch model (which named provider lists it),
-      # with the same Python-resolver + static fallbacks.
-      delegation_provider="$(printf '%s\n' "$block_for_scan" | awk -v m="$delegation_model" '
-        /^  - name: / { prov = $3; next }
-        $0 ~ "^      " m ":$" { print prov; exit }
-      ')"
-      if [ -z "$delegation_provider" ]; then
-        delegation_provider="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
-            ALCF_BASE_URL="$ALCF_BASE_URL" \
-            "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$delegation_model" \
-            2>>/tmp/populate_models.log || true)"
-        case "$delegation_provider" in custom:*) : ;; ?*) delegation_provider="custom:$delegation_provider" ;; esac
-      else
-        delegation_provider="custom:$delegation_provider"
+      # Endpoint-pinned, like the launch model: if a provider on the LAUNCH
+      # endpoint lists the model (exactly one must), delegate there -- so a
+      # model served on several clusters (gpt-oss-120b) stays on the cluster
+      # the user launched on. Otherwise exactly one provider on another
+      # cluster must list it (subagents may run on any endpoint). None, or
+      # several elsewhere (e.g. gpt-oss-120b on metis AND minerva when
+      # launching on sophia), has no unambiguous route: refuse, never guess.
+      if ! delegation_provider="$(printf '%s\n' "$block_for_scan" \
+            | "$PY" "$ALCF_DIR/populate_models.py" --delegation-provider "$delegation_model" \
+              --base-url "$ALCF_BASE_URL" 2>"$LAUNCH_PROVIDER_LOG")"; then
+        err "======================================================================"
+        err "REFUSING TO START: delegation model '$delegation_model'"
+        err "(ALCF_DELEGATION_MODEL) does not map to exactly one model provider:"
+        while IFS= read -r _lline; do err "  $_lline"; done <"$LAUNCH_PROVIDER_LOG"
+        err ""
+        err "Set ALCF_DELEGATION_MODEL to a model served on $ALCF_BASE_URL or by"
+        err "exactly one other provider, or unset it to delegate on the launch model '$launch_model'."
+        err "======================================================================"
+        exit 78   # EX_CONFIG: delegation model is unresolvable
       fi
-      [ -n "$delegation_provider" ] || delegation_provider="custom:alcf-sophia"
     fi
     extra_block+="$(cat <<EOF
 
@@ -482,9 +567,9 @@ src, dst = sys.argv[1], sys.argv[2]
 tmpl = open(src, encoding="utf-8").read()
 
 # Splice: replace from the sentinel line (inclusive) to EOF with the generated
-# custom_providers block, when one was produced. The sentinel is a YAML comment,
-# so the template stays valid even if this splice is skipped.
-SENTINEL = "#__ALCF_CUSTOM_PROVIDERS__"
+# providers block, when one was produced. The sentinel is a YAML comment, so
+# the template stays valid even if this splice is skipped.
+SENTINEL = "#__ALCF_PROVIDERS__"
 block = os.environ.get("ALCF_PROVIDERS_BLOCK", "").strip()
 if block:
     idx = tmpl.find(SENTINEL)
@@ -550,7 +635,7 @@ if [ "$GENERIC_MODE" == "0" ] && [ "${ALCF_SHOW_MODEL_STATUS:-1}" != "0" ]; then
   ALCF_INFER_TOKEN="$("$ALCF_TOKENS" get-token inference 2>/dev/null || true)" ALCF_PY="$PY" \
     ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
     ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
-    "$PY" "$ALCF_DIR/populate_models.py" --status-report 2>>/tmp/populate_models.log \
+    "$PY" "$ALCF_DIR/populate_models.py" --status-report 2>>"$POPULATE_LOG" \
   | while IFS= read -r line; do diag "$line"; done || true
 fi
 

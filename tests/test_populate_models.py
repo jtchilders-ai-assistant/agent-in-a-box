@@ -200,17 +200,17 @@ class TestEmit(unittest.TestCase):
     def test_reasoning_split_gives_each_class_its_own_max_tokens(self):
         mapping = {"chatty": (128000, False), "thinky": (262144, True)}
         block = "\n".join(pm._emit_cluster("alcf-x", "https://h/v1", mapping))
-        self.assertIn("  - name: alcf-x\n", block + "\n")
-        self.assertIn("- name: alcf-x-reasoning", block)
-        self.assertIn(f"max_tokens: {pm.BASELINE_MAX_TOKENS}", block)
-        self.assertIn(f"max_tokens: {pm.REASONING_MAX_TOKENS}", block)
+        self.assertIn("  alcf-x:\n    name: alcf-x\n", block + "\n")
+        self.assertIn("  alcf-x-reasoning:\n    name: alcf-x-reasoning\n", block)
+        self.assertIn(f"    extra_body:\n      max_tokens: {pm.BASELINE_MAX_TOKENS}\n", block)
+        self.assertIn(f"    extra_body:\n      max_tokens: {pm.REASONING_MAX_TOKENS}\n", block)
         self.assertIn("context_length: 262144", block)
 
     def test_single_class_emits_one_provider(self):
         block = "\n".join(pm._emit_cluster(
             "alcf-x", "https://h/v1", {"thinky": (262144, True)}))
-        self.assertIn("- name: alcf-x-reasoning", block)
-        self.assertNotIn("- name: alcf-x\n", block + "\n")
+        self.assertIn("  alcf-x-reasoning:\n", block)
+        self.assertNotIn("  alcf-x:\n", block + "\n")
 
 
 if __name__ == "__main__":

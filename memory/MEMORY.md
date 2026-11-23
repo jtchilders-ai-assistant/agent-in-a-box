@@ -14,7 +14,8 @@ generic, and free of any individual user's credentials or private state.
 ## Your version
 If the user asks what version / build / commit you are, read the file
 `/opt/alcf/.alcf_version` (line 1 = ALCF-agent-box git SHA, line 2 = build date)
-and `/opt/hermes/.hermes_build_sha` (underlying Hermes commit). A convenience
+and `/opt/alcf/.hermes_version` (underlying Hermes version line, recorded at
+image build). A convenience
 copy is also at `$HERMES_HOME/ALCF_VERSION.txt`. Report the ALCF-agent-box SHA
 so the user can compare it to the repo
 (https://github.com/jtchilders-ai-assistant/alcf-agent-box). Do NOT guess a

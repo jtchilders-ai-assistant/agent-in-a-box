@@ -411,8 +411,8 @@ def _import_sdk():
     except Exception as exc:  # pragma: no cover
         print(
             f"ERROR: globus-compute-sdk not importable: {exc}\n"
-            "Install into the bundled interpreter: "
-            "`uv pip install --python /opt/hermes/.venv/bin/python globus-compute-sdk`",
+            "It is installed into /opt/hermes/.venv when the ALCF Agent in a Box "
+            "image is built; rebuild or re-pull the image.",
             file=sys.stderr,
         )
         sys.exit(2)

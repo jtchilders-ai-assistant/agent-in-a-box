@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the Hermes ``custom_providers:`` block from the LIVE ALCF catalog.
+"""Generate the Hermes ``providers:`` block from the LIVE ALCF catalog.
 
 At container start we query every serving ALCF Inference Service cluster and emit
-one ``custom_providers`` entry per cluster, each with a curated, chat-only model
+keyed ``providers`` entries per cluster, each with a curated, chat-only model
 mapping that carries every model's REAL serving context window:
 
-  - ``alcf-sophia``   (vLLM,  full OpenAI-compat)  base_url .../sophia/vllm/v1
-  - ``alcf-metis``    (SambaNova, chat-only)       base_url .../metis/api/v1
-  - ``alcf-minerva``  (api framework)              base_url .../minerva/api/v1
+  - ``alcf-sophia``   (vLLM,  full OpenAI-compat)  api .../sophia/vllm/v1
+  - ``alcf-metis``    (SambaNova, chat-only)       api .../metis/api/v1
+  - ``alcf-minerva``  (api framework)              api .../minerva/api/v1
 
 ``tara`` also appears in list-endpoints but is still being provisioned
 (``/models`` -> ``[]``, ``/jobs`` -> HTTP 500), so it gets no provider; the status
@@ -21,9 +21,9 @@ We instead query the ALCF-specific ``.../<cluster>/models`` endpoint ourselves
 and write the result into a static ``models:`` MAPPING (``discover_models:false``)
 so the dropdown reflects the live catalog and every model gets its correct
 ``context_length`` (Hermes honours per-model
-``custom_providers[].models.<id>.context_length`` on an in-session ``/model``
-switch — issue #15779). Without the right per-model window a switch overflows the
-real context and the gateway silently drops the SSE stream (EmptyStreamError).
+``providers.<key>.models.<id>.context_length`` on an in-session ``/model``
+switch). Without the right per-model window a switch overflows the real context
+and the gateway silently drops the SSE stream (EmptyStreamError).
 
 Three clusters, three catalog shapes
 ------------------------------------
@@ -59,25 +59,37 @@ Never fatal
 -----------
 Any failure (network, auth, bad JSON, empty result for a cluster) degrades to the
 committed static fallback for that cluster, and the script always prints a valid
-``custom_providers:`` block so container start cannot break on a lookup failure.
+``providers:`` block so container start cannot break on a lookup failure.
 
 Usage
 -----
     populate_models.py [--out PATH] [--no-metis] [--no-minerva]
     populate_models.py --status-report        # LIVE/QUEUED/OFFLINE + windows
-    populate_models.py --launch-provider ID
+    populate_models.py --launch-provider ID [--base-url URL] < providers-block
+    populate_models.py --list-models [--base-url URL]       < providers-block
 
-Prints the YAML block to stdout (and to --out if given). Reads:
+Prints the YAML block to stdout (and to --out if given). --launch-provider and
+--list-models read an already-generated block (or a whole config) on stdin,
+parse it with ruamel.yaml (the Hermes runtime venv's parser) or PyYAML, exit 1
+if it cannot be parsed, and never touch the network. Reads:
     ALCF_INFER_TOKEN    optional pre-fetched inference token
     ALCF_PY             python used to run the auth helper (default: this python)
     ALCF_ENABLE_METIS   include the Metis provider?   "1" (default) / "0"
     ALCF_ENABLE_MINERVA include the Minerva provider? "1" (default) / "0"
+    ALCF_LAUNCH_CLUSTER the launch cluster: always included, whatever its
+                        ALCF_ENABLE_<CLUSTER> flag says
+    ALCF_LAUNCH_MODEL   the launch model; with ALCF_LAUNCH_CONTEXT (its resolved
+    ALCF_LAUNCH_CONTEXT window), added to the launch cluster's static fallback if
+                        discovery failed and the fallback lacks it (>= 64k only)
+    ALCF_LAUNCH_SOURCE_FILE  where to write the launch cluster's state: live |
+                        fallback | fallback-injected | fallback-missing
 """
 import json
 import os
 import re
 import sys
 import textwrap
+import urllib.error
 import urllib.request
 
 INFER_HOST = "https://inference-api.alcf.anl.gov/resource_server"
@@ -115,14 +127,16 @@ MIN_CONTEXT = 64000
 # return empty content (finish_reason=length) — verified on gpt-oss at ALCF. So
 # reasoning models need a bigger output cap than plain chat models.
 #
-# Hermes has NO per-model max_tokens (unlike context_length): it honours a
-# per-PROVIDER max_tokens on a custom_providers entry (runtime_provider.py
-# _lift_max_output_tokens), applied only when the top-level model.max_tokens is
-# unset. So we express "per-model" caps by SPLITTING each cluster into two
-# provider blocks — a baseline block and a "-reasoning" block — each carrying its
-# own max_tokens. The launch model's cap is set separately by the entrypoint on
-# the top-level model: block (that model resolves through raw provider:custom,
-# not a named provider).
+# Hermes has NO per-model max_tokens (unlike context_length), and Hermes
+# v0.23.2 IGNORES a provider-level max_tokens on a ``providers:`` entry (it logs
+# "unknown config keys ignored: max_tokens"). What it does honour is the entry's
+# ``extra_body``: it becomes the provider's request_overrides and is sent with
+# every request to a model selected under that provider (at launch and after an
+# in-session /model switch). So we express "per-model" caps by SPLITTING each
+# cluster into two provider entries — a baseline one and a "-reasoning" one —
+# each carrying its own ``extra_body: {max_tokens: N}``. The entrypoint points
+# the top-level model.provider at the one entry that lists the launch model, so
+# the launch turn gets the same cap as a later switch to that model.
 #
 # Both caps are env-overridable (entrypoint passes them through):
 #   ALCF_MAX_TOKENS            baseline output cap  (default 2048)
@@ -227,6 +241,15 @@ MINERVA_FALLBACK = {
 
 
 from alcf_tokens.auth import get_access_token
+
+
+def _exc_summary(e: BaseException) -> str:
+    """The exception class and HTTP status (when there is one) for a log line.
+    Never str(e): that may echo a URL, a response body or a credential."""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status is None and isinstance(e, urllib.error.HTTPError):
+        status = e.code
+    return type(e).__name__ + (f", HTTP {status}" if status is not None else "")
 
 
 def _get_token() -> str:
@@ -374,33 +397,42 @@ def _resolve_cluster(cluster: str, token: str, selector, fallback: dict) -> tupl
         print(f"[populate_models] {cluster}: empty selection; using fallback",
               file=sys.stderr)
     except Exception as e:  # noqa: BLE001
-        print(f"[populate_models] {cluster} discovery failed ({e}); using fallback",
+        print(f"[populate_models] {cluster} discovery failed ({_exc_summary(e)}); using fallback",
               file=sys.stderr)
     return dict(fallback), "fallback"
 
 
+_PLAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def _yaml_key(mid: str) -> str:
+    """A model id as a YAML mapping key: bare when safe, else double-quoted."""
+    return mid if _PLAIN_ID.fullmatch(mid) else json.dumps(mid)
+
+
 def _emit_provider(name: str, base_url: str, mapping: dict,
-                   max_tokens: int = 0) -> list:
-    """Render one custom_providers entry (2-space list-item indent).
+                   max_tokens: int) -> list:
+    """Render one keyed ``providers`` entry, indented to sit under ``providers:``.
 
     ``mapping`` is {model_id: (context_length, is_reasoning)}; only context_length
-    is emitted per model (Hermes has no per-model max_tokens). ``max_tokens`` > 0
-    emits a PROVIDER-level output cap that Hermes lifts onto AIAgent.max_tokens
-    for any model selected under this provider (when top-level model.max_tokens is
-    unset) — this is how we give reasoning vs non-reasoning models different caps.
+    is emitted per model (Hermes has no per-model max_tokens). ``max_tokens`` is
+    the output cap for every model selected under this provider. It goes in
+    ``extra_body``, which Hermes v0.23.2 sends as request overrides on each
+    request; a provider-level ``max_tokens`` key would be ignored.
     """
     lines = [
-        f"  - name: {name}",
-        f'    base_url: "{base_url}"',
+        f"  {name}:",
+        f"    name: {name}",
+        f'    api: "{base_url}"',
         '    api_key: "${ALCF_ACCESS_TOKEN}"',
         "    discover_models: false",
+        "    extra_body:",
+        f"      max_tokens: {max_tokens}",
+        "    models:",
     ]
-    if max_tokens and max_tokens > 0:
-        lines.append(f"    max_tokens: {max_tokens}")
-    lines.append("    models:")
     for mid in sorted(mapping):
         ctx = mapping[mid][0]
-        lines.append(f"      {mid}:")
+        lines.append(f"      {_yaml_key(mid)}:")
         lines.append(f"        context_length: {ctx}")
     return lines
 
@@ -413,10 +445,12 @@ def _split_reasoning(mapping: dict) -> tuple:
 
 
 def _emit_cluster(name: str, base_url: str, mapping: dict) -> list:
-    """Emit one or two provider blocks for a cluster, split by reasoning class.
+    """Return the lines of one cluster's keyed ``providers`` entries.
 
+    Every line is indented two spaces so build_block() can nest the result
+    directly under its single ``providers:`` root (no list items, no root key).
     Non-reasoning models go in ``<name>`` with the baseline output cap; reasoning
-    models go in ``<name>-reasoning`` with the larger reasoning cap. A block is
+    models go in ``<name>-reasoning`` with the larger reasoning cap. An entry is
     omitted entirely if its bucket is empty, so a cluster with only one class
     yields a single provider (no empty "-reasoning" entry cluttering the picker).
     """
@@ -434,8 +468,8 @@ def _emit_cluster(name: str, base_url: str, mapping: dict) -> list:
 def _clusters(include_metis: bool = True, include_minerva: bool = True) -> list:
     """Ordered cluster registry: (cluster, provider_name, base_url, selector, fallback).
 
-    Single source of truth shared by build_block(), the status banner and the
-    launch-provider resolver, so adding a cluster is a one-line change here.
+    Single source of truth shared by build_block() and the status banner, so
+    adding a cluster is a one-line change here.
     Provisioning clusters (see PROVISIONING_CLUSTERS) are deliberately absent —
     they have no models to offer; the banner reports them separately.
     """
@@ -448,25 +482,82 @@ def _clusters(include_metis: bool = True, include_minerva: bool = True) -> list:
     return out
 
 
+def _include_flags(include_metis: bool, include_minerva: bool) -> tuple:
+    """Apply the launch-cluster override to the ALCF_ENABLE_<CLUSTER> flags.
+
+    The launch model must resolve on the launch endpoint, so the launch cluster
+    ($ALCF_LAUNCH_CLUSTER) is always generated; the flags only trim the OTHER
+    clusters. Logs one line when a flag is overridden.
+    """
+    launch = os.environ.get("ALCF_LAUNCH_CLUSTER", "")
+    for cluster, enabled in (("metis", include_metis), ("minerva", include_minerva)):
+        if launch == cluster and not enabled:
+            print(f"[populate_models] ALCF_ENABLE_{cluster.upper()}=0 overridden: "
+                  f"{cluster} is the launch cluster", file=sys.stderr)
+    return include_metis or launch == "metis", include_minerva or launch == "minerva"
+
+
+def _launch_context() -> int:
+    """$ALCF_LAUNCH_CONTEXT as a positive int, else 0 (unknown)."""
+    raw = os.environ.get("ALCF_LAUNCH_CONTEXT", "").strip()
+    return int(raw) if raw.isdigit() else 0
+
+
+def _ensure_launch_model(mapping: dict, src: str, cluster: str) -> str:
+    """Keep the launch model resolvable on its cluster during a catalog outage.
+
+    Returns the launch cluster's state: 'live' (discovered; an absent model is
+    really not served, so nothing is added), 'fallback' (static list already
+    lists it), 'fallback-injected' (the static list lacked it, so it was added
+    to ``mapping`` with the resolved launch context and its id-heuristic
+    reasoning class) or 'fallback-missing' (lacking, and the context is unknown
+    or below MIN_CONTEXT, so the entrypoint refuses).
+    """
+    model = os.environ.get("ALCF_LAUNCH_MODEL", "")
+    if src == "live":
+        return "live"
+    if model in mapping:
+        return "fallback"
+    ctx = _launch_context()
+    if ctx < MIN_CONTEXT:
+        print(f"[populate_models] {cluster}: catalog unavailable and launch model "
+              f"{model!r} is not in the static fallback list; its context ({ctx or 'unknown'}) "
+              f"is below the {MIN_CONTEXT} floor, so it is NOT added", file=sys.stderr)
+        return "fallback-missing"
+    mapping[model] = (ctx, _is_reasoning_id(model))
+    print(f"[populate_models] {cluster}: catalog unavailable; added launch model "
+          f"{model!r} to the static fallback list (context {ctx})", file=sys.stderr)
+    return "fallback-injected"
+
+
 def build_block(include_metis: bool = True, include_minerva: bool = True) -> str:
     try:
         token = _get_token()
     except Exception as e:  # noqa: BLE001
-        print(f"[populate_models] token fetch failed ({e}); full static fallback",
+        print(f"[populate_models] token fetch failed ({_exc_summary(e)}); full static fallback",
               file=sys.stderr)
         token = None
 
-    lines = ["custom_providers:"]
+    include_metis, include_minerva = _include_flags(include_metis, include_minerva)
+    launch_cluster = os.environ.get("ALCF_LAUNCH_CLUSTER", "")
+    launch_state = None
+    lines = ["providers:"]
     for cluster, provider, base, selector, fallback in _clusters(
             include_metis=include_metis, include_minerva=include_minerva):
         if token:
             mapping, src = _resolve_cluster(cluster, token, selector, fallback)
         else:
             mapping, src = dict(fallback), "fallback"
+        if cluster == launch_cluster and os.environ.get("ALCF_LAUNCH_MODEL"):
+            launch_state = _ensure_launch_model(mapping, src, cluster)
         lines += _emit_cluster(provider, base, mapping)
         print(f"[populate_models] {cluster}: {len(mapping)} models ({src})",
               file=sys.stderr)
 
+    state_file = os.environ.get("ALCF_LAUNCH_SOURCE_FILE", "")
+    if state_file and launch_state:
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.write(launch_state + "\n")
     return "\n".join(lines) + "\n"
 
 
@@ -566,12 +657,13 @@ def status_report() -> int:
     try:
         token = _get_token()
     except Exception as e:  # noqa: BLE001
-        print(f"[status-report] token fetch failed ({e}); skipping status banner",
+        print(f"[status-report] token fetch failed ({_exc_summary(e)}); skipping status banner",
               file=sys.stderr)
         return 0
 
-    include_metis = os.environ.get("ALCF_ENABLE_METIS", "1") != "0"
-    include_minerva = os.environ.get("ALCF_ENABLE_MINERVA", "1") != "0"
+    include_metis, include_minerva = _include_flags(
+        os.environ.get("ALCF_ENABLE_METIS", "1") != "0",
+        os.environ.get("ALCF_ENABLE_MINERVA", "1") != "0")
 
     lines = ["Model availability (context window shown per model):"]
     any_live = False
@@ -582,7 +674,7 @@ def status_report() -> int:
             live, queued = _fetch_job_states(cluster, token)
             known = True
         except Exception as e:  # noqa: BLE001
-            print(f"[status-report] {cluster} /jobs failed ({e})", file=sys.stderr)
+            print(f"[status-report] {cluster} /jobs failed ({_exc_summary(e)})", file=sys.stderr)
             live, queued, known = set(), {}, False
 
         lines.append(f"  {cluster}:")
@@ -638,46 +730,154 @@ def status_report() -> int:
 hot_report = status_report
 
 
-def launch_provider(model_id: str) -> str:
-    """Return the named custom provider the LAUNCH model should resolve through.
+class LaunchProviderError(Exception):
+    """The launch/delegation model does not map to exactly one provider."""
 
-    The top-level model: block in config resolves through a NAMED custom provider
-    so the launch turn inherits that provider's per-model output cap. This returns
-    e.g. 'custom:alcf-sophia-reasoning' or 'custom:alcf-metis'. The cluster is read
-    from ALCF_BASE_URL (the launch model always uses that endpoint); the reasoning
-    class is taken from the live catalog's reasoning_parser when reachable, else
-    the id heuristic (so this is robust offline / on discovery failure).
 
-    Never raises — on any doubt it returns the reasoning provider, because giving a
-    plain chat model extra output headroom is harmless, while starving a reasoning
-    model of headroom produces empty responses.
-    """
-    base = os.environ.get("ALCF_BASE_URL", "") or SOPHIA_BASE
-    cluster, provider = "sophia", "alcf-sophia"
-    for cl, prov, cl_base, _sel, _fb in _clusters():
-        if f"/{cl}/" in base or base.rstrip("/") == cl_base.rstrip("/"):
-            cluster, provider = cl, prov
-            break
+class ProviderParseError(LaunchProviderError):
+    """The providers text cannot be read: no YAML parser, bad YAML or bad shape."""
 
-    is_reasoning = _is_reasoning_id(model_id)
-    if not is_reasoning:
-        # Consult the live catalog for an authoritative reasoning signal:
-        # Sophia advertises `reasoning_parser`, Minerva advertises
-        # capabilities.reasoning.supported. Best-effort, never fatal.
+
+def _yaml_load(text: str):
+    """Parse ``text`` with ruamel.yaml (what the Hermes runtime venv ships), else
+    PyYAML. With neither importable, or on any parse error, raise
+    ProviderParseError: a half-read block must never pick a provider."""
+    try:
+        from ruamel.yaml import YAML
+    except ImportError:
+        YAML = None
+    if YAML is not None:
         try:
-            token = _get_token()
-            for m in _fetch_models(cluster, token):
-                if m.get("id") != model_id:
-                    continue
-                caps = m.get("capabilities") or {}
-                if m.get("reasoning_parser") or (caps.get("reasoning") or {}).get("supported"):
-                    is_reasoning = True
-                break
-        except Exception:  # noqa: BLE001
-            pass
+            return YAML(typ="safe", pure=True).load(text)
+        except Exception as e:  # ruamel raises several unrelated error types
+            raise ProviderParseError(f"providers text is not valid YAML: {e}") from None
+    try:
+        import yaml
+    except ImportError:
+        raise ProviderParseError(
+            "no YAML parser available (need ruamel.yaml or PyYAML)") from None
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        """SafeLoader that, like ruamel, rejects duplicate mapping keys."""
 
-    name = f"{provider}-reasoning" if is_reasoning else provider
-    return f"custom:{name}"
+        def construct_mapping(self, node, deep=False):
+            seen = set()
+            for key_node, _value in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, f"duplicate key {key!r}", key_node.start_mark)
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
+    try:
+        return yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 (SafeLoader subclass)
+    except Exception as e:
+        raise ProviderParseError(f"providers text is not valid YAML: {e}") from None
+
+
+def parse_providers(text: str) -> dict:
+    """Read the ``providers:`` mapping of a config or block with a real YAML parser.
+
+    Returns ``{provider_key: {"api": url, "models": {model_id: context_length}}}``.
+    Text with no top-level ``providers:`` key (e.g. the legacy
+    ``custom_providers:`` list, or empty text) yields ``{}``. Anything else
+    that is not that shape -- invalid YAML, a non-mapping ``providers``, an
+    entry without a string ``api`` and a ``models`` mapping, a model without an
+    positive integer ``context_length`` -- raises ProviderParseError (fail closed).
+    """
+    doc = _yaml_load(text or "")
+    if doc is None:
+        return {}
+    if not isinstance(doc, dict):
+        raise ProviderParseError("providers text is not a YAML mapping")
+    if "providers" not in doc:
+        return {}
+    providers = doc["providers"]
+    if not isinstance(providers, dict):
+        raise ProviderParseError("'providers' is not a mapping")
+    out: dict = {}
+    for key, entry in providers.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            raise ProviderParseError(f"provider {key!r} is not a named mapping")
+        api, models = entry.get("api"), entry.get("models")
+        if not isinstance(api, str) or not isinstance(models, dict):
+            raise ProviderParseError(
+                f"provider {key!r} needs a string 'api' and a 'models' mapping")
+        out[key] = {"api": api, "models": {}}
+        for mid, meta in models.items():
+            ctx = meta.get("context_length") if isinstance(meta, dict) else None
+            if (not isinstance(mid, str) or not isinstance(ctx, int)
+                    or isinstance(ctx, bool) or ctx <= 0):
+                raise ProviderParseError(
+                    f"provider {key!r} model {mid!r} needs a positive integer context_length")
+            out[key]["models"][mid] = ctx
+    return out
+
+
+def _on_endpoint(providers: dict, base_url) -> dict:
+    """The providers whose ``api`` is base_url (trailing slash ignored); all if None."""
+    if not base_url:
+        return providers
+    want = base_url.rstrip("/")
+    return {k: e for k, e in providers.items() if e["api"].rstrip("/") == want}
+
+
+def list_models(providers_text: str, base_url=None) -> list:
+    """Sorted model ids listed by the providers on base_url (all if None)."""
+    scoped = _on_endpoint(parse_providers(providers_text), base_url)
+    return sorted({mid for e in scoped.values() for mid in e["models"]})
+
+
+def launch_provider(model_id: str, providers_text: str, base_url=None) -> str:
+    """Return the named provider the launch (or delegation) model resolves through.
+
+    The top-level model: block resolves through a NAMED provider so the launch
+    turn gets that provider's output cap (its extra_body), exactly as a later
+    /model switch to the same model would. The answer is read from the generated
+    block itself, never guessed: among the providers whose ``api`` is base_url
+    (the launch endpoint; all providers when None) exactly one
+    must list model_id. Zero or several matches raise LaunchProviderError, since
+    a guess could silently apply the wrong cap or endpoint. Returns e.g.
+    'custom:alcf-sophia-reasoning'. Never touches the network.
+    """
+    scoped = _on_endpoint(parse_providers(providers_text), base_url)
+    matches = sorted(k for k, e in scoped.items() if model_id in e["models"])
+    where = f" on {base_url}" if base_url else ""
+    if not matches:
+        raise LaunchProviderError(
+            f"model {model_id!r} is not listed by any generated provider{where}")
+    if len(matches) > 1:
+        raise LaunchProviderError(
+            f"model {model_id!r} is listed by several providers{where} "
+            f"({', '.join(matches)}); cannot pick one")
+    return f"custom:{matches[0]}"
+
+
+def delegation_provider(model_id: str, providers_text: str, launch_base_url) -> str:
+    """Return the named provider the delegation (subagent) model resolves through.
+
+    Endpoint-pinned like the launch model: if any provider on the launch
+    endpoint lists model_id, the launch_provider() rule applies there (exactly
+    one, else raise) -- so a model served on several clusters (e.g. gpt-oss-120b)
+    delegates on the cluster the user launched on. Otherwise exactly one provider
+    on any OTHER endpoint must list it. None, or several elsewhere, raise
+    LaunchProviderError naming the candidates; there is no guess. Never touches
+    the network.
+    """
+    providers = parse_providers(providers_text)
+    on_launch = _on_endpoint(providers, launch_base_url) if launch_base_url else {}
+    if any(model_id in e["models"] for e in on_launch.values()):
+        return launch_provider(model_id, providers_text, launch_base_url)
+    matches = sorted(k for k, e in providers.items()
+                     if k not in on_launch and model_id in e["models"])
+    if not matches:
+        raise LaunchProviderError(
+            f"model {model_id!r} is not listed by any generated provider")
+    if len(matches) > 1:
+        raise LaunchProviderError(
+            f"model {model_id!r} is not on the launch endpoint and is listed by several "
+            f"other providers ({', '.join(matches)}); cannot pick one")
+    return f"custom:{matches[0]}"
 
 
 def main() -> int:
@@ -692,16 +892,49 @@ def main() -> int:
                     action="store_true",
                     help="print a per-cluster LIVE/QUEUED/OFFLINE availability "
                          "banner (with each model's context window) instead of "
-                         "the custom_providers block (queries /jobs). "
+                         "the providers block (queries /jobs). "
                          "--hot-report is the deprecated alias.")
     ap.add_argument("--launch-provider", default="", metavar="MODEL_ID",
-                    help="print the named custom provider the given launch model "
-                         "should resolve through (e.g. custom:alcf-sophia-reasoning) "
-                         "and exit")
+                    help="read a providers block on stdin and print the one named "
+                         "provider that lists MODEL_ID (e.g. "
+                         "custom:alcf-sophia-reasoning); exit 1 if none or several")
+    ap.add_argument("--delegation-provider", default="", metavar="MODEL_ID",
+                    help="read a providers block on stdin and print the named "
+                         "provider for the delegation model: the one on --base-url "
+                         "(the launch endpoint) if it lists MODEL_ID, else the one "
+                         "other provider that does; exit 1 if none or ambiguous")
+    ap.add_argument("--list-models", action="store_true",
+                    help="read a providers block on stdin and print its model ids "
+                         "(comma-separated, sorted); exit 1 if none")
+    ap.add_argument("--base-url", default="",
+                    help="with --launch-provider/--list-models: only consider "
+                         "providers whose api is this endpoint; with "
+                         "--delegation-provider: the launch endpoint")
     args = ap.parse_args()
 
-    if args.launch_provider:
-        sys.stdout.write(launch_provider(args.launch_provider) + "\n")
+    if args.launch_provider or args.delegation_provider:
+        try:
+            if args.launch_provider:
+                name = launch_provider(args.launch_provider, sys.stdin.read(),
+                                       args.base_url or None)
+            else:
+                name = delegation_provider(args.delegation_provider, sys.stdin.read(),
+                                           args.base_url or None)
+        except LaunchProviderError as e:
+            print(f"[populate_models] {e}", file=sys.stderr)
+            return 1
+        sys.stdout.write(name + "\n")
+        return 0
+
+    if args.list_models:
+        try:
+            ids = list_models(sys.stdin.read(), args.base_url or None)
+        except ProviderParseError as e:
+            print(f"[populate_models] {e}", file=sys.stderr)
+            return 1
+        if not ids:
+            return 1
+        sys.stdout.write(", ".join(ids) + "\n")
         return 0
 
     if args.status_report:

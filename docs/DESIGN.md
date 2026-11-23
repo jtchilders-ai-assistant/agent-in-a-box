@@ -78,13 +78,43 @@ Consequences baked into the design:
   Hermes config with a fresh inference access token, because the token is the
   `api_key` and it rotates.
 
+### Secret hygiene
+
+The rendered `config.yaml` is the only intended durable home of an inference
+credential; the entrypoint forces it to mode 0600 on every render. In generic
+mode, `INFERENCE_TOKEN` arrives through `docker run -e`; once it is in the
+config, the entrypoint `unset`s it before launching anything. The generic-mode
+invariant is therefore: **the token is not inherited by long-lived descendants;
+it is persisted only in the mode-0600 config.** The dashboard, Caddy, the MCP
+`bash` server, and a gateway the dashboard starts never see it in their
+environment. (Short-lived setup helpers the entrypoint runs before the unset,
+such as `generic_inference.py`, do receive it.)
+
+**Known limit (`docker exec`).** Docker gives every process started with
+`docker exec` the container's configured environment (`Config.Env`, i.e. the
+`-e` values from `docker run`), not the entrypoint's. The entrypoint cannot
+change that. A gateway that `docker exec <c> hermes -z ...` auto-starts
+therefore inherits `INFERENCE_TOKEN` (seen in the v0.23.2 image smoke test).
+If that matters, use the dashboard, or blank the variable for the exec:
+`docker exec -e INFERENCE_TOKEN= <c> hermes ...`. ALCF mode is unaffected,
+because it passes no inference token through the environment.
+
 ## Startup pipeline (what the launch scripts do)
 
 `scripts/entrypoint.sh` runs on every container start and renders the live config
 before launching the dashboard. The design principle throughout is **fail-open**:
 every ALCF-service call is best-effort and falls back to a safe default rather
-than aborting the launch, and the one intentional hard stop (the context-floor
-guard) only fires on a positive, confirmed sub-floor reading.
+than aborting the launch. The intentional hard stops are configuration errors,
+not service failures: the context-floor guard only fires on a positive,
+confirmed sub-floor reading, launch/delegation-provider resolution refuses a
+model that does not map to one unambiguous generated provider, and a set but
+non-positive-integer `ALCF_MAX_TOKENS` / `ALCF_REASONING_MAX_TOKENS` is refused
+up front rather than replaced by the default cap.
+
+Diagnostic and state files for a start (`ctxlen.log`, `populate_models.log`,
+`launch_provider.log`, `generic_inference.log`, `launch_source`) live in one
+private run directory, `mktemp -d "${TMPDIR:-/tmp}/aib-run.XXXXXX"` (mode 0700,
+files 0600), never at fixed `/tmp` paths. `startup.log` names it.
 
 Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
 
@@ -96,20 +126,44 @@ Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
    Defaults to 128000 on any failure (so the floor guard fails open).
 3. **Model-list generation** (`populate_models.py`). Queries the live catalog on
    both clusters, filters to chat models with a real ≥64k window, and emits a
-   `custom_providers:` block. Each cluster is split into a baseline provider and a
-   `-reasoning` provider (see quirk #1), each carrying its own `max_tokens`.
+   keyed `providers:` block (the Hermes v0.23.2 schema). Each cluster is split
+   into a baseline provider and a `-reasoning` provider (see quirk #1), each
+   carrying its own output cap as `extra_body.max_tokens`.
    Reasoning classification uses the catalog `reasoning_parser` field plus an id
    heuristic. On any discovery failure it prints the committed static fallback
    block from the template, so the container always comes up with a usable list.
+   Two launch-model safeguards live here. First, the launch cluster
+   (`ALCF_CLUSTER`) is always generated, even if its `ALCF_ENABLE_<CLUSTER>`
+   flag is `0`; the override is logged. Second, if the launch cluster fell back
+   to its static list and that list lacks `ALCF_MODEL`, the model is added to
+   the matching plain or `-reasoning` provider, using the step-2 context window
+   (only if ≥ 64k), with a loud stderr notice. This injection is a best-effort
+   emergency fallback: the model has passed only the local context-floor check,
+   and whether it is actually served stays unverified until the catalog
+   recovers. The launch cluster's state (`live` / `fallback` /
+   `fallback-injected` / `fallback-missing`) is handed to the entrypoint through
+   a state file in the private run directory (below), for step 5; any other
+   content in it is refused with exit 78.
 4. **Context-floor guard.** Hermes hard-refuses a model whose window is below
    `MINIMUM_CONTEXT_LENGTH` (64000). If the *launch* model is sub-floor, exit 78
    with an actionable list of valid models rather than a raw Hermes stacktrace.
-5. **Launch-provider resolution.** Scan the *generated block* (single source of
-   truth) for which provider lists the launch model, and set the top-level
-   `model.provider` to that named provider (`custom:alcf-sophia[-reasoning]`).
-   This is how turn one inherits the correct per-model output cap given that
-   Hermes has no top-level per-model `max_tokens`. Falls back to the Python
-   `--launch-provider` id heuristic, then to `custom:alcf-sophia`.
+5. **Launch-provider resolution.** Parse the *generated block* (single source of
+   truth, via `populate_models.py --launch-provider --base-url`) for the one
+   provider on the launch endpoint that lists the launch model, and set the
+   top-level `model.provider` to it (`custom:alcf-sophia[-reasoning]`). This is
+   how turn one inherits the correct per-model output cap given that Hermes has
+   no per-model `max_tokens`. This is the second intentional hard stop: if no
+   provider, or more than one, lists the model, exit 78 with the valid model
+   ids. When the launch cluster is on its static fallback and the model could
+   not be added in step 3, or generation failed outright, the refusal instead
+   says "catalog unavailable; '<model>' is not in the static fallback list".
+   A distinct `ALCF_DELEGATION_MODEL` is endpoint-pinned too
+   (`--delegation-provider --base-url`): the provider on the launch endpoint
+   that lists it (exactly one there must), else the one provider elsewhere that
+   lists it. It exits 78 when unresolvable, or listed by several providers that
+   are not on the launch endpoint. (Before the
+   v0.23.2 migration this step fell back to an id heuristic and then to
+   `custom:alcf-sophia`; that silent fallback was removed.)
 6. **Splice + substitute.** The generated block replaces the sentinel-to-EOF
    region of `config.template.yaml`, then `${VAR}` placeholders are substituted.
 
@@ -128,27 +182,32 @@ clobbered), the 6h refresh loop starts, and the dashboard launches behind Caddy.
    models (`gpt-oss-*`, `gemma-4-*`, `nemotron-3-super`, `*-Thinking`) spend part
    of the `max_tokens` output budget on a hidden reasoning channel, so a small cap
    can leave them returning empty content (`finish_reason=length`). Hermes has no
-   *per-model* `max_tokens` (unlike `context_length`) — it honours a per-*provider*
-   `max_tokens`, and only when the top-level `model.max_tokens` is unset. Fix
+   *per-model* `max_tokens` (unlike `context_length`), and v0.23.2 ignores a bare
+   `max_tokens` key on a `providers:` entry ("unknown config keys ignored"). It
+   does send a provider's `extra_body` with every request to that provider's
+   models, at launch and after a `/model` switch, and the OpenAI-compatible wire
+   carries `extra_body.max_tokens` as the request's `max_tokens`. Fix
    (`populate_models.py`): split each cluster into a baseline provider
-   (`alcf-sophia`, `max_tokens` 2048) and a `-reasoning` provider
-   (`alcf-sophia-reasoning`, `max_tokens` 12288, env-overridable via
+   (`alcf-sophia`, `extra_body.max_tokens` 2048) and a `-reasoning` provider
+   (`alcf-sophia-reasoning`, `extra_body.max_tokens` 12288, env-overridable via
    `ALCF_MAX_TOKENS` / `ALCF_REASONING_MAX_TOKENS`); leave top-level
-   `model.max_tokens` unset so `/model` switches resolve the right cap per request;
-   and point the launch model's top-level `model.provider` at whichever named
-   provider matches its class so turn one gets the right cap too. Reasoning is
+   `model.max_tokens` unset so the per-provider cap is the only one in play;
+   and point the launch model's top-level `model.provider` at the provider that
+   lists it so turn one gets the right cap too. (Before v0.23.2 the cap was a
+   provider-level `max_tokens` in the legacy `custom_providers:` list.) Reasoning is
    detected from the gateway's `reasoning_parser` field, with an id heuristic for
    models served without it (e.g. gpt-oss).
 2. **The vLLM gateway rejects `name` on `role: tool` messages** with HTTP 422
    `extra_forbidden`, breaking all agentic tool use. `name` is a *valid* Chat
    Completions field that compliant providers accept, so we can't strip it
-   unconditionally. Fix: a config-gated flag added to Hermes,
-   `model.strip_tool_message_name` (default off), which drops the field for this
-   provider only. The image sets it to `true`.
-   - Patch lives on the fork branch `feat/strip-tool-message-name`
-     (`agent/transports/chat_completions.py`), with 4 unit tests; 547
-     transport/provider tests pass. Upstreamable — helps anyone pointing Hermes
-     at a strict OpenAI-compatible gateway.
+   unconditionally. **Current fix: none needed.** Upstream Hermes v0.23.2 drops
+   `name` from `role: tool` messages itself (role-qualified, in
+   `agent/transports/chat_completions.py`), so the image uses Hermes unmodified.
+   - *Historical (retired with the v0.23.2 base):* earlier images applied a local
+     patch, `patches/0001-strip-tool-message-name.patch`, from the fork branch
+     `feat/strip-tool-message-name`. It added a config-gated flag,
+     `model.strip_tool_message_name` (default off), which the image set to
+     `true`. The patch file and the flag are gone.
 
 ## Verification log (spike, 2026-07-29)
 
@@ -159,15 +218,15 @@ All proven with real execution, not description:
 - ✅ A/B curl proof of the `name`/422 blocker and the drop-`name` fix.
 - ✅ Hermes (isolated `HERMES_HOME`) plain chat → correct answer.
 - ✅ Hermes agentic tool call that previously 422'd → now returns the right
-  answer with the flag on.
+  answer with the flag on (the since-retired patch flag; see quirk #2).
 - ✅ `hermes dashboard` web chat drove `gpt-oss-120b` through autonomous terminal
   tool calls end-to-end.
 
 ## Repo layout
 
 ```
-Dockerfile                         patched-Hermes install + content, layered
-config/config.template.yaml        single ALCF inference target + both fixes
+Dockerfile                         official Hermes image (unmodified) + ALCF content, layered
+config/config.template.yaml        single ALCF inference target + static providers fallback
 config/SOUL.md                     agent identity + "what can I do" greeting (seeded to $HERMES_HOME/SOUL.md)
 scripts/entrypoint.sh              first-run alcf-tokens login, config render + dynamic model list, floor/launch-provider guards, refresh loop, launch
 scripts/populate_models.py         generates the switchable model list from the live ALCF catalog (reasoning split, 64k floor, --hot-report, --launch-provider)
@@ -191,9 +250,9 @@ The image is shared, so it must carry only generic ALCF knowledge:
 - [x] Review `Vendor_Support` project-name references in the IRI skill —
       genericized to `<your project>` / "look it up via GET /account/projects"
       (removed the specific project name + allocation node-hour figures).
-- [x] The pinned Hermes fork branch carries only the `strip_tool_message_name`
-      patch (4 unit tests); no unrelated personal patches. Pin a dedicated clean
-      tag if the branch later accumulates other commits.
+- [x] No Hermes fork or local patch: the image pins the official
+      `nousresearch/hermes-agent` release tag. (Historical: the retired
+      `strip_tool_message_name` fork patch carried no unrelated personal changes.)
 
 ## Open items
 
@@ -203,12 +262,12 @@ remaining items are genuinely optional follow-ups:
 
 1. Serve the Hermes CLI/TUI in addition to the dashboard (currently
    dashboard-only; the CLI still works if you `docker exec` in).
-2. Upstream the `strip_tool_message_name` fix to NousResearch as a PR. The fork
-   branch `feat/strip-tool-message-name` is pushed; once merged, the
-   `patches/0001-*.patch` layer becomes a no-op and can be deleted.
 
 ### Resolved (kept for history)
 
+- ✅ Tool-message `name` fix: upstream Hermes v0.23.2 strips `name` from tool
+  messages, so the local `strip_tool_message_name` patch layer was retired and
+  deleted with the move to that base.
 - ✅ One combined consent validated against inference, IRI, and Globus Compute.
 - ✅ Default model decided: `google/gemma-4-31B-it` — a non-reasoning model kept
   consistently *hot* on Sophia, so it avoids both the cold-start HTTP 503 and
