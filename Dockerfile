@@ -4,27 +4,28 @@
 # (nousresearch/hermes-agent) rather than reinventing its build. That image
 # already handles the fixed SQLite build, s6-overlay supervision, editable
 # install, config/skills seeding (docker/stage2-hook.sh), the /opt/data volume,
-# and the web dashboard. We add exactly three things:
+# and the web dashboard. On top of a loopback HTTP proxy (layer 0) we add
+# exactly two things:
 #
-#   1. A one-file patch enabling model.strip_tool_message_name (required because
-#      the ALCF vLLM gateway rejects `name` on role:tool messages -> HTTP 422).
-#      Upstreamable; once merged this layer becomes a no-op and can be deleted.
-#   2. ALCF Globus auth helpers (inference + IRI) + their Python deps.
-#   3. ALCF content baked as image defaults: skills, curated MEMORY.md, a docs
+#   1. ALCF Globus auth helpers (inference + IRI) + their Python deps.
+#   2. ALCF content baked as image defaults: skills, curated MEMORY.md, a docs
 #      snapshot, the config template, and our entrypoint that does first-run
 #      Globus auth, renders the config with a fresh token, and launches the
 #      dashboard.
 #
-# Pin the base by an explicit version tag for reproducibility (not :latest,
-# which drifts and could break the strip_tool_message_name patch apply or move
-# the venv/plugin paths the entrypoint relies on). Bump deliberately after
-# re-verifying the patch applies + tool calls still work. v2026.7.30 is the
-# release the full feature set was verified against.
-ARG HERMES_BASE=nousresearch/hermes-agent:v2026.7.30
+# The Hermes install itself is used unmodified: upstream Hermes strips `name`
+# from role:tool messages (which the ALCF vLLM gateway rejects with HTTP 422),
+# so no local source patch is needed.
+#
+# Pin the base by an explicit release tag for reproducibility (not :latest,
+# which drifts and could move the venv/plugin paths or config schema the
+# entrypoint relies on). Bump deliberately after re-verifying tool calls and the
+# generated provider config still work.
+ARG HERMES_BASE=nousresearch/hermes-agent:v0.23.2
 FROM ${HERMES_BASE}
 
 # The base image sets USER/ENV/ENTRYPOINT for the stock Hermes runtime. We need
-# root to patch the (root-owned, read-only) install tree and drop in content.
+# root to install deps into its venv and drop in content.
 USER root
 
 # ---------------------------------------------------------------------------
@@ -36,28 +37,7 @@ COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
 COPY config/Caddyfile /opt/alcf/Caddyfile
 
 # ---------------------------------------------------------------------------
-# 1. Apply the strip_tool_message_name patch to the installed Hermes source.
-#    git is present in the base image; `patch` is not. Applied against
-#    /opt/hermes which is a git-tracked install tree.
-#
-#    Idempotent + upstream-safe: if the base image already carries the flag
-#    (i.e. the fix was merged upstream and we bumped HERMES_BASE), we SKIP the
-#    patch instead of failing the build on an already-applied hunk. Once the
-#    flag is guaranteed upstream, this whole layer can be deleted.
-# ---------------------------------------------------------------------------
-COPY patches/0001-strip-tool-message-name.patch /tmp/alcf/0001.patch
-RUN cd /opt/hermes \
-    && if grep -q strip_tool_message_name agent/transports/chat_completions.py; then \
-         echo "ALCF patch skipped: strip_tool_message_name already present (upstream?)"; \
-       else \
-         git apply --unsafe-paths --directory=/opt/hermes /tmp/alcf/0001.patch \
-         && grep -q strip_tool_message_name agent/transports/chat_completions.py \
-         && echo "ALCF patch applied: strip_tool_message_name present"; \
-       fi \
-    && rm -rf /tmp/alcf
-
-# ---------------------------------------------------------------------------
-# 2. Official alcf-tokens package + Globus Compute SDK. The base image's venv
+# 1. Official alcf-tokens package + Globus Compute SDK. The base image's venv
 #    is uv-managed (no pip binary), so install with `uv pip`. alcf-tokens
 #    provides the `alcf-tokens` CLI (login / get-token) and the
 #    `alcf_tokens.auth` Python API (get_access_token / get_service_authorizer)
@@ -69,7 +49,7 @@ RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache \
     alcf-tokens==0.3.0 globus-compute-sdk requests
 
 # ---------------------------------------------------------------------------
-# 3. ALCF content (changes most often -> last for cache friendliness).
+# 2. ALCF content (changes most often -> last for cache friendliness).
 #    /opt/alcf is the staging area; the entrypoint copies skills + MEMORY.md
 #    into $HERMES_HOME (/opt/data) on first run so they land on the durable
 #    volume without clobbering user edits.

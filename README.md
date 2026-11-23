@@ -249,7 +249,7 @@ like a real login shell. Recommended container environment overrides:
 
 | Piece | Source | Purpose |
 |---|---|---|
-| Hermes Agent (official image) | `nousresearch/hermes-agent:v2026.7.30` | Agent core + web dashboard (pinned base image) |
+| Hermes Agent (official image) | `nousresearch/hermes-agent:v0.23.2` | Agent core + web dashboard (pinned base image) |
 | Tool-message patch | `patches/0001-strip-tool-message-name.patch` | Enables agentic tool use on the ALCF gateway |
 | ALCF skills | `skills/` | How to call ALCF inference / IRI / PBS |
 | Knowledge seed | `memory/MEMORY.md` | Curated, **sanitized** ALCF facts (always injected) |
@@ -260,7 +260,7 @@ like a real login shell. Recommended container environment overrides:
 
 ### Architecture: built on the official Hermes image
 
-This image is `FROM nousresearch/hermes-agent:v2026.7.30` plus three thin layers
+This image is `FROM nousresearch/hermes-agent:v0.23.2` plus three thin layers
 (patch, Globus auth helpers, ALCF content). We deliberately do **not** rebuild
 Hermes — the official image already handles the fixed SQLite build, s6-overlay
 supervision, the editable install, and the dashboard. See
