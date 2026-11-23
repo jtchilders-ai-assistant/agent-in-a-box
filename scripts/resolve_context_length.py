@@ -31,11 +31,21 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 from alcf_tokens.auth import get_access_token
 
 DEFAULT_CONTEXT = 128000
+
+
+def _exc_summary(e: BaseException) -> str:
+    """The exception class and HTTP status (when there is one) for a log line.
+    Never str(e): that may echo a URL, a response body or a credential."""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status is None and isinstance(e, urllib.error.HTTPError):
+        status = e.code
+    return type(e).__name__ + (f", HTTP {status}" if status is not None else "")
 
 
 def _fallback() -> int:
@@ -96,7 +106,7 @@ def _mode_value(vllm_base_url: str, model_id: str) -> None:
         print(val)
     except Exception as e:  # noqa: BLE001
         fb = _fallback()
-        print(f"context-length lookup failed ({e}); using fallback {fb}",
+        print(f"context-length lookup failed ({_exc_summary(e)}); using fallback {fb}",
               file=sys.stderr)
         print(fb)
 
@@ -111,7 +121,7 @@ def _mode_mapping(vllm_base_url: str, models: list) -> None:
         lens = _fetch_max_lens(vllm_base_url)
     except Exception as e:  # noqa: BLE001
         lens = {}
-        print(f"models listing failed ({e}); using fallback for all",
+        print(f"models listing failed ({_exc_summary(e)}); using fallback for all",
               file=sys.stderr)
     fb = _fallback()
     lines = ["models:"]

@@ -282,6 +282,8 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         self.venv_bin = self.runtime / "venv" / "bin"
         self.hermes_agent = self.runtime / "hermes-agent"
         self.home = self.runtime / "home"
+        self.tmpdir = self.runtime / "tmp"  # the entrypoint's private run dir lands here
+        self.tmpdir.mkdir(parents=True)
         self.alcf_dir.mkdir(parents=True)
         self.venv_bin.mkdir(parents=True)
         self.hermes_agent.mkdir(parents=True)
@@ -348,6 +350,7 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         env.update(
             {
                 "HERMES_HOME": str(self.home),
+                "TMPDIR": str(self.tmpdir),
                 "ALCF_CLUSTER": "sophia",
                 "ALCF_DASHBOARD_PASSWORD": "test-dashboard-password",
                 "ALCF_ENABLE_GLOBUS_COMPUTE": "0",

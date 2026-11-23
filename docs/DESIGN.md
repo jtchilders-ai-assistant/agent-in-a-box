@@ -83,9 +83,12 @@ Consequences baked into the design:
 The rendered `config.yaml` is the only intended durable home of an inference
 credential; the entrypoint forces it to mode 0600 on every render. In generic
 mode, `INFERENCE_TOKEN` arrives through `docker run -e`; once it is in the
-config, the entrypoint `unset`s it before launching anything. So the
-entrypoint's descendants — the dashboard, Caddy, the MCP `bash` server, and a
-gateway the dashboard starts — never see it in their environment.
+config, the entrypoint `unset`s it before launching anything. The generic-mode
+invariant is therefore: **the token is not inherited by long-lived descendants;
+it is persisted only in the mode-0600 config.** The dashboard, Caddy, the MCP
+`bash` server, and a gateway the dashboard starts never see it in their
+environment. (Short-lived setup helpers the entrypoint runs before the unset,
+such as `generic_inference.py`, do receive it.)
 
 **Known limit (`docker exec`).** Docker gives every process started with
 `docker exec` the container's configured environment (`Config.Env`, i.e. the
@@ -103,8 +106,15 @@ before launching the dashboard. The design principle throughout is **fail-open**
 every ALCF-service call is best-effort and falls back to a safe default rather
 than aborting the launch. The intentional hard stops are configuration errors,
 not service failures: the context-floor guard only fires on a positive,
-confirmed sub-floor reading, and launch/delegation-provider resolution refuses a
-model that does not map to exactly one generated provider.
+confirmed sub-floor reading, launch/delegation-provider resolution refuses a
+model that does not map to one unambiguous generated provider, and a set but
+non-positive-integer `ALCF_MAX_TOKENS` / `ALCF_REASONING_MAX_TOKENS` is refused
+up front rather than replaced by the default cap.
+
+Diagnostic and state files for a start (`ctxlen.log`, `populate_models.log`,
+`launch_provider.log`, `generic_inference.log`, `launch_source`) live in one
+private run directory, `mktemp -d "${TMPDIR:-/tmp}/aib-run.XXXXXX"` (mode 0700,
+files 0600), never at fixed `/tmp` paths. `startup.log` names it.
 
 Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
 
@@ -127,9 +137,13 @@ Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
    flag is `0`; the override is logged. Second, if the launch cluster fell back
    to its static list and that list lacks `ALCF_MODEL`, the model is added to
    the matching plain or `-reasoning` provider, using the step-2 context window
-   (only if ≥ 64k), with a loud stderr notice. The launch cluster's state
-   (`live` / `fallback` / `fallback-injected` / `fallback-missing`) is handed to
-   the entrypoint through a small state file, for step 5.
+   (only if ≥ 64k), with a loud stderr notice. This injection is a best-effort
+   emergency fallback: the model has passed only the local context-floor check,
+   and whether it is actually served stays unverified until the catalog
+   recovers. The launch cluster's state (`live` / `fallback` /
+   `fallback-injected` / `fallback-missing`) is handed to the entrypoint through
+   a state file in the private run directory (below), for step 5; any other
+   content in it is refused with exit 78.
 4. **Context-floor guard.** Hermes hard-refuses a model whose window is below
    `MINIMUM_CONTEXT_LENGTH` (64000). If the *launch* model is sub-floor, exit 78
    with an actionable list of valid models rather than a raw Hermes stacktrace.
@@ -143,8 +157,11 @@ Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
    ids. When the launch cluster is on its static fallback and the model could
    not be added in step 3, or generation failed outright, the refusal instead
    says "catalog unavailable; '<model>' is not in the static fallback list".
-   A distinct `ALCF_DELEGATION_MODEL` is resolved the same way across all
-   providers and also exits 78 when unresolvable or ambiguous. (Before the
+   A distinct `ALCF_DELEGATION_MODEL` is endpoint-pinned too
+   (`--delegation-provider --base-url`): the provider on the launch endpoint
+   that lists it (exactly one there must), else the one provider elsewhere that
+   lists it. It exits 78 when unresolvable, or listed by several providers that
+   are not on the launch endpoint. (Before the
    v0.23.2 migration this step fell back to an id heuristic and then to
    `custom:alcf-sophia`; that silent fallback was removed.)
 6. **Splice + substitute.** The generated block replaces the sentinel-to-EOF

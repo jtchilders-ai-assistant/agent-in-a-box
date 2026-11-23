@@ -86,6 +86,34 @@ STARTUP_LOG="$HERMES_HOME/startup.log"
 mkdir -p "$HERMES_HOME"
 : > "$STARTUP_LOG"
 
+# Private run directory for this start's diagnostic and state files (catalog,
+# context-window and provider-resolution logs, the launch-cluster state).
+# mktemp -d creates it mode 0700 under an unpredictable name, so no other local
+# user can read, pre-create or symlink-swap these files the way fixed /tmp
+# names allowed. The files are pre-created under umask 077 (mode 0600); later
+# writes truncate or append in place, which keeps that mode.
+RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/aib-run.XXXXXX")" \
+  || { err "Cannot create a private run directory under ${TMPDIR:-/tmp}; refusing to start."; exit 1; }
+CTXLEN_LOG="$RUNDIR/ctxlen.log"
+POPULATE_LOG="$RUNDIR/populate_models.log"
+LAUNCH_SOURCE_FILE="$RUNDIR/launch_source"
+LAUNCH_PROVIDER_LOG="$RUNDIR/launch_provider.log"
+GENERIC_INFERENCE_LOG="$RUNDIR/generic_inference.log"
+(umask 077 && : > "$CTXLEN_LOG" && : > "$POPULATE_LOG" && : > "$LAUNCH_SOURCE_FILE" \
+   && : > "$LAUNCH_PROVIDER_LOG" && : > "$GENERIC_INFERENCE_LOG")
+diag "Run diagnostics directory: $RUNDIR"
+
+# Output caps. When set (non-empty), each must be a positive integer: a bad
+# value is refused here rather than silently replaced by the template default.
+for _cap_var in ALCF_MAX_TOKENS ALCF_REASONING_MAX_TOKENS; do
+  _cap_val="${!_cap_var:-}"
+  if [[ -n "$_cap_val" && ! "$_cap_val" =~ ^[1-9][0-9]*$ ]]; then
+    err "$_cap_var must be a positive integer when set; refusing to start."
+    exit 78   # EX_CONFIG: output cap is invalid
+  fi
+done
+unset _cap_var _cap_val
+
 # --- 1b. Generic inference mode (opt-in via INFERENCE_URL) --------------------
 # Setting INFERENCE_URL points the agent's LLM brain at ANY OpenAI-compatible
 # endpoint instead of the ALCF Inference Service. This changes ONLY the model
@@ -181,13 +209,13 @@ render_config() {
     if ! INFERENCE_TOKEN="$token" "$PY" "$ALCF_DIR/generic_inference.py" \
            --base-url "$INFERENCE_URL" --model "$INFERENCE_MODEL" \
            --max-tokens "${INFERENCE_MAX_TOKENS:-4096}" \
-           --output "$gmanifest" >/tmp/generic_inference.log 2>&1; then
+           --output "$gmanifest" >"$GENERIC_INFERENCE_LOG" 2>&1; then
       err "Generic inference setup failed — refusing to start. Details (token-free):"
-      sed 's/^/  /' /tmp/generic_inference.log >&2 || true
+      sed 's/^/  /' "$GENERIC_INFERENCE_LOG" >&2 || true
       exit 78   # EX_CONFIG: endpoint/token/model/catalog is unusable
     fi
     # Surface the per-model ENABLED/DISABLED report in the startup log.
-    while IFS= read -r _gline; do diag "$_gline"; done </tmp/generic_inference.log
+    while IFS= read -r _gline; do diag "$_gline"; done <"$GENERIC_INFERENCE_LOG"
     ctxlen="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_context_length"])' "$gmanifest")"
     render_base_url="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_url"])' "$gmanifest")"
     # One named provider carrying EVERY catalog-enabled model with its real
@@ -228,10 +256,10 @@ GPYEOF
   # $ALCF_CONTEXT_LENGTH / 128000 if the lookup fails. Never fatal.
   ctxlen="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
             "$PY" "$ALCF_DIR/resolve_context_length.py" \
-            "$ALCF_BASE_URL" "${ALCF_MODEL:-google/gemma-4-31B-it}" 2>>/tmp/ctxlen.log)"
+            "$ALCF_BASE_URL" "${ALCF_MODEL:-google/gemma-4-31B-it}" 2>>"$CTXLEN_LOG")"
   # Guard: if the resolver printed nothing usable, hard-default here too.
   case "$ctxlen" in ''|*[!0-9]*) ctxlen=128000 ;; esac
-  diag "Model context window: $ctxlen tokens (from max_model_len; see /tmp/ctxlen.log)"
+  diag "Model context window: $ctxlen tokens (from max_model_len; see $CTXLEN_LOG)"
 
   # Generate the switchable-model `providers:` block from the LIVE ALCF
   # catalog on every serving cluster (sophia + metis + minerva). populate_models.py
@@ -245,9 +273,10 @@ GPYEOF
   # list lacks the launch model, populate_models.py adds the model (with the
   # $ctxlen resolved above, only if >= the 64k floor) so a model ALCF really
   # serves still starts. It reports the launch cluster's state (live | fallback
-  # | fallback-injected | fallback-missing) in $launch_source_file.
-  local launch_source_file=/tmp/alcf_launch_source launch_source
-  rm -f "$launch_source_file"
+  # | fallback-injected | fallback-missing) in $LAUNCH_SOURCE_FILE (empty when
+  # the launch cluster is not in the block); any other content refuses below.
+  local launch_source
+  (umask 077 && : > "$LAUNCH_SOURCE_FILE")
   case "${ALCF_CLUSTER:-sophia}" in
     metis)
       if [ "${ALCF_ENABLE_METIS:-1}" = "0" ]; then
@@ -260,17 +289,25 @@ GPYEOF
             ALCF_LAUNCH_CLUSTER="${ALCF_CLUSTER:-sophia}" \
             ALCF_LAUNCH_MODEL="${ALCF_MODEL:-google/gemma-4-31B-it}" \
             ALCF_LAUNCH_CONTEXT="$ctxlen" \
-            ALCF_LAUNCH_SOURCE_FILE="$launch_source_file" \
+            ALCF_LAUNCH_SOURCE_FILE="$LAUNCH_SOURCE_FILE" \
             ALCF_MAX_TOKENS="${ALCF_MAX_TOKENS:-2048}" \
             ALCF_REASONING_MAX_TOKENS="${ALCF_REASONING_MAX_TOKENS:-12288}" \
-            "$PY" "$ALCF_DIR/populate_models.py" 2>>/tmp/populate_models.log)" \
+            "$PY" "$ALCF_DIR/populate_models.py" 2>>"$POPULATE_LOG")" \
     || providers_block=""   # a crash must reach the guard below, not abort under set -e
-  launch_source="$(cat "$launch_source_file" 2>/dev/null || true)"
+  launch_source="$(cat "$LAUNCH_SOURCE_FILE" 2>/dev/null || true)"
+  # The state steers the outage handling below, so only the values
+  # populate_models.py writes are accepted; anything else refuses (the content
+  # is not echoed).
+  case "$launch_source" in
+    ""|live|fallback|fallback-injected|fallback-missing) : ;;
+    *) err "REFUSING TO START: populate_models reported an unrecognised launch-cluster state (see $LAUNCH_SOURCE_FILE)."
+       exit 78 ;;   # EX_CONFIG: launch-cluster state is untrustworthy
+  esac
   # Guard: a generated block MUST start with 'providers:'. If somehow it didn't
   # (script crashed hard), leave $providers_block empty so the splice step keeps
   # the template's committed static fallback instead.
   case "$providers_block" in
-    providers:*) diag "Model list generated from live catalog (see /tmp/populate_models.log)" ;;
+    providers:*) diag "Model list generated from live catalog (see $POPULATE_LOG)" ;;
     *) providers_block=""; launch_source="generation-failed"
        err "populate_models produced no block; keeping static fallback list" ;;
   esac
@@ -311,7 +348,7 @@ GPYEOF
   # `|| true` so a parse failure can't abort under `set -e`.
   valid_list="$(printf '%s\n' "$block_for_scan" \
     | "$PY" "$ALCF_DIR/populate_models.py" --list-models --base-url "$ALCF_BASE_URL" \
-      2>>/tmp/populate_models.log || true)"
+      2>>"$POPULATE_LOG" || true)"
   if [ -z "$valid_list" ]; then
     valid_list="openai/gpt-oss-120b, openai/gpt-oss-20b, google/gemma-4-31B-it, google/gemma-4-26B-A4B-it, nvidia/nemotron-3-super-120b, argonne/AuroraGPT-IT-v4-0125"
   fi
@@ -351,7 +388,7 @@ GPYEOF
   # says so, since the model may well be served once the catalog is back.
   if ! launch_provider="$(printf '%s\n' "$block_for_scan" \
         | "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$launch_model" \
-          --base-url "$ALCF_BASE_URL" 2>/tmp/launch_provider.log)"; then
+          --base-url "$ALCF_BASE_URL" 2>"$LAUNCH_PROVIDER_LOG")"; then
     if [ "$launch_source" = "fallback-missing" ] || [ "$launch_source" = "generation-failed" ]; then
       err "======================================================================"
       err "REFUSING TO START: ALCF model catalog unavailable; '$launch_model' is not in the static fallback list"
@@ -366,7 +403,7 @@ GPYEOF
     err "======================================================================"
     err "REFUSING TO START: launch model '$launch_model' does not map to exactly"
     err "one model provider on $ALCF_BASE_URL:"
-    while IFS= read -r _lline; do err "  $_lline"; done </tmp/launch_provider.log
+    while IFS= read -r _lline; do err "  $_lline"; done <"$LAUNCH_PROVIDER_LOG"
     err ""
     err "Set ALCF_MODEL to one of these models served on this endpoint and restart the container:"
     err "  $valid_list"
@@ -426,20 +463,23 @@ GPYEOF
       fi
       delegation_provider="custom:generic-inference"
     else
-      # Same exactly-one-provider rule as the launch model, but across EVERY
-      # cluster (subagents may run on any endpoint): a model listed by no
-      # provider, or by several (e.g. gpt-oss-120b on metis AND minerva), has
-      # no unambiguous route, so refuse rather than guess.
+      # Endpoint-pinned, like the launch model: if a provider on the LAUNCH
+      # endpoint lists the model (exactly one must), delegate there -- so a
+      # model served on several clusters (gpt-oss-120b) stays on the cluster
+      # the user launched on. Otherwise exactly one provider on another
+      # cluster must list it (subagents may run on any endpoint). None, or
+      # several elsewhere (e.g. gpt-oss-120b on metis AND minerva when
+      # launching on sophia), has no unambiguous route: refuse, never guess.
       if ! delegation_provider="$(printf '%s\n' "$block_for_scan" \
-            | "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$delegation_model" \
-              2>/tmp/launch_provider.log)"; then
+            | "$PY" "$ALCF_DIR/populate_models.py" --delegation-provider "$delegation_model" \
+              --base-url "$ALCF_BASE_URL" 2>"$LAUNCH_PROVIDER_LOG")"; then
         err "======================================================================"
         err "REFUSING TO START: delegation model '$delegation_model'"
         err "(ALCF_DELEGATION_MODEL) does not map to exactly one model provider:"
-        while IFS= read -r _lline; do err "  $_lline"; done </tmp/launch_provider.log
+        while IFS= read -r _lline; do err "  $_lline"; done <"$LAUNCH_PROVIDER_LOG"
         err ""
-        err "Set ALCF_DELEGATION_MODEL to a model listed by exactly one provider,"
-        err "or unset it to delegate on the launch model '$launch_model'."
+        err "Set ALCF_DELEGATION_MODEL to a model served on $ALCF_BASE_URL or by"
+        err "exactly one other provider, or unset it to delegate on the launch model '$launch_model'."
         err "======================================================================"
         exit 78   # EX_CONFIG: delegation model is unresolvable
       fi
@@ -595,7 +635,7 @@ if [ "$GENERIC_MODE" == "0" ] && [ "${ALCF_SHOW_MODEL_STATUS:-1}" != "0" ]; then
   ALCF_INFER_TOKEN="$("$ALCF_TOKENS" get-token inference 2>/dev/null || true)" ALCF_PY="$PY" \
     ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
     ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
-    "$PY" "$ALCF_DIR/populate_models.py" --status-report 2>>/tmp/populate_models.log \
+    "$PY" "$ALCF_DIR/populate_models.py" --status-report 2>>"$POPULATE_LOG" \
   | while IFS= read -r line; do diag "$line"; done || true
 fi
 

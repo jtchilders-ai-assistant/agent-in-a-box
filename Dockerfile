@@ -4,14 +4,23 @@
 # (nousresearch/hermes-agent) rather than reinventing its build. That image
 # already handles the fixed SQLite build, s6-overlay supervision, editable
 # install, config/skills seeding (docker/stage2-hook.sh), the /opt/data volume,
-# and the web dashboard. On top of a loopback HTTP proxy (layer 0) we add
-# exactly two things:
+# and the web dashboard. On top of it we add, in order:
 #
-#   1. ALCF Globus auth helpers (inference + IRI) + their Python deps.
-#   2. ALCF content baked as image defaults: skills, curated MEMORY.md, a docs
-#      snapshot, the config template, and our entrypoint that does first-run
-#      Globus auth, renders the config with a fresh token, and launches the
-#      dashboard.
+#   0. Caddy, a loopback HTTP proxy in front of the dashboard, + its Caddyfile.
+#   1. The ALCF Python deps (alcf-tokens, globus-compute-sdk, requests),
+#      installed into the sealed base venv with the base's own pinned uv, behind
+#      a version-drift guard and a smoke import.
+#   2. A record of the base's Hermes version (/opt/alcf/.hermes_version) for
+#      the startup banner.
+#   3. ALCF content baked as image defaults: skills, curated MEMORY.md, a docs
+#      snapshot, the config template, SOUL.md, the runtime helper scripts
+#      (Globus/IRI facility helpers, remote bash + its MCP server, context-window
+#      and model-catalog resolvers, generic-inference validator) and our
+#      entrypoint, which does first-run Globus auth, renders the config with a
+#      fresh token, and launches the dashboard.
+#   4. The ALCF-agent-box git revision + build date (/opt/alcf/.alcf_version).
+#   5. ALCF_* ENV defaults, a healthcheck through Caddy, and the entrypoint,
+#      run as the non-root hermes user.
 #
 # The Hermes install itself is used unmodified: upstream Hermes strips `name`
 # from role:tool messages (which the ALCF vLLM gateway rejects with HTTP 422),

@@ -27,6 +27,7 @@ import tempfile
 import textwrap
 import unittest
 from unittest import mock
+import urllib.error
 
 import yaml
 
@@ -880,6 +881,22 @@ class ProviderParsingContract(UpstreamHarnessMixin, unittest.TestCase):
                 with self.assertRaises(pm.ProviderParseError):
                     pm.parse_providers(bad)
 
+    def test_context_length_must_be_a_positive_integer(self):
+        """B7c-R4: 0, negative, bool, float, string and null are all rejected;
+        so is the same block once it stops being valid YAML."""
+        head = "providers:\n  alcf-x:\n    api: https://h/v1\n    models:\n      m:\n"
+        self.assertEqual(pm.parse_providers(head + "        context_length: 1\n"),
+                         {"alcf-x": {"api": "https://h/v1", "models": {"m": 1}}})
+        for value in ("0", "-1", "-131072", "true", "false", "131072.0", '"131072"', "null"):
+            with self.subTest(context_length=value):
+                bad = head + f"        context_length: {value}\n"
+                with self.assertRaises(pm.ProviderParseError):
+                    pm.parse_providers(bad)
+                with self.assertRaises(pm.LaunchProviderError):
+                    pm.launch_provider("m", bad, "https://h/v1")
+        with self.assertRaises(pm.ProviderParseError):
+            pm.parse_providers(head + "        context_length: [131072\n")
+
     def test_no_yaml_parser_fails_closed(self):
         block = build_test_block()
         with mock.patch.dict(sys.modules, {"ruamel": None, "ruamel.yaml": None, "yaml": None}):
@@ -916,6 +933,14 @@ class ProviderParsingContract(UpstreamHarnessMixin, unittest.TestCase):
                 import populate_models as pm
                 block = sys.stdin.read()
                 print(json.dumps(pm.parse_providers(block), sort_keys=True))
+                rejected = 0
+                for v in ("0", "-1", "true", "131072.0"):
+                    try:
+                        pm.parse_providers("providers:\\n  x:\\n    api: u\\n    models:\\n"
+                                           "      m:\\n        context_length: " + v + "\\n")
+                    except pm.ProviderParseError:
+                        rejected += 1
+                print(rejected)
                 sys.stdin = io.StringIO(block)
                 sys.argv = ["populate_models.py", "--launch-provider", "shared-model",
                             "--base-url", "https://h/b/v1"]
@@ -927,8 +952,9 @@ class ProviderParsingContract(UpstreamHarnessMixin, unittest.TestCase):
                                  input=CROSS_CLUSTER_BLOCK, text=True, capture_output=True,
                                  env=env, timeout=60)
         self.assertEqual(res.returncode, 0, res.stderr)
-        parsed, provider = res.stdout.strip().splitlines()
+        parsed, rejected, provider = res.stdout.strip().splitlines()
         self.assertEqual(json.loads(parsed), self.via_yaml(CROSS_CLUSTER_BLOCK))
+        self.assertEqual(rejected, "4", "ruamel path must reject non-positive/bool/float context")
         self.assertEqual(provider, "custom:alcf-b-reasoning")
 
 
@@ -986,8 +1012,8 @@ class LaunchProviderContract(unittest.TestCase):
 
     The launch model maps to EXACTLY ONE named provider that lists it, among
     the providers whose `api` is the launch endpoint (base_url; trailing slash
-    ignored) -- or among all providers when base_url is None (delegation, which
-    may target any cluster). Zero or several matches raise LaunchProviderError
+    ignored) -- or among all providers when base_url is None (delegation uses
+    delegation_provider instead). Zero or several matches raise LaunchProviderError
     with a non-secret message; there is no heuristic or default fallback. It
     never touches the network (catalog fetchers are patched to explode).
     """
@@ -1058,6 +1084,108 @@ class LaunchProviderContract(unittest.TestCase):
         self.assertEqual(res.stdout.strip(), "")
 
 
+class DelegationProviderContract(unittest.TestCase):
+    """delegation_provider(model, providers_text, launch_base_url) CONTRACT (B7c-R1).
+
+    Endpoint-pinned like the launch model: if any provider on the LAUNCH
+    endpoint lists the model, the launch_provider rule applies there (exactly
+    one, else raise). Otherwise exactly one provider on another endpoint must
+    list it. Zero, or several non-launch providers, raise LaunchProviderError
+    naming the candidates. Never touches the network.
+    """
+
+    def setUp(self):
+        for name in ("_get_token", "_fetch_models"):
+            p = mock.patch.object(pm, name, side_effect=AssertionError(f"{name}: network used"))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_model_on_several_clusters_prefers_the_launch_endpoint(self):
+        self.assertEqual(pm.delegation_provider("shared-model", CROSS_CLUSTER_BLOCK, "https://h/a/v1"),
+                         "custom:alcf-a-reasoning")
+        self.assertEqual(pm.delegation_provider("shared-model", CROSS_CLUSTER_BLOCK, "https://h/b/v1/"),
+                         "custom:alcf-b-reasoning")
+
+    def test_model_unique_elsewhere_selects_that_provider(self):
+        self.assertEqual(pm.delegation_provider("only-a", CROSS_CLUSTER_BLOCK, "https://h/b/v1"),
+                         "custom:alcf-a-reasoning")
+        self.assertEqual(pm.delegation_provider("plain-b", CROSS_CLUSTER_BLOCK, "https://h/a/v1"),
+                         "custom:alcf-b")
+
+    def test_model_on_several_non_launch_providers_fails_closed(self):
+        for model, launch, names in (("shared-model", "https://h/c/v1",
+                                      ("alcf-a-reasoning", "alcf-b-reasoning")),
+                                     ("dup-on-b", "https://h/a/v1",
+                                      ("alcf-b-extra", "alcf-b-reasoning"))):
+            with self.subTest(model=model, launch=launch):
+                with self.assertRaises(pm.LaunchProviderError) as cm:
+                    pm.delegation_provider(model, CROSS_CLUSTER_BLOCK, launch)
+                for name in (model, *names):
+                    self.assertIn(name, str(cm.exception))
+
+    def test_duplicate_on_the_launch_endpoint_fails_closed(self):
+        # Pinned to the launch endpoint, where two providers list it: no guess,
+        # and no escape to another endpoint either.
+        with self.assertRaises(pm.LaunchProviderError) as cm:
+            pm.delegation_provider("dup-on-b", CROSS_CLUSTER_BLOCK, "https://h/b/v1")
+        self.assertIn("alcf-b-extra", str(cm.exception))
+
+    def test_unlisted_model_fails_closed(self):
+        with self.assertRaises(pm.LaunchProviderError) as cm:
+            pm.delegation_provider("unknown/model", CROSS_CLUSTER_BLOCK, "https://h/a/v1")
+        self.assertIn("unknown/model", str(cm.exception))
+
+    def test_cli(self):
+        res = run_populate_cli("--delegation-provider", "shared-model", "--base-url", "https://h/a/v1",
+                               stdin=CROSS_CLUSTER_BLOCK)
+        self.assertEqual((res.returncode, res.stdout.strip()), (0, "custom:alcf-a-reasoning"),
+                         res.stderr)
+        res = run_populate_cli("--delegation-provider", "shared-model", "--base-url", "https://h/c/v1",
+                               stdin=CROSS_CLUSTER_BLOCK)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual(res.stdout.strip(), "")
+        self.assertIn("alcf-a-reasoning", res.stderr)
+        self.assertIn("alcf-b-reasoning", res.stderr)
+
+
+class ExceptionLogHygieneContract(unittest.TestCase):
+    """B7c-R6: catalog/context failures log the exception class and HTTP status,
+    never str(e) (which can carry a URL, response body or credential)."""
+
+    LEAKY = f"https://h/v1?token={FAKE_TOKEN}"
+
+    def errors(self):
+        import resolve_context_length as rcl
+        http = urllib.error.HTTPError(self.LEAKY, 401, self.LEAKY, None, None)
+        self.addCleanup(http.close)
+        with_response = RuntimeError(self.LEAKY)
+        with_response.response = mock.Mock(status_code=503)
+        return rcl, ((http, "HTTPError, HTTP 401"), (with_response, "RuntimeError, HTTP 503"),
+                     (ValueError(self.LEAKY), "ValueError"))
+
+    def test_summary_is_class_and_status_only(self):
+        rcl, cases = self.errors()
+        for summary in (pm._exc_summary, rcl._exc_summary):
+            for exc, want in cases:
+                with self.subTest(fn=summary.__module__, exc=type(exc).__name__):
+                    self.assertEqual(summary(exc), want)
+
+    def test_failure_lines_do_not_echo_the_exception_text(self):
+        rcl, cases = self.errors()
+        exc = cases[0][0]
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(pm, "_fetch_models", side_effect=exc):
+                pm._resolve_cluster("x", "tok", lambda m: m, {"m": (131072, False)})
+            with mock.patch.object(pm, "_get_token", side_effect=exc), \
+                    mock.patch.object(pm, "_clusters", return_value=[]):
+                pm.build_block()
+            with mock.patch.object(rcl, "_fetch_max_lens", side_effect=exc), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rcl._mode_mapping("https://h/resource_server/x/vllm/v1", ["m"])
+        self.assertNotIn(FAKE_TOKEN, err.getvalue())
+        self.assertEqual(err.getvalue().count("HTTPError, HTTP 401"), 3, err.getvalue())
+
+
 # Offline stand-in for /opt/alcf/populate_models.py inside the bounded
 # entrypoint: runs the REAL module with every catalog/token fetcher disabled (so
 # it emits its committed static fallback), optionally over a test cluster list.
@@ -1092,7 +1220,12 @@ OFFLINE_POPULATE = textwrap.dedent('''\
     pm._clusters = _clusters
     if os.environ.get("ALCF_TEST_FORCE_LAUNCH_CONTEXT"):
         os.environ["ALCF_LAUNCH_CONTEXT"] = os.environ["ALCF_TEST_FORCE_LAUNCH_CONTEXT"]
-    sys.exit(pm.main())
+    rc = pm.main()
+    state_file = os.environ.get("ALCF_LAUNCH_SOURCE_FILE")
+    if state_file and "ALCF_TEST_FORCE_STATE" in os.environ:
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.write(os.environ["ALCF_TEST_FORCE_STATE"])
+    sys.exit(rc)
     ''')
 CRASHING_POPULATE = "import sys\nsys.exit(1)\n"
 ALL_LIVE = "sophia,metis,minerva"
@@ -1211,10 +1344,68 @@ class EntrypointLaunchProviderContract(AlcfEntrypointMixin, unittest.TestCase):
                          {"provider": "custom:alcf-minerva-reasoning", "model": "inkling-bf16"})
 
     def test_ambiguous_delegation_model_fails_closed(self):
-        # gpt-oss-120b is listed by alcf-metis-reasoning AND alcf-minerva-reasoning.
+        # gpt-oss-120b is listed by alcf-metis-reasoning AND alcf-minerva-reasoning,
+        # neither of which is on the sophia launch endpoint.
         res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL="gpt-oss-120b")
         self.assert_refused(res)
         self.assertIn("gpt-oss-120b", res.stderr)
+        self.assertIn("alcf-metis-reasoning", res.stderr)
+        self.assertIn("alcf-minerva-reasoning", res.stderr)
+
+
+class EntrypointDelegationContract(AlcfEntrypointMixin, unittest.TestCase):
+    """B7c-R1: ALCF_DELEGATION_MODEL is endpoint-pinned like the launch model.
+
+    Offered on the launch endpoint -> that provider; else exactly one provider
+    elsewhere -> that one; else (none, or several elsewhere) exit 78 naming the
+    candidates.
+    """
+
+    CLUSTERS = json.dumps([
+        ["sophia", "alcf-sophia", pm.SOPHIA_BASE, {"launch/model": [131072, False],
+                                                   "dup/model": [131072, False]}],
+        ["x", "alcf-x", "https://h/x/v1", {"dup/model": [131072, True],
+                                           "elsewhere/model": [131072, False],
+                                           "unique/model": [131072, False]}],
+        ["y", "alcf-y", "https://h/y/v1", {"dup/model": [131072, False],
+                                           "elsewhere/model": [131072, True]}],
+    ])
+
+    def run_delegation(self, model, **env):
+        return self.run_alcf(ALCF_MODEL="launch/model", ALCF_DELEGATION_MODEL=model,
+                             ALCF_TEST_CLUSTERS=self.CLUSTERS, **env)
+
+    def test_model_on_several_clusters_uses_the_launch_provider(self):
+        res = self.run_delegation("dup/model")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["delegation"],
+                         {"provider": "custom:alcf-sophia", "model": "dup/model"})
+
+    def test_real_fallback_gpt_oss_on_metis_launch_uses_metis(self):
+        # gpt-oss-120b is on metis AND minerva; launching on metis pins it there.
+        res = self.run_alcf(ALCF_CLUSTER="metis", ALCF_MODEL="gemma-4-31B-it",
+                            ALCF_DELEGATION_MODEL="gpt-oss-120b")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["delegation"],
+                         {"provider": "custom:alcf-metis-reasoning", "model": "gpt-oss-120b"})
+
+    def test_model_unique_elsewhere_uses_that_provider(self):
+        res = self.run_delegation("unique/model")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["delegation"],
+                         {"provider": "custom:alcf-x", "model": "unique/model"})
+
+    def test_model_on_several_non_launch_clusters_fails_closed(self):
+        res = self.run_delegation("elsewhere/model")
+        self.assert_refused(res)
+        self.assertIn("REFUSING TO START", res.stderr)
+        for name in ("elsewhere/model", "alcf-x", "alcf-y-reasoning"):
+            self.assertIn(name, res.stderr)
+
+    def test_unlisted_model_fails_closed(self):
+        res = self.run_delegation("nowhere/model")
+        self.assert_refused(res)
+        self.assertIn("nowhere/model", res.stderr)
 
 
 class EntrypointLaunchClusterContract(AlcfEntrypointMixin, unittest.TestCase):
@@ -1313,6 +1504,106 @@ class EntrypointCatalogOutageContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assert_refused(res)
         self.assertNotIn("catalog unavailable", res.stderr)
         self.assertIn("does not map to exactly", res.stderr)
+
+
+RUN_FILES = {"ctxlen.log", "populate_models.log", "launch_source", "launch_provider.log",
+             "generic_inference.log"}
+
+
+def assert_private_run_dir(test, tmpdir: Path) -> Path:
+    """Exactly one mktemp run dir (mode 0700) whose files are all mode 0600."""
+    dirs = sorted(tmpdir.glob("aib-run.*"))
+    test.assertEqual(len(dirs), 1, dirs)
+    rundir = dirs[0]
+    test.assertEqual(rundir.stat().st_mode & 0o777, 0o700)
+    test.assertEqual({p.name for p in rundir.iterdir()}, RUN_FILES)
+    for path in rundir.iterdir():
+        test.assertEqual(path.stat().st_mode & 0o777, 0o600, path.name)
+    return rundir
+
+
+class EntrypointRunDirContract(AlcfEntrypointMixin, unittest.TestCase):
+    """B7c-R2: every entrypoint diagnostic/state file lives in one private
+    mktemp run dir under $TMPDIR, never at a fixed /tmp path."""
+
+    def test_no_fixed_tmp_paths(self):
+        body = (SCRIPTS / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertNotIn("/tmp/", body)
+        self.assertIn('RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/aib-run.XXXXXX")"', body)
+        self.assertRegex(body, r"\(umask 077 && : > \"\$CTXLEN_LOG\"")
+
+    def test_alcf_run_writes_only_into_the_private_run_dir(self):
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rundir = assert_private_run_dir(self, self.harness.tmpdir)
+        self.assertEqual((rundir / "launch_source").read_text(encoding="utf-8").strip(), "fallback")
+        self.assertIn("[populate_models]", (rundir / "populate_models.log").read_text(encoding="utf-8"))
+        self.assertIn(f"Run diagnostics directory: {rundir}", self.startup_log())
+        for path in rundir.iterdir():
+            self.assertNotIn(ALCF_TOKEN_IN_HARNESS, path.read_text(encoding="utf-8"), path.name)
+
+    def test_refusal_diagnostic_is_read_from_the_run_dir(self):
+        clusters = [["sophia", "alcf-sophia", pm.SOPHIA_BASE, {"dup/model": [131072, False]}],
+                    ["sophia", "alcf-shadow", pm.SOPHIA_BASE, {"dup/model": [131072, True]}]]
+        res = self.run_alcf(ALCF_MODEL="dup/model", ALCF_TEST_CLUSTERS=json.dumps(clusters))
+        self.assert_refused(res)
+        rundir = assert_private_run_dir(self, self.harness.tmpdir)
+        logged = (rundir / "launch_provider.log").read_text(encoding="utf-8")
+        self.assertIn("alcf-shadow-reasoning", logged)
+        self.assertIn("alcf-shadow-reasoning", res.stderr)
+
+
+class EntrypointLaunchSourceValidationContract(AlcfEntrypointMixin, unittest.TestCase):
+    """B7c-R3: the launch-cluster state file must hold one of the values
+    populate_models writes; anything else is a fixed refusal (exit 78)."""
+
+    def test_unrecognised_state_refuses_without_echoing_it(self):
+        for state in ("bogus-state-xyz", "generation-failed", "live\nfallback",
+                      "live; touch pwned", "LIVE"):
+            with self.subTest(state=state):
+                res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_TEST_FORCE_STATE=state)
+                self.assert_refused(res)
+                self.assertIn("unrecognised launch-cluster state", res.stderr)
+                self.assertNotIn("bogus-state-xyz", res.stderr)
+                self.assertNotIn("pwned", res.stderr)
+
+    def test_recognised_states_are_accepted(self):
+        for state in ("live", "fallback", "fallback\n", ""):
+            with self.subTest(state=state):
+                res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_TEST_FORCE_STATE=state)
+                self.assertEqual(res.returncode, 0, res.stderr)
+
+
+class EntrypointOutputCapValidationContract(AlcfEntrypointMixin, unittest.TestCase):
+    """B7c-R5: ALCF_MAX_TOKENS / ALCF_REASONING_MAX_TOKENS, when set, must be
+    positive integers; a bad value exits 78 instead of silently using a default."""
+
+    BAD = ("0", "-5", "abc", "12.5", "1e3", " 2048", "2048 ", "02048", "2048\nabc", "bogus-cap-xyz")
+
+    def test_bad_caps_refuse(self):
+        for var in ("ALCF_MAX_TOKENS", "ALCF_REASONING_MAX_TOKENS"):
+            for value in self.BAD:
+                with self.subTest(var=var, value=value):
+                    res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", **{var: value})
+                    self.assert_refused(res)
+                    self.assertIn(f"{var} must be a positive integer", res.stderr)
+                    self.assertNotIn("bogus-cap-xyz", res.stderr)
+
+    def test_valid_caps_reach_the_providers(self):
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_MAX_TOKENS="4096",
+                            ALCF_REASONING_MAX_TOKENS="16384")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        providers = self.config()["providers"]
+        self.assertEqual(providers["alcf-sophia"]["extra_body"]["max_tokens"], 4096)
+        self.assertEqual(providers["alcf-sophia-reasoning"]["extra_body"]["max_tokens"], 16384)
+
+    def test_empty_caps_mean_unset(self):
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_MAX_TOKENS="",
+                            ALCF_REASONING_MAX_TOKENS="")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        providers = self.config()["providers"]
+        self.assertEqual(providers["alcf-sophia"]["extra_body"]["max_tokens"], 2048)
+        self.assertEqual(providers["alcf-sophia-reasoning"]["extra_body"]["max_tokens"], 12288)
 
 
 class PopulateLaunchClusterContract(unittest.TestCase):
@@ -1431,6 +1722,27 @@ class GenericRenderMixin:
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return (self.harness.home / "config.yaml").read_text(encoding="utf-8")
+
+
+class GenericRunDirAndCapContract(GenericRenderMixin, unittest.TestCase):
+    """B7c-R2/R5 in generic mode: the generic_inference log lives in the private
+    run dir; a bad ALCF cap refuses before the endpoint is ever contacted."""
+
+    def test_generic_log_lives_in_the_private_run_dir(self):
+        self.render()
+        rundir = assert_private_run_dir(self, self.harness.tmpdir)
+        log = (rundir / "generic_inference.log").read_text(encoding="utf-8")
+        self.assertIn("selected/model", log)
+        self.assertNotIn(tgi.SECRET, log)
+
+    def test_bad_cap_refuses_before_contacting_the_endpoint(self):
+        res = self.harness.run_entrypoint(
+            INFERENCE_URL=self.harness.base_url, INFERENCE_TOKEN=tgi.SECRET,
+            INFERENCE_MODEL="selected/model", ALCF_MAX_TOKENS="0")
+        self.assertEqual(res.returncode, 78, res.stderr)
+        self.assertIn("ALCF_MAX_TOKENS must be a positive integer", res.stderr)
+        self.assertEqual(tgi._CatalogHandler.seen, [])
+        self.assertFalse((self.harness.home / "config.yaml").exists())
 
 
 class GenericInferenceRenderContract(GenericRenderMixin, unittest.TestCase):

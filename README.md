@@ -394,7 +394,10 @@ explicit override count).
 > ⚠️ **Credential persistence:** `INFERENCE_TOKEN` is rendered into
 > `$HERMES_HOME/config.yaml` (forced to mode 0600), which lives on your
 > `alcf-agent-home` volume / Apptainer state directory and persists after the
-> container exits. Anyone with access to that volume can read the token. It is
+> container exits. Anyone with access to that volume can read the token. The
+> token is not inherited by long-lived descendants (the entrypoint drops it from
+> its environment after rendering); it is persisted only in the mode-0600
+> config. (`docker exec` is a known exception; see `docs/DESIGN.md`.) It is
 > static — there is no auto-refresh in generic mode; restart the container with
 > an updated `-e INFERENCE_TOKEN=...` to rotate it. Keep publishing the
 > dashboard on `127.0.0.1` only, exactly as above.
@@ -438,9 +441,9 @@ than aborting the launch.
      `model:` block at it (`custom:alcf-sophia`, `custom:alcf-sophia-reasoning`,
      …), so the very first turn inherits the correct per-model output cap. If
      no provider (or more than one) lists it, refuse to start (exit 78) with the
-     list of valid models. The delegation model is resolved the same way across
-     all generated providers. (See **Choosing the launch and delegation models**
-     below.)
+     list of valid models. The delegation model is resolved on the launch
+     endpoint first, else on the one other provider that lists it. (See
+     **Choosing the launch and delegation models** below.)
    - **Splice + substitute** the providers block into the template and write the
      final config.
 4. **Model availability banner** (`populate_models.py --status-report`, unless
@@ -561,7 +564,7 @@ Three behaviors are worth knowing:
 ### Choosing the launch and delegation models
 
 `ALCF_MODEL` (the launch model) and `ALCF_DELEGATION_MODEL` (the `delegate_task`
-subagent model) must each map to **exactly one** generated provider:
+subagent model) must each map to **one unambiguous** generated provider:
 
 - the **launch** model must be listed by exactly one provider on the launch
   endpoint (the `ALCF_CLUSTER` base URL). The launch cluster's providers are
@@ -569,11 +572,13 @@ subagent model) must each map to **exactly one** generated provider:
   `ALCF_CLUSTER=metis` with `ALCF_ENABLE_METIS=0` still gets the Metis
   providers; the override is noted in `startup.log`). The flags only trim the
   other clusters;
-- the **delegation** model must be listed by exactly one provider across all
-  generated providers, so a model served on more than one cluster (e.g.
-  `gpt-oss-120b`, on both Metis and Minerva) is ambiguous and is refused. If
-  `ALCF_DELEGATION_MODEL` is unset or equals the launch model, subagents simply
-  reuse the launch provider.
+- the **delegation** model is pinned to the launch endpoint the same way: if a
+  provider on the launch endpoint lists it, that provider is used (exactly one
+  there must). Otherwise exactly one provider on another cluster must list it.
+  So `gpt-oss-120b` (on both Metis and Minerva) delegates on Metis when
+  `ALCF_CLUSTER=metis`, but is ambiguous, and refused, when launching on Sophia.
+  If `ALCF_DELEGATION_MODEL` is unset or equals the launch model, subagents
+  simply reuse the launch provider.
 
 Otherwise startup **refuses with exit 78** and prints the valid model ids. This
 replaces the old behavior of silently falling back to `custom:alcf-sophia` when
@@ -584,10 +589,12 @@ committed static list in `config/config.template.yaml`, so the container always
 comes up with a usable (if possibly slightly stale) set of models.
 
 During such an outage the static list may not include your `ALCF_MODEL`. In
-that case the generator adds the launch model to the launch cluster's plain or
-`-reasoning` provider (classified by its id), using the context window resolved
-at startup, and prints a notice to stderr naming the outage and the added
-model. This only happens if that window is at least 64k. Otherwise startup
+that case, as a **best-effort emergency fallback**, the generator adds the
+launch model to the launch cluster's plain or `-reasoning` provider (classified
+by its id), using the context window resolved at startup, and prints a notice to
+stderr naming the outage and the added model. The model has passed only the
+local context-floor check (window at least 64k); whether ALCF actually serves it
+is unverified until the catalog recovers. Without a ≥64k window, startup
 refuses with exit 78 and a distinct message: "catalog unavailable; '<model>' is
 not in the static fallback list …". When the catalog *is* reachable, a launch
 model missing from it really is not served (or was excluded), so it is always

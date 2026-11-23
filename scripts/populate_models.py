@@ -89,6 +89,7 @@ import os
 import re
 import sys
 import textwrap
+import urllib.error
 import urllib.request
 
 INFER_HOST = "https://inference-api.alcf.anl.gov/resource_server"
@@ -242,6 +243,15 @@ MINERVA_FALLBACK = {
 from alcf_tokens.auth import get_access_token
 
 
+def _exc_summary(e: BaseException) -> str:
+    """The exception class and HTTP status (when there is one) for a log line.
+    Never str(e): that may echo a URL, a response body or a credential."""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status is None and isinstance(e, urllib.error.HTTPError):
+        status = e.code
+    return type(e).__name__ + (f", HTTP {status}" if status is not None else "")
+
+
 def _get_token() -> str:
     # Support passing a pre-fetched token via env (set by entrypoint to avoid
     # extra alcf-tokens calls during the same render_config invocation).
@@ -387,7 +397,7 @@ def _resolve_cluster(cluster: str, token: str, selector, fallback: dict) -> tupl
         print(f"[populate_models] {cluster}: empty selection; using fallback",
               file=sys.stderr)
     except Exception as e:  # noqa: BLE001
-        print(f"[populate_models] {cluster} discovery failed ({e}); using fallback",
+        print(f"[populate_models] {cluster} discovery failed ({_exc_summary(e)}); using fallback",
               file=sys.stderr)
     return dict(fallback), "fallback"
 
@@ -524,7 +534,7 @@ def build_block(include_metis: bool = True, include_minerva: bool = True) -> str
     try:
         token = _get_token()
     except Exception as e:  # noqa: BLE001
-        print(f"[populate_models] token fetch failed ({e}); full static fallback",
+        print(f"[populate_models] token fetch failed ({_exc_summary(e)}); full static fallback",
               file=sys.stderr)
         token = None
 
@@ -647,7 +657,7 @@ def status_report() -> int:
     try:
         token = _get_token()
     except Exception as e:  # noqa: BLE001
-        print(f"[status-report] token fetch failed ({e}); skipping status banner",
+        print(f"[status-report] token fetch failed ({_exc_summary(e)}); skipping status banner",
               file=sys.stderr)
         return 0
 
@@ -664,7 +674,7 @@ def status_report() -> int:
             live, queued = _fetch_job_states(cluster, token)
             known = True
         except Exception as e:  # noqa: BLE001
-            print(f"[status-report] {cluster} /jobs failed ({e})", file=sys.stderr)
+            print(f"[status-report] {cluster} /jobs failed ({_exc_summary(e)})", file=sys.stderr)
             live, queued, known = set(), {}, False
 
         lines.append(f"  {cluster}:")
@@ -773,7 +783,7 @@ def parse_providers(text: str) -> dict:
     ``custom_providers:`` list, or empty text) yields ``{}``. Anything else
     that is not that shape -- invalid YAML, a non-mapping ``providers``, an
     entry without a string ``api`` and a ``models`` mapping, a model without an
-    integer ``context_length`` -- raises ProviderParseError (fail closed).
+    positive integer ``context_length`` -- raises ProviderParseError (fail closed).
     """
     doc = _yaml_load(text or "")
     if doc is None:
@@ -797,9 +807,9 @@ def parse_providers(text: str) -> dict:
         for mid, meta in models.items():
             ctx = meta.get("context_length") if isinstance(meta, dict) else None
             if (not isinstance(mid, str) or not isinstance(ctx, int)
-                    or isinstance(ctx, bool)):
+                    or isinstance(ctx, bool) or ctx <= 0):
                 raise ProviderParseError(
-                    f"provider {key!r} model {mid!r} needs an integer context_length")
+                    f"provider {key!r} model {mid!r} needs a positive integer context_length")
             out[key]["models"][mid] = ctx
     return out
 
@@ -825,7 +835,7 @@ def launch_provider(model_id: str, providers_text: str, base_url=None) -> str:
     turn gets that provider's output cap (its extra_body), exactly as a later
     /model switch to the same model would. The answer is read from the generated
     block itself, never guessed: among the providers whose ``api`` is base_url
-    (the launch endpoint; all providers when None, for delegation) exactly one
+    (the launch endpoint; all providers when None) exactly one
     must list model_id. Zero or several matches raise LaunchProviderError, since
     a guess could silently apply the wrong cap or endpoint. Returns e.g.
     'custom:alcf-sophia-reasoning'. Never touches the network.
@@ -840,6 +850,33 @@ def launch_provider(model_id: str, providers_text: str, base_url=None) -> str:
         raise LaunchProviderError(
             f"model {model_id!r} is listed by several providers{where} "
             f"({', '.join(matches)}); cannot pick one")
+    return f"custom:{matches[0]}"
+
+
+def delegation_provider(model_id: str, providers_text: str, launch_base_url) -> str:
+    """Return the named provider the delegation (subagent) model resolves through.
+
+    Endpoint-pinned like the launch model: if any provider on the launch
+    endpoint lists model_id, the launch_provider() rule applies there (exactly
+    one, else raise) -- so a model served on several clusters (e.g. gpt-oss-120b)
+    delegates on the cluster the user launched on. Otherwise exactly one provider
+    on any OTHER endpoint must list it. None, or several elsewhere, raise
+    LaunchProviderError naming the candidates; there is no guess. Never touches
+    the network.
+    """
+    providers = parse_providers(providers_text)
+    on_launch = _on_endpoint(providers, launch_base_url) if launch_base_url else {}
+    if any(model_id in e["models"] for e in on_launch.values()):
+        return launch_provider(model_id, providers_text, launch_base_url)
+    matches = sorted(k for k, e in providers.items()
+                     if k not in on_launch and model_id in e["models"])
+    if not matches:
+        raise LaunchProviderError(
+            f"model {model_id!r} is not listed by any generated provider")
+    if len(matches) > 1:
+        raise LaunchProviderError(
+            f"model {model_id!r} is not on the launch endpoint and is listed by several "
+            f"other providers ({', '.join(matches)}); cannot pick one")
     return f"custom:{matches[0]}"
 
 
@@ -861,18 +898,28 @@ def main() -> int:
                     help="read a providers block on stdin and print the one named "
                          "provider that lists MODEL_ID (e.g. "
                          "custom:alcf-sophia-reasoning); exit 1 if none or several")
+    ap.add_argument("--delegation-provider", default="", metavar="MODEL_ID",
+                    help="read a providers block on stdin and print the named "
+                         "provider for the delegation model: the one on --base-url "
+                         "(the launch endpoint) if it lists MODEL_ID, else the one "
+                         "other provider that does; exit 1 if none or ambiguous")
     ap.add_argument("--list-models", action="store_true",
                     help="read a providers block on stdin and print its model ids "
                          "(comma-separated, sorted); exit 1 if none")
     ap.add_argument("--base-url", default="",
                     help="with --launch-provider/--list-models: only consider "
-                         "providers whose api is this endpoint")
+                         "providers whose api is this endpoint; with "
+                         "--delegation-provider: the launch endpoint")
     args = ap.parse_args()
 
-    if args.launch_provider:
+    if args.launch_provider or args.delegation_provider:
         try:
-            name = launch_provider(args.launch_provider, sys.stdin.read(),
-                                   args.base_url or None)
+            if args.launch_provider:
+                name = launch_provider(args.launch_provider, sys.stdin.read(),
+                                       args.base_url or None)
+            else:
+                name = delegation_provider(args.delegation_provider, sys.stdin.read(),
+                                           args.base_url or None)
         except LaunchProviderError as e:
             print(f"[populate_models] {e}", file=sys.stderr)
             return 1
