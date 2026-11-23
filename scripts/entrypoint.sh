@@ -50,13 +50,19 @@ log() { milestone "$*"; }
 
 # --- 0. Version banner ------------------------------------------------------
 # Print the ALCF-agent-box git revision + build date baked at image build, plus
-# the underlying Hermes SHA, so you can confirm exactly which image is running.
+# the underlying Hermes version, so you can confirm exactly which image is
+# running. The Hermes line is recorded at image build (Dockerfile, from
+# `hermes --version`) into $ALCF_DIR/.hermes_version; older bases shipped
+# /opt/hermes/.hermes_build_sha instead. Never run `hermes --version` here.
 _alcf_sha="dev"; _alcf_date="unknown"
 if [[ -f "$ALCF_DIR/.alcf_version" ]]; then
   _alcf_sha="$(sed -n 1p "$ALCF_DIR/.alcf_version")"
   _alcf_date="$(sed -n 2p "$ALCF_DIR/.alcf_version")"
 fi
-_hermes_sha="$(cat /opt/hermes/.hermes_build_sha 2>/dev/null | cut -c1-12 || true)"
+_hermes_sha="$(sed -n 1p "$ALCF_DIR/.hermes_version" 2>/dev/null || true)"
+if [[ -z "$_hermes_sha" ]]; then
+  _hermes_sha="$(cat /opt/hermes/.hermes_build_sha 2>/dev/null | cut -c1-12 || true)"
+fi
 printf '\033[1;36m╔══════════════════════════════════════════════════════════╗\033[0m\n'
 printf '\033[1;36m║\033[0m  ALCF Agent in a Box\n'
 printf '\033[1;36m║\033[0m  version : %s  (built %s)\n' "$_alcf_sha" "$_alcf_date"
@@ -65,7 +71,7 @@ printf '\033[1;36m╚═══════════════════�
 # Drop a chat-readable copy on the volume (refreshed every start so it always
 # reflects the running image; the agent reads it when asked "what version?").
 mkdir -p "${HERMES_HOME:-/opt/data}" 2>/dev/null || true
-printf 'ALCF Agent in a Box\nalcf-agent-box commit: %s\nbuilt: %s\nhermes commit: %s\nrepo: https://github.com/jtchilders-ai-assistant/alcf-agent-box\n' \
+printf 'ALCF Agent in a Box\nalcf-agent-box commit: %s\nbuilt: %s\nhermes: %s\nrepo: https://github.com/jtchilders-ai-assistant/alcf-agent-box\n' \
   "$_alcf_sha" "$_alcf_date" "${_hermes_sha:-unknown}" > "${HERMES_HOME:-/opt/data}/ALCF_VERSION.txt" 2>/dev/null || true
 
 # --- 1. Resolve inference base_url ------------------------------------------

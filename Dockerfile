@@ -84,6 +84,24 @@ RUN set -eu; \
     "$py" -c "import hermes_cli, alcf_tokens.auth, globus_compute_sdk, requests, ruamel.yaml"; \
     /opt/hermes/.venv/bin/alcf-tokens --help >/dev/null
 
+# Record the base's Hermes version line (e.g. "Hermes Agent v0.23.2
+# (2026.9.24) · upstream ae2a81cc") for the startup banner; v0.23.2 no longer
+# ships /opt/hermes/.hermes_build_sha. Captured once here so the entrypoint
+# never runs `hermes --version` at boot. Uses the venv binary (not the
+# /opt/hermes/bin exec shim) and a throwaway HOME/HERMES_HOME so no cache files
+# land in the image. An empty version line fails the build.
+RUN set -eu; \
+    tmp="$(mktemp -d)"; \
+    out="$(HOME="$tmp" HERMES_HOME="$tmp" /opt/hermes/.venv/bin/hermes --version)"; \
+    rm -rf "$tmp"; \
+    line="$(printf '%s\n' "$out" | sed -n 1p)"; \
+    if [ -z "$line" ]; then \
+        echo "ERROR: 'hermes --version' printed no version line" >&2; \
+        exit 1; \
+    fi; \
+    printf '%s\n' "$line" > /opt/alcf/.hermes_version; \
+    echo "Recorded Hermes version: $line"
+
 # ---------------------------------------------------------------------------
 # 2. ALCF content (changes most often -> last for cache friendliness).
 #    /opt/alcf is the staging area; the entrypoint copies skills + MEMORY.md

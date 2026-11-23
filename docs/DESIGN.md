@@ -78,6 +78,24 @@ Consequences baked into the design:
   Hermes config with a fresh inference access token, because the token is the
   `api_key` and it rotates.
 
+### Secret hygiene
+
+The rendered `config.yaml` is the only intended durable home of an inference
+credential; the entrypoint forces it to mode 0600 on every render. In generic
+mode, `INFERENCE_TOKEN` arrives through `docker run -e`; once it is in the
+config, the entrypoint `unset`s it before launching anything. So the
+entrypoint's descendants — the dashboard, Caddy, the MCP `bash` server, and a
+gateway the dashboard starts — never see it in their environment.
+
+**Known limit (`docker exec`).** Docker gives every process started with
+`docker exec` the container's configured environment (`Config.Env`, i.e. the
+`-e` values from `docker run`), not the entrypoint's. The entrypoint cannot
+change that. A gateway that `docker exec <c> hermes -z ...` auto-starts
+therefore inherits `INFERENCE_TOKEN` (seen in the v0.23.2 image smoke test).
+If that matters, use the dashboard, or blank the variable for the exec:
+`docker exec -e INFERENCE_TOKEN= <c> hermes ...`. ALCF mode is unaffected,
+because it passes no inference token through the environment.
+
 ## Startup pipeline (what the launch scripts do)
 
 `scripts/entrypoint.sh` runs on every container start and renders the live config

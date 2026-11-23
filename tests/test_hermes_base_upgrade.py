@@ -268,7 +268,22 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
             msg = record.getMessage()
             if "unknown config keys" in msg:
                 ev["unknown_key_warnings"].append(msg)
+            if "config migration" in msg:
+                ev["migration_warnings"].append(msg)
+    ev["migration_warnings"] = []
     logging.getLogger().addHandler(_Grab(level=logging.WARNING))
+
+    # The boot-time schema check upstream runs (post_update.step_migrate_config):
+    # a current stamp is a no-op "up-to-date"; a missing one reads as version 0,
+    # below the support floor, and logs "config migration skipped" every boot.
+    try:
+        from hermes_cli.config_version_stamp import read_config_version_stamp
+        from hermes_cli.post_update import step_migrate_config
+        stamp, latest = read_config_version_stamp()
+        ev["config_version"] = {"stamp": stamp, "latest": latest,
+                                "migrate": step_migrate_config()}
+    except Exception:
+        fail("config_version")
 
     try:
         ev["validate_issues"] = [{"severity": str(getattr(i, "severity", "")),
@@ -426,6 +441,16 @@ class UpstreamHarnessMixin:
         print(f"\n[upstream evidence] {json.dumps(ev, sort_keys=True)}", file=sys.stderr)
         self.assertIsNone(ev["harness_error"], "upstream harness error (not a contract failure)")
         return ev
+
+    def assert_config_version_current(self, ev: dict) -> None:
+        """The rendered config carries upstream's current schema stamp, so the boot
+        migration check is a silent no-op (not 'below-support-floor')."""
+        cv = ev["config_version"]
+        self.assertEqual(cv["stamp"], cv["latest"],
+                         "rendered config's _config_version != upstream "
+                         "DEFAULT_CONFIG['_config_version']")
+        self.assertEqual(cv["migrate"], {"ok": True, "skipped": "up-to-date"})
+        self.assertEqual(ev["migration_warnings"], [])
 
     def assert_runtime_contract(self, ev: dict, checks: list) -> None:
         self.assertIn("providers", ev["root_keys"], "rendered config has no `providers` root key")
@@ -1420,6 +1445,69 @@ class GenericInferenceRenderContract(GenericRenderMixin, unittest.TestCase):
         self.assertEqual(doc["model"]["provider"], "custom:generic-inference")
 
 
+HERMES_VERSION_LINE = "Hermes Agent v0.23.2 (2026.9.24) · upstream ae2a81cc"
+
+
+class HermesVersionRecordContract(GenericRenderMixin, unittest.TestCase):
+    """v0.23.2 ships no /opt/hermes/.hermes_build_sha (banner said 'unknown').
+    The image build records `hermes --version`'s first line in
+    /opt/alcf/.hermes_version; the entrypoint shows it and never runs hermes."""
+
+    def version_run(self) -> str:
+        runs = [i for i in dockerfile_instructions()
+                if i.startswith("RUN ") and "/opt/alcf/.hermes_version" in i]
+        self.assertEqual(len(runs), 1, "expected exactly one RUN recording the Hermes version")
+        return runs[0]
+
+    def test_dockerfile_records_version_after_deps_as_root(self):
+        insts = dockerfile_instructions()
+        run = self.version_run()
+        at = insts.index(run)
+        deps_at = next(n for n, i in enumerate(insts) if i.startswith("RUN ") and DEPS in i)
+        self.assertGreater(at, deps_at, "version must be recorded after the deps install")
+        users = [i for i in insts[:at] if i.startswith("USER ")]
+        self.assertEqual(users[-1], "USER root")
+        self.assertTrue(run.startswith("RUN set -eu;"), run[:40])
+        self.assertIn('/opt/hermes/.venv/bin/hermes --version)"', run)
+        self.assertIn('HOME="$tmp" HERMES_HOME="$tmp"', run, "no build-time cache in the image")
+        self.assertRegex(run, r'if \[ -z "\$line" \]; then .*exit 1; fi')
+        self.assertIn("printf '%s\\n' \"$line\" > /opt/alcf/.hermes_version", run)
+        res = subprocess.run(["sh", "-n", "-c", run[len("RUN "):]],
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_entrypoint_reads_recorded_version_with_fallbacks_and_never_runs_hermes(self):
+        body = (ROOT / "scripts" / "entrypoint.sh").read_text(encoding="utf-8")
+        code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"hermes\S*\s+--version")
+        recorded = code.index('"$ALCF_DIR/.hermes_version"')
+        legacy = code.index("/opt/hermes/.hermes_build_sha")
+        banner = code.index('hermes  : %s')
+        self.assertLess(recorded, legacy)
+        self.assertLess(legacy, banner)
+        self.assertIn('"${_hermes_sha:-unknown}"', code[banner:])
+
+    def test_banner_and_version_file_show_recorded_version(self):
+        (self.harness.alcf_dir / ".hermes_version").write_text(HERMES_VERSION_LINE + "\n",
+                                                                encoding="utf-8")
+        result = self.harness.run_entrypoint(
+            INFERENCE_URL=self.harness.base_url, INFERENCE_TOKEN=tgi.SECRET,
+            INFERENCE_MODEL="selected/model", INFERENCE_MAX_TOKENS="4096")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"hermes  : {HERMES_VERSION_LINE}", result.stdout)
+        txt = (self.harness.home / "ALCF_VERSION.txt").read_text(encoding="utf-8")
+        self.assertIn(f"hermes: {HERMES_VERSION_LINE}\n", txt)
+
+    def test_banner_without_any_record_says_unknown(self):
+        if Path("/opt/hermes/.hermes_build_sha").exists():
+            self.fail("host has /opt/hermes/.hermes_build_sha; cannot test the 'unknown' fallback")
+        result = self.harness.run_entrypoint(
+            INFERENCE_URL=self.harness.base_url, INFERENCE_TOKEN=tgi.SECRET,
+            INFERENCE_MODEL="selected/model", INFERENCE_MAX_TOKENS="4096")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hermes  : unknown", result.stdout)
+
+
 class UpstreamRuntimeContract(UpstreamHarnessMixin, unittest.TestCase):
     def test_positive_control_hand_written_v0_23_2_config(self):
         """Proves the harness itself: a correct providers: config must pass today."""
@@ -1432,6 +1520,24 @@ class UpstreamRuntimeContract(UpstreamHarnessMixin, unittest.TestCase):
         self.assertNotIn("${ALCF_ACCESS_TOKEN}", config)
         ev = self.run_upstream(config, ALCF_CHECKS)
         self.assert_runtime_contract(ev, ALCF_CHECKS)
+        self.assert_config_version_current(ev)
+
+    def test_unstamped_config_trips_the_support_floor_warning(self):
+        """Negative control for the stamp check: a config without _config_version
+        (as rendered before the fix) is what upstream refuses to migrate."""
+        self.assertNotIn("_config_version", POSITIVE_CONTROL_CONFIG)
+        ev = self.run_upstream(POSITIVE_CONTROL_CONFIG, [])
+        self.assertIsNone(ev["config_version"]["stamp"])
+        self.assertEqual(ev["config_version"]["migrate"],
+                         {"ok": True, "skipped": "below-support-floor"})
+        self.assertTrue(any("predates version 12" in w for w in ev["migration_warnings"]),
+                        ev["migration_warnings"])
+
+    def test_template_stamp_is_upstream_current_schema_version(self):
+        template = yaml.safe_load((ROOT / "config" / "config.template.yaml").read_text(encoding="utf-8"))
+        ev = self.run_upstream(render_alcf_config("", launch_provider="custom:alcf-sophia-reasoning",
+                                                  model="google/gemma-4-31B-it"), [])
+        self.assertEqual(template["_config_version"], ev["config_version"]["latest"])
 
     def test_positive_control_model_switch_uses_target_provider_cap(self):
         """Proves the switch harness: a correct config switches to the 12288 cap today."""
@@ -1455,6 +1561,7 @@ class UpstreamRuntimeContract(UpstreamHarnessMixin, unittest.TestCase):
                    "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN}]
         ev = self.run_upstream(config, checks)
         self.assert_runtime_contract(ev, checks)
+        self.assert_config_version_current(ev)
 
 
 class UpstreamGenericRuntimeContract(UpstreamHarnessMixin, GenericRenderMixin, unittest.TestCase):
@@ -1466,6 +1573,7 @@ class UpstreamGenericRuntimeContract(UpstreamHarnessMixin, GenericRenderMixin, u
                    "fake_token": tgi.SECRET}]
         ev = self.run_upstream(config, checks)
         self.assert_runtime_contract(ev, checks)
+        self.assert_config_version_current(ev)
 
 
 if __name__ == "__main__":

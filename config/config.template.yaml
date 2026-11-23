@@ -8,6 +8,17 @@
 # base_urls, or secrets. The packaged agent must have exactly ONE inference
 # target so it never silently talks to the wrong host.
 
+# Hermes config schema version this template is written for. Hermes treats a
+# config without this stamp as version 0 -- below its migration support floor
+# (12) -- and logs "config migration skipped ... run `hermes setup`" on every
+# boot. The entrypoint re-renders config.yaml from this template on every
+# start, so the file is always in the base image's current schema; stamp it
+# with that version (DEFAULT_CONFIG["_config_version"] in
+# hermes_cli/config_defaults.py: 53 for Hermes v0.23.2). Bump it together with
+# HERMES_BASE in the Dockerfile, after re-checking the template against the new
+# schema.
+_config_version: 53
+
 model:
   # The ALCF Inference Service is OpenAI-compatible. provider: custom tells
   # Hermes to treat base_url as a raw OpenAI-wire endpoint.
