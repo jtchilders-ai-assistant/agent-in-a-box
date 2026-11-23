@@ -744,8 +744,9 @@ Models are organized by cluster and marked with the following capabilities:
 
 ??? "Chat Language Models"
 
-    - nemotron-3-ultra^H^
-    - inkling-bf16^H^
+    - muse-spark-bf16^RTH^
+    - mistral-large-4-nvfp4^RTH^
+    - inkling-2-small^RTH^
 
 ### Tara Cluster
 

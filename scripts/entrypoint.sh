@@ -75,20 +75,24 @@ printf 'ALCF Agent in a Box\nalcf-agent-box commit: %s\nbuilt: %s\nhermes: %s\nr
   "$_alcf_sha" "$_alcf_date" "${_hermes_sha:-unknown}" > "${HERMES_HOME:-/opt/data}/ALCF_VERSION.txt" 2>/dev/null || true
 
 # --- 1. Resolve inference base_url ------------------------------------------
-# Default launch: Muse Spark on Tara. ALCF_MODEL unset on another cluster keeps
-# that cluster's previous default (google/gemma-4-31B-it).
+# The ONE default-model table: the image sets no ALCF_MODEL, so the default
+# depends on ALCF_CLUSTER (default tara). An explicit ALCF_MODEL always wins.
+# metis/minerva keep the pre-Tara default (google/gemma-4-31B-it).
 ALCF_CLUSTER="${ALCF_CLUSTER:-tara}"
 case "$ALCF_CLUSTER" in
   tara)    ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/tara/api/v1"
-           ALCF_MODEL="${ALCF_MODEL:-muse-spark-bf16}" ;;
-  sophia)  ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1" ;;
-  metis)   ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/metis/api/v1" ;;
-  minerva) ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1" ;;
+           default_model="muse-spark-bf16" ;;
+  sophia)  ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
+           default_model="google/gemma-4-31B-it" ;;
+  metis)   ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/metis/api/v1"
+           default_model="google/gemma-4-31B-it" ;;
+  minerva) ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1"
+           default_model="google/gemma-4-31B-it" ;;
   *) err "Unknown ALCF_CLUSTER='$ALCF_CLUSTER' (expected sophia|metis|minerva|tara)"
      exit 78 ;;   # EX_CONFIG
 esac
-ALCF_MODEL="${ALCF_MODEL:-google/gemma-4-31B-it}"
-export ALCF_BASE_URL
+ALCF_MODEL="${ALCF_MODEL:-$default_model}"
+export ALCF_BASE_URL ALCF_MODEL
 
 STARTUP_LOG="$HERMES_HOME/startup.log"
 mkdir -p "$HERMES_HOME"

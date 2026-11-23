@@ -277,7 +277,8 @@ remaining items are genuinely optional follow-ups:
 - ✅ Default model changed (2026-11-23): `muse-spark-bf16` on Tara (1M context,
   reasoning, with the `-reasoning` provider's 12288-token cap). Trade-off: no
   Tara model is kept always hot, so the first request may wait for a cold
-  start. `ALCF_CLUSTER=sophia ALCF_MODEL=google/gemma-4-31B-it` restores the
-  previous always-hot default.
+  start. The default model depends on `ALCF_CLUSTER` (the image sets no
+  `ALCF_MODEL`; the entrypoint holds the one table), so `ALCF_CLUSTER=sophia`
+  alone restores the previous always-hot default (`google/gemma-4-31B-it`).
 - ✅ Repo created under `jtchilders-ai-assistant` with GHCR publish + nightly
   docs-refresh CI. (Move to `argonne-lcf` if this becomes official.)

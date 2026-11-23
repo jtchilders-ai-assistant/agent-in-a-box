@@ -32,7 +32,7 @@ model:
   provider: "${ALCF_LAUNCH_PROVIDER}"
   base_url: "${ALCF_BASE_URL}"        # default https://inference-api.alcf.anl.gov/resource_server/tara/api/v1
   api_key: "${ALCF_ACCESS_TOKEN}"     # Globus access token, injected + refreshed by entrypoint
-  model: "${ALCF_MODEL}"              # default muse-spark-bf16 (Tara)
+  model: "${ALCF_MODEL}"              # default depends on ALCF_CLUSTER (tara: muse-spark-bf16)
   default: "${ALCF_MODEL}"
 
   # NOTE: model.max_tokens is intentionally NOT set here.
@@ -212,19 +212,19 @@ providers:
     discover_models: false
     extra_body:
       max_tokens: 12288
-    # Minerva publishes a structured `capabilities` object, so these windows and
-    # the reasoning class are read straight from the catalog rather than guessed
-    # (verified live 2026-08-24). All three advertise reasoning.supported=true —
-    # note inkling-bf16 and nemotron-3-ultra match no reasoning ID heuristic, so
-    # the capabilities read is what keeps them out of the 2048-token baseline
-    # (starved of budget they return empty content).
+    # Minerva publishes a structured `capabilities` object, so live windows and
+    # the reasoning class are read straight from the catalog rather than guessed.
+    # This static list is the Minerva table of the ALCF models doc as of
+    # 2026-11-23 (all reasoning). None of these ids matches a reasoning ID
+    # heuristic, so the capabilities read is what keeps them out of the
+    # 2048-token baseline (starved of budget they return empty content).
     models:
-      gpt-oss-120b:
-        context_length: 131072
-      inkling-bf16:
-        context_length: 262144
-      nemotron-3-ultra:
-        context_length: 262144
+      muse-spark-bf16:
+        context_length: 1048576
+      mistral-large-4-nvfp4:
+        context_length: 1048576
+      inkling-2-small:
+        context_length: 1048576
   alcf-tara-reasoning:
     name: alcf-tara-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/tara/api/v1"

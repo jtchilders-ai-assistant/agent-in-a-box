@@ -47,6 +47,8 @@ METIS_MODELS = [
     {"id": "Mistral-Large-3-675B-Instruct-2512", "framework": "api"},
 ]
 
+# The 2026-08-24 live Minerva capture: it exercises the capabilities selector,
+# not today's model set (that is MINERVA_FALLBACK / TestMinervaFallback).
 MINERVA_MODELS = [
     {"id": "gpt-oss-120b", "framework": "api", "capabilities": {
         "context_window_tokens": 131072, "reasoning": {"supported": True},
@@ -181,6 +183,20 @@ class TestSelectors(unittest.TestCase):
                     {"id": "plain-chat-model", "framework": "api"}])
                 self.assertEqual(sel["plain-chat-model"], (default, False))
                 self.assertEqual(set(pm.EXCLUDED_BY_FLOOR), {cluster})
+
+
+class TestMinervaFallback(unittest.TestCase):
+    def test_fallback_is_the_documented_table(self):
+        # The Minerva table of plans/evidence/tara/alcf-models-doc-2026-11-23.md.
+        self.assertEqual(pm.MINERVA_FALLBACK, {
+            "muse-spark-bf16": (1048576, True),
+            "mistral-large-4-nvfp4": (1048576, True),
+            "inkling-2-small": (1048576, True),
+        })
+
+    def test_muse_spark_is_on_minerva_and_tara(self):
+        self.assertIn("muse-spark-bf16", pm.MINERVA_FALLBACK)
+        self.assertIn("muse-spark-bf16", pm.TARA_FALLBACK)
 
 
 class TestTaraFallback(unittest.TestCase):
@@ -335,6 +351,39 @@ class TestTaraToggle(unittest.TestCase):
                         contextlib.redirect_stderr(io.StringIO()):
                     pm.status_report()
                 self.assertEqual(seen, [want])
+
+
+class TestStatusReportWarning(unittest.TestCase):
+    """The "no model is LIVE" warning needs at least one cluster whose /jobs
+    status was actually read; unknown everywhere is not "none live"."""
+
+    CLUSTERS = [("a", "alcf-a", "https://h/a/v1", None, {"m1": (131072, True)}),
+                ("b", "alcf-b", "https://h/b/v1", None, {"m2": (131072, False)})]
+
+    def report(self, job_states):
+        with mock.patch.object(pm, "_get_token", return_value="fake-token"), \
+                mock.patch.object(pm, "_clusters", return_value=self.CLUSTERS), \
+                mock.patch.object(pm, "_resolve_cluster",
+                                  side_effect=lambda c, _t, _s, fb: (dict(fb), "fallback")), \
+                mock.patch.object(pm, "_fetch_job_states", side_effect=job_states), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pm.status_report(), 0)
+        return out.getvalue()
+
+    def test_no_warning_when_every_status_is_unknown(self):
+        out = self.report(RuntimeError("offline test"))
+        self.assertEqual(out.count("status unknown"), 2)
+        self.assertNotIn("no model is LIVE", out)
+
+    def test_warning_when_a_known_cluster_has_nothing_live(self):
+        out = self.report([RuntimeError("offline test"), (set(), {})])
+        self.assertIn("status unknown", out)
+        self.assertIn("WARNING: no model is LIVE on any cluster", out)
+
+    def test_no_warning_when_a_model_is_live(self):
+        out = self.report([(set(), {}), ({"m2"}, {})])
+        self.assertNotIn("no model is LIVE", out)
 
 
 class TestEmit(unittest.TestCase):

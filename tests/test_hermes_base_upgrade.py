@@ -170,6 +170,20 @@ def fallback_as_providers(fallbacks) -> dict:
     return out
 
 
+def image_model_env(**overrides) -> dict:
+    """The image's ALCF_CLUSTER / ALCF_MODEL ENV defaults as `docker run` sees
+    them, plus `-e` overrides; ALCF_MODEL is empty (unset) unless one sets it."""
+    env = {"ALCF_MODEL": ""}
+    for instr in dockerfile_instructions():
+        if instr.startswith("ENV "):
+            for tok in instr.split()[1:]:
+                key, _, val = tok.partition("=")
+                if key in ("ALCF_CLUSTER", "ALCF_MODEL"):
+                    env[key] = val
+    env.update(overrides)
+    return env
+
+
 def template_fallback_doc() -> dict:
     """The committed fallback: the template from its sentinel line to EOF."""
     tmpl = (ROOT / "config" / "config.template.yaml").read_text(encoding="utf-8")
@@ -1354,10 +1368,15 @@ class EntrypointLaunchProviderContract(AlcfEntrypointMixin, unittest.TestCase):
                 self.assertEqual(self.config()["model"]["provider"], want)
 
     def test_model_on_several_clusters_resolves_on_the_launch_endpoint(self):
-        # gpt-oss-120b is served by metis AND minerva; ALCF_CLUSTER=metis pins it.
-        res = self.run_alcf(ALCF_CLUSTER="metis", ALCF_MODEL="gpt-oss-120b")
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(self.config()["model"]["provider"], "custom:alcf-metis-reasoning")
+        # muse-spark-bf16 is served by minerva AND tara (ALCF models doc,
+        # 2026-11-23); ALCF_CLUSTER pins it to the launch endpoint's provider.
+        for cluster, want in (("minerva", "custom:alcf-minerva-reasoning"),
+                              ("tara", "custom:alcf-tara-reasoning")):
+            with self.subTest(cluster=cluster):
+                res = self.run_alcf(ALCF_CLUSTER=cluster, ALCF_MODEL="muse-spark-bf16")
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(self.config()["model"]["provider"], want)
+                self.assertNotIn("not verified against the catalog", res.stderr)
 
     def test_unlisted_model_fails_closed(self):
         # With a LIVE catalog an absent model is really not served (or was
@@ -1379,24 +1398,35 @@ class EntrypointLaunchProviderContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertIn("alcf-shadow-reasoning", res.stderr)
 
     def test_delegation_model_resolves_to_exactly_one_provider(self):
-        # muse-spark-bf16 is listed only by alcf-tara-reasoning (not on sophia).
-        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it",
-                            ALCF_DELEGATION_MODEL="muse-spark-bf16")
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(self.config()["delegation"],
-                         {"provider": "custom:alcf-tara-reasoning", "model": "muse-spark-bf16"})
+        # Per the ALCF models doc (2026-11-23) each is served by one cluster only,
+        # and not on the sophia launch endpoint: inkling-bf16 by tara (Minerva
+        # serves inkling-2-small), gpt-oss-120b (no "openai/" prefix) by metis.
+        for model, want in (("inkling-bf16", "custom:alcf-tara-reasoning"),
+                            ("gpt-oss-120b", "custom:alcf-metis-reasoning")):
+            with self.subTest(model=model):
+                res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it",
+                                    ALCF_DELEGATION_MODEL=model)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(self.config()["delegation"], {"provider": want, "model": model})
 
     def test_ambiguous_delegation_model_fails_closed(self):
-        # Each is listed by two providers, neither on the sophia launch endpoint:
-        # gpt-oss-120b by metis + minerva, inkling-bf16 by minerva + tara.
-        for model, providers in (("gpt-oss-120b", ("alcf-metis-reasoning", "alcf-minerva-reasoning")),
-                                 ("inkling-bf16", ("alcf-minerva-reasoning", "alcf-tara-reasoning"))):
-            with self.subTest(model=model):
-                res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL=model)
-                self.assert_refused(res)
-                self.assertIn(model, res.stderr)
-                for name in providers:
-                    self.assertIn(name, res.stderr)
+        # muse-spark-bf16 is listed by minerva AND tara (ALCF models doc,
+        # 2026-11-23), neither on the sophia launch endpoint: refuse, naming both.
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it",
+                            ALCF_DELEGATION_MODEL="muse-spark-bf16")
+        self.assert_refused(res)
+        self.assertIn("muse-spark-bf16", res.stderr)
+        for name in ("alcf-minerva-reasoning", "alcf-tara-reasoning"):
+            self.assertIn(name, res.stderr)
+
+    def test_default_launch_delegating_muse_spark_stays_on_tara(self):
+        # The image defaults (Tara, muse-spark-bf16) delegating muse-spark-bf16:
+        # Minerva serves it too, but the launch endpoint wins.
+        res = self.run_alcf(**image_model_env(ALCF_DELEGATION_MODEL="muse-spark-bf16"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["model"]["provider"], "custom:alcf-tara-reasoning")
+        self.assertEqual(self.config()["delegation"],
+                         {"provider": "custom:alcf-tara-reasoning", "model": "muse-spark-bf16"})
 
 
 class EntrypointDelegationContract(AlcfEntrypointMixin, unittest.TestCase):
@@ -1497,20 +1527,58 @@ class EntrypointClusterContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertEqual(self.config()["providers"]["alcf-tara-reasoning"]["extra_body"],
                          {"max_tokens": pm.REASONING_MAX_TOKENS})
 
-    def test_dockerfile_defaults_to_muse_spark_on_tara(self):
+    def test_dockerfile_sets_cluster_but_not_model(self):
+        # An image-wide ALCF_MODEL would survive `-e ALCF_CLUSTER=sophia` and aim
+        # Muse Spark at Sophia; the per-cluster default lives in the entrypoint.
         env = " ".join(i for i in dockerfile_instructions() if i.startswith("ENV ")).split()
         self.assertIn("ALCF_CLUSTER=tara", env)
-        self.assertIn("ALCF_MODEL=muse-spark-bf16", env)
-        self.assertFalse([t for t in env if t.startswith(("ALCF_CLUSTER=", "ALCF_MODEL="))
-                          and t not in ("ALCF_CLUSTER=tara", "ALCF_MODEL=muse-spark-bf16")])
+        self.assertFalse([t for t in env
+                          if t.startswith("ALCF_CLUSTER=") and t != "ALCF_CLUSTER=tara"])
+        self.assertFalse([t for t in env if t.startswith("ALCF_MODEL")], env)
+
+    def test_entrypoint_has_one_default_model_table(self):
+        body = (SCRIPTS / "entrypoint.sh").read_text(encoding="utf-8")
+        code = [ln for ln in body.splitlines() if not ln.lstrip().startswith("#")]
+        self.assertEqual(len([ln for ln in code if 'ALCF_MODEL="${ALCF_MODEL:-' in ln]), 1)
+        self.assertEqual(len([ln for ln in code if "muse-spark-bf16" in ln]), 1)
+
+    def test_image_defaults_launch_muse_spark_on_tara(self):
+        res = self.run_alcf(**image_model_env())
+        self.assertEqual(res.returncode, 0, res.stderr)
+        model = self.config()["model"]
+        self.assertEqual(model["model"], "muse-spark-bf16")
+        self.assertEqual(model["provider"], "custom:alcf-tara-reasoning")
+        self.assertEqual(model["base_url"], pm.TARA_BASE)
+
+    def test_image_with_sophia_cluster_launches_gemma_on_sophia(self):
+        # `docker run -e ALCF_CLUSTER=sophia` with ALCF_MODEL unset.
+        res = self.run_alcf(**image_model_env(ALCF_CLUSTER="sophia"))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        model = self.config()["model"]
+        self.assertEqual(model["model"], "google/gemma-4-31B-it")
+        self.assertEqual(model["provider"], "custom:alcf-sophia-reasoning")
+        self.assertEqual(model["base_url"], pm.SOPHIA_BASE)
+        self.assertNotIn("muse-spark-bf16", res.stderr)
+
+    def test_explicit_model_wins_over_cluster_default(self):
+        for cluster, want in (("sophia", "custom:alcf-sophia-reasoning"),
+                              ("tara", "custom:alcf-tara-reasoning")):
+            with self.subTest(cluster=cluster):
+                res = self.run_alcf(**image_model_env(ALCF_CLUSTER=cluster,
+                                                      ALCF_MODEL="openai/gpt-oss-120b"))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(self.config()["model"]["model"], "openai/gpt-oss-120b")
+                self.assertEqual(self.config()["model"]["provider"], want)
 
     def test_tara_and_minerva_resolve_their_endpoints(self):
         for cluster, model, base, provider in (
                 ("tara", "muse-spark-bf16", pm.TARA_BASE, "custom:alcf-tara-reasoning"),
-                ("minerva", "inkling-bf16", pm.MINERVA_BASE, "custom:alcf-minerva-reasoning")):
+                ("minerva", "inkling-2-small", pm.MINERVA_BASE, "custom:alcf-minerva-reasoning")):
             with self.subTest(cluster=cluster):
                 res = self.run_alcf(ALCF_CLUSTER=cluster, ALCF_MODEL=model)
                 self.assertEqual(res.returncode, 0, res.stderr)
+                # In the static fallback list, so nothing had to be injected.
+                self.assertNotIn("not verified against the catalog", res.stderr)
                 self.assertEqual(self.config()["model"]["base_url"], base)
                 self.assertEqual(self.config()["model"]["provider"], provider)
 
@@ -1546,7 +1614,7 @@ class EntrypointClusterContract(AlcfEntrypointMixin, unittest.TestCase):
 
     def test_disabled_minerva_launch_cluster_is_diagnosed(self):
         res = self.run_alcf(ALCF_CLUSTER="minerva", ALCF_ENABLE_MINERVA="0",
-                            ALCF_MODEL="inkling-bf16")
+                            ALCF_MODEL="inkling-2-small")
         self.assertEqual(res.returncode, 0, res.stderr)
         overrides = [ln for ln in self.startup_log().splitlines()
                      if "ALCF_ENABLE_MINERVA=0" in ln and "launch cluster" in ln]

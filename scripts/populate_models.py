@@ -197,7 +197,8 @@ METIS_DEFAULT_CONTEXT = 32768
 #   capabilities.context_window_tokens   int
 #   capabilities.reasoning.supported     bool
 # Verified live 2026-08-24: gpt-oss-120b 131072, inkling-bf16 262144,
-# nemotron-3-ultra 262144 — all reasoning:true, all tool_calling:true.
+# nemotron-3-ultra 262144 — all reasoning:true, all tool_calling:true. (The
+# 2026-11-23 Minerva set is different: see MINERVA_FALLBACK.)
 # NOTE the id heuristic MISSES inkling-bf16 and nemotron-3-ultra, so without the
 # capabilities read they would land in the 2048-token baseline provider and
 # return empty content (their reasoning channel eats the whole budget —
@@ -238,13 +239,15 @@ METIS_FALLBACK = {
     mid: (ctx, _is_reasoning_id(mid))
     for mid, ctx in METIS_CONTEXT.items() if ctx >= MIN_CONTEXT
 }
-# Minerva fallback: verified live 2026-08-24 from capabilities.*. All three are
-# reasoning models (capabilities.reasoning.supported = true), all well above the
-# 64k floor.
+# Minerva fallback: the Minerva table of the ALCF "Available Models" doc as of
+# 2026-11-23 (plans/evidence/tara/alcf-models-doc-2026-11-23.md). All three are
+# marked R (reasoning), T and H. muse-spark-bf16 is ALSO on Tara, so delegating
+# it from a launch on neither cluster is ambiguous (exit 78). The 2026-08-24
+# set (gpt-oss-120b, inkling-bf16, nemotron-3-ultra) is no longer listed.
 MINERVA_FALLBACK = {
-    "gpt-oss-120b": (131072, True),
-    "inkling-bf16": (262144, True),
-    "nemotron-3-ultra": (262144, True),
+    "muse-spark-bf16": (1048576, True),
+    "mistral-large-4-nvfp4": (1048576, True),
+    "inkling-2-small": (1048576, True),
 }
 # Tara fallback: the Tara table of the ALCF "Available Models" doc as of
 # 2026-11-23 (plans/evidence/tara/alcf-models-doc-2026-11-23.md). Every model is
@@ -710,6 +713,7 @@ def status_report() -> int:
 
     lines = ["Model availability (context window shown per model):"]
     any_live = False
+    any_known = False
     for cluster, _provider, _base, selector, fallback in _clusters(
             include_metis=include_metis, include_minerva=include_minerva,
             include_tara=include_tara):
@@ -731,6 +735,7 @@ def status_report() -> int:
         queued_ids = sorted(m for m in offered if m not in live and m in queued)
         offline_ids = sorted(m for m in offered
                              if m not in live and m not in queued)
+        any_known = True
         any_live = any_live or bool(live_ids)
 
         if live_ids:
@@ -766,7 +771,9 @@ def status_report() -> int:
     if include_tara:
         lines.append("  Tara models are not kept always hot: the first request to one")
         lines.append("  may wait for a cold start.")
-    if not any_live:
+    # Only a cluster whose /jobs was read can say "nothing live"; when every
+    # status is unknown the per-cluster lines already say so.
+    if any_known and not any_live:
         lines.append("  WARNING: no model is LIVE on any cluster right now.")
     # Emit to stdout so the entrypoint can `log` it line-by-line.
     sys.stdout.write("\n".join(lines) + "\n")

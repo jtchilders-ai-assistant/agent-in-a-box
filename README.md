@@ -287,7 +287,7 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `ALCF_MODEL` | `muse-spark-bf16` | Model id on the inference service (the launch model). Tara models are not kept always hot, so the first request may wait for a cold start; `-e ALCF_CLUSTER=sophia -e ALCF_MODEL=google/gemma-4-31B-it` restores the previous always-hot default |
+| `ALCF_MODEL` | depends on `ALCF_CLUSTER` | Model id on the inference service (the launch model). The default model depends on `ALCF_CLUSTER`: `muse-spark-bf16` on `tara`, `google/gemma-4-31B-it` on `sophia`, `metis` and `minerva`. An explicit `ALCF_MODEL` always wins. Tara models are not kept always hot, so the first request may wait for a cold start; `-e ALCF_CLUSTER=sophia` restores the previous always-hot default |
 | `ALCF_CLUSTER` | `tara` | `tara`, `sophia` (vLLM), `metis` (SambaNova) or `minerva`; anything else refuses to start (exit 78) |
 | `ALCF_MAX_TOKENS` | `2048` | Baseline per-response output cap for **plain chat** models |
 | `ALCF_REASONING_MAX_TOKENS` | `12288` | Per-response output cap for **reasoning** models (gpt-oss, gemma-4, nemotron-3-super, *-Thinking). They spend part of the output budget on a hidden reasoning channel, so they need more headroom than chat models. |
@@ -515,14 +515,16 @@ providers are named by cluster and reasoning class:
   `nvidia/nemotron-3-super-120b`, `arcee-ai/Trinity-Large-Thinking-…`)
 - **`alcf-metis`** / **`alcf-metis-reasoning`** — the Metis equivalents (drop the
   Metis providers with `-e ALCF_ENABLE_METIS=0`)
-- **`alcf-minerva-reasoning`** — Minerva models (`gpt-oss-120b`, `inkling-bf16`,
-  `nemotron-3-ultra`; drop with `-e ALCF_ENABLE_MINERVA=0`)
+- **`alcf-minerva-reasoning`** — Minerva models (`muse-spark-bf16`,
+  `mistral-large-4-nvfp4`, `inkling-2-small`; drop with `-e ALCF_ENABLE_MINERVA=0`)
 
-The default launch is **`muse-spark-bf16` on Tara** (1M-token context, a
-reasoning model with the 12288-token reasoning output cap). The trade-off: Tara
-models are not "always hot", so the first request after a quiet period may wait
-for a cold start. To go back to the previous always-hot default, run with
-`-e ALCF_CLUSTER=sophia -e ALCF_MODEL=google/gemma-4-31B-it`.
+The default model depends on `ALCF_CLUSTER`. The default launch is
+**`muse-spark-bf16` on Tara** (1M-token context, a reasoning model with the
+12288-token reasoning output cap); with `ALCF_CLUSTER=sophia` (or `metis` /
+`minerva`) and no `ALCF_MODEL`, it is `google/gemma-4-31B-it`. An explicit
+`ALCF_MODEL` always wins. The trade-off: Tara models are not "always hot", so
+the first request after a quiet period may wait for a cold start. To go back to
+the previous always-hot default, run with `-e ALCF_CLUSTER=sophia`.
 
 Three behaviors are worth knowing:
 
@@ -582,10 +584,10 @@ subagent model) must each map to **one unambiguous** generated provider:
 - the **delegation** model is pinned to the launch endpoint the same way: if a
   provider on the launch endpoint lists it, that provider is used (exactly one
   there must). Otherwise exactly one provider on another cluster must list it.
-  So `gpt-oss-120b` (on both Metis and Minerva) delegates on Metis when
-  `ALCF_CLUSTER=metis`, but is ambiguous, and refused, when launching on Sophia.
-  Likewise `openai/gpt-oss-120b` (on Sophia and Tara) delegates on Tara when
-  launching on Tara.
+  So `muse-spark-bf16` (on both Minerva and Tara) delegates on Tara when
+  launching on Tara (the default), but is ambiguous, and refused, when
+  launching on Sophia. Likewise `openai/gpt-oss-120b` (on Sophia and Tara)
+  delegates on Tara when launching on Tara.
   If `ALCF_DELEGATION_MODEL` is unset or equals the launch model, subagents
   simply reuse the launch provider.
 
