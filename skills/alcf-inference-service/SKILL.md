@@ -100,11 +100,13 @@ With too small a cap the model spends the whole budget on reasoning and returns
 models or you get blank replies. Reasoning models on ALCF include the gpt-oss family,
 the **gemma-4 family** (they carry a `reasoning_parser` in the catalog), nemotron-3-super,
 and the `*-Thinking` models; plain-chat models (AuroraGPT, Llama) don't need the extra
-headroom. In Hermes, express this with a **per-provider** `max_tokens` on the
-`custom_providers` entry (there is no top-level per-model `max_tokens`): put reasoning
-models in a provider block with a larger cap. The `alcf-agent-box` container does exactly
-this — it splits each cluster into a baseline provider (`max_tokens` 2048) and a
-`-reasoning` provider (`max_tokens` 12288); see its `scripts/populate_models.py`.
+headroom. Hermes has no per-model `max_tokens`, and Hermes v0.23.2 ignores a bare
+`max_tokens` key on a `providers:` entry; express the cap **per provider** as
+`extra_body: {max_tokens: N}`, which Hermes sends with every request to that provider's
+models. Put reasoning models in a provider with a larger cap. The `alcf-agent-box`
+container does exactly this — it splits each cluster into a baseline provider
+(`extra_body.max_tokens` 2048) and a `-reasoning` provider (`extra_body.max_tokens`
+12288); see its `scripts/populate_models.py`.
 
 ## Using it as a Hermes backend
 

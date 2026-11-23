@@ -7,11 +7,11 @@ Two outputs, selected by --mode:
       for the top-level ``model.context_length``. Falls back to
       $ALCF_CONTEXT_LENGTH then 128000.
 
-  --mode mapping: print a YAML ``models:`` mapping (2-space indented, ready to
-      splice under a custom_providers entry) giving each listed model its real
-      ``context_length``. This is what makes an in-session ``/model`` switch use
-      the correct window — Hermes honours per-model
-      ``custom_providers[].models.<id>.context_length`` overrides (issue #15779),
+  --mode mapping: print a YAML ``models:`` mapping (2-space indented; re-indent
+      to splice under a ``providers.<key>`` entry) giving each listed model its
+      real ``context_length``. This is what makes an in-session ``/model`` switch
+      use the correct window — Hermes v0.23.2 honours per-model
+      ``providers.<key>.models.<id>.context_length`` overrides,
       and the ALCF gateway 404s the ``/v1/models`` path Hermes would otherwise
       probe, so without this a switch falls back to Hermes' (wrong) static table.
 

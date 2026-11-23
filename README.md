@@ -250,7 +250,6 @@ like a real login shell. Recommended container environment overrides:
 | Piece | Source | Purpose |
 |---|---|---|
 | Hermes Agent (official image) | `nousresearch/hermes-agent:v0.23.2` | Agent core + web dashboard (pinned base image) |
-| Tool-message patch | `patches/0001-strip-tool-message-name.patch` | Enables agentic tool use on the ALCF gateway |
 | ALCF skills | `skills/` | How to call ALCF inference / IRI / PBS |
 | Knowledge seed | `memory/MEMORY.md` | Curated, **sanitized** ALCF facts (always injected) |
 | Docs snapshot | `docs/` | Latest ALCF user docs (refreshed nightly) |
@@ -260,21 +259,23 @@ like a real login shell. Recommended container environment overrides:
 
 ### Architecture: built on the official Hermes image
 
-This image is `FROM nousresearch/hermes-agent:v0.23.2` plus three thin layers
-(patch, Globus auth helpers, ALCF content). We deliberately do **not** rebuild
+This image is `FROM nousresearch/hermes-agent:v0.23.2` plus two thin layers
+(Globus auth helpers, ALCF content); Hermes itself is used unmodified. We
+deliberately do **not** rebuild
 Hermes — the official image already handles the fixed SQLite build, s6-overlay
 supervision, the editable install, and the dashboard. See
 [docs/DESIGN.md](docs/DESIGN.md).
 
-### Why a patched Hermes?
+### History: the retired tool-message patch
 
-The ALCF Inference Service's vLLM gateway validates the Chat Completions
-tool-message schema strictly and rejects a `name` field on `role: tool`
-messages with HTTP 422, which breaks agentic (tool-using) sessions. Hermes was
-extended with a config flag `model.strip_tool_message_name` (default off) that
-strips that field for such gateways. The image applies the patch and sets the
-flag to `true`. The fix is upstreamable; once merged the patch layer becomes a
-no-op. See [docs/DESIGN.md](docs/DESIGN.md) for the full root-cause writeup.
+The ALCF Inference Service's vLLM gateway rejects a `name` field on `role: tool`
+messages with HTTP 422, which breaks agentic (tool-using) sessions. Earlier
+images worked around this with a local Hermes patch that has since been retired
+(`0001-strip-tool-message-name.patch`, which added a
+`model.strip_tool_message_name` flag). Upstream Hermes v0.23.2 strips `name`
+from tool messages itself, so the patch was retired with the move to that base
+and the image sets no flag. See [docs/DESIGN.md](docs/DESIGN.md) for the
+original root-cause writeup.
 
 ---
 
@@ -429,10 +430,14 @@ than aborting the launch.
    - **Context-floor guard.** If the *launch* model's real window is under 64k,
      refuse to start (exit 78) with an actionable list of valid ≥64k models,
      instead of letting Hermes throw a raw stacktrace at load.
-   - **Launch-provider resolution.** Find which generated provider lists the
-     launch model and point the top-level `model:` block at it
-     (`custom:alcf-sophia`, `custom:alcf-sophia-reasoning`, …), so the very first
-     turn inherits the correct per-model output cap.
+   - **Launch-provider resolution.** Find the one generated provider on the
+     launch endpoint that lists the launch model and point the top-level
+     `model:` block at it (`custom:alcf-sophia`, `custom:alcf-sophia-reasoning`,
+     …), so the very first turn inherits the correct per-model output cap. If
+     no provider (or more than one) lists it, refuse to start (exit 78) with the
+     list of valid models. The delegation model is resolved the same way across
+     all generated providers. (See **Choosing the launch and delegation models**
+     below.)
    - **Splice + substitute** the providers block into the template and write the
      final config.
 4. **Model availability banner** (`populate_models.py --status-report`, unless
@@ -525,8 +530,11 @@ Three behaviors are worth knowing:
    gateway's `reasoning_parser` field, plus an id heuristic for models served
    without either) and puts them in the `-reasoning` provider with a larger
    per-response cap — `ALCF_REASONING_MAX_TOKENS` (default **12288**) vs.
-   `ALCF_MAX_TOKENS` (default **2048**) for plain chat. The launch model is
-   automatically pointed at whichever provider matches its class, so the first
+   `ALCF_MAX_TOKENS` (default **2048**) for plain chat. Hermes v0.23.2 ignores a
+   bare `max_tokens` key on a provider entry, so each generated provider carries
+   its cap as `extra_body.max_tokens`, which Hermes sends with every request to
+   that provider's models (at launch and after a `/model` switch). The launch
+   model is automatically pointed at the provider that lists it, so the first
    turn already gets the right cap.
 
 3. **LIVE vs. QUEUED vs. OFFLINE (the HTTP 503 you might see).** All models share
@@ -546,6 +554,23 @@ Three behaviors are worth knowing:
    ~10–15 min and then works — that looks like a failure but isn't. A whole
    cluster can also be down, in which case *every* model on it shows OFFLINE.
    Suppress the banner with `-e ALCF_SHOW_MODEL_STATUS=0`.
+
+### Choosing the launch and delegation models
+
+`ALCF_MODEL` (the launch model) and `ALCF_DELEGATION_MODEL` (the `delegate_task`
+subagent model) must each map to **exactly one** generated provider:
+
+- the **launch** model must be listed by exactly one provider on the launch
+  endpoint (the `ALCF_CLUSTER` base URL);
+- the **delegation** model must be listed by exactly one provider across all
+  generated providers, so a model served on more than one cluster (e.g.
+  `gpt-oss-120b`, on both Metis and Minerva) is ambiguous and is refused. If
+  `ALCF_DELEGATION_MODEL` is unset or equals the launch model, subagents simply
+  reuse the launch provider.
+
+Otherwise startup **refuses with exit 78** and prints the valid model ids. This
+replaces the old behavior of silently falling back to `custom:alcf-sophia` when
+a model wasn't in the generated list.
 
 If the live catalog is unreachable at startup, the generator falls back to a
 committed static list in `config/config.template.yaml`, so the container always

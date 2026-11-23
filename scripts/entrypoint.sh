@@ -337,7 +337,7 @@ GPYEOF
   # grep of the INSTALLED Hermes source: if this base image predates the
   # feature, we skip the block (with a log line) instead of risking an unknown
   # config key at dashboard startup. Same fail-open philosophy as the rest of
-  # this script, and the same grep-gate pattern the Dockerfile patch layer uses.
+  # this script.
   local extra_block=""
 
   # (a) delegation: route delegate_task subagents. Subagents get their own
@@ -357,10 +357,12 @@ GPYEOF
       # mapping — the provider block quotes model ids, so membership is
       # checked against the manifest, not by grepping the YAML block).
       # A delegation model not in that mapping has NO valid provider in
-      # generic mode, and the ALCF path below (populate_models.py with
-      # $token, plus the custom:alcf-sophia fallback) would leak the generic
-      # INFERENCE_TOKEN to the ALCF gateway and route subagents to a provider
-      # that does not exist in this config. Fail closed instead.
+      # generic mode, and routing subagents through the ALCF resolution
+      # below would point them at a provider that does not exist in this
+      # config (historically that path also passed the token to
+      # populate_models.py and fell back to custom:alcf-sophia, which would
+      # have leaked the generic INFERENCE_TOKEN to the ALCF gateway). Fail
+      # closed instead.
       if ! "$PY" -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1], encoding="utf-8"))["enabled_models"] else 1)' \
              "$gmanifest" "$delegation_model"; then
         err "======================================================================"
