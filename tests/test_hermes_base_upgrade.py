@@ -834,20 +834,41 @@ class LaunchProviderContract(unittest.TestCase):
 # Offline stand-in for /opt/alcf/populate_models.py inside the bounded
 # entrypoint: runs the REAL module with every catalog/token fetcher disabled (so
 # it emits its committed static fallback), optionally over a test cluster list.
+# ALCF_TEST_LIVE=c1,c2 makes those clusters "discovered LIVE" instead: the real
+# _resolve_cluster sees a successful (offline) fetch whose selection is the
+# cluster's fallback mapping, so the block is identical but the source is live.
+# ALCF_TEST_FORCE_LAUNCH_CONTEXT overrides the launch context the entrypoint
+# passes, to reach the sub-floor injection refusal past the earlier floor guard.
 OFFLINE_POPULATE = textwrap.dedent('''\
     import importlib.util, json, os, sys
     spec = importlib.util.spec_from_file_location("populate_models_real", {real!r})
     pm = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pm)
+    live = set(filter(None, os.environ.get("ALCF_TEST_LIVE", "").split(",")))
     def _offline(*_a, **_k):
         raise RuntimeError("offline contract test")
-    pm._get_token = pm._fetch_models = _offline
-    if os.environ.get("ALCF_TEST_CLUSTERS"):
-        _cl = [(c, p, b, None, {{m: tuple(v) for m, v in fb.items()}})
-               for c, p, b, fb in json.loads(os.environ["ALCF_TEST_CLUSTERS"])]
-        pm._clusters = lambda include_metis=True, include_minerva=True: _cl
+    def _fetch(cluster, _token):
+        if cluster in live:
+            return []
+        raise RuntimeError("offline contract test")
+    pm._get_token = (lambda: "fake-catalog-token") if live else _offline
+    pm._fetch_models = _fetch
+    _real_clusters = pm._clusters
+    def _clusters(include_metis=True, include_minerva=True):
+        if os.environ.get("ALCF_TEST_CLUSTERS"):
+            out = [(c, p, b, None, {{m: tuple(v) for m, v in fb.items()}})
+                   for c, p, b, fb in json.loads(os.environ["ALCF_TEST_CLUSTERS"])]
+        else:
+            out = _real_clusters(include_metis=include_metis, include_minerva=include_minerva)
+        return [(c, p, b, (lambda _models, fb=fb: dict(fb)) if c in live else sel, fb)
+                for c, p, b, sel, fb in out]
+    pm._clusters = _clusters
+    if os.environ.get("ALCF_TEST_FORCE_LAUNCH_CONTEXT"):
+        os.environ["ALCF_LAUNCH_CONTEXT"] = os.environ["ALCF_TEST_FORCE_LAUNCH_CONTEXT"]
     sys.exit(pm.main())
     ''')
+CRASHING_POPULATE = "import sys\nsys.exit(1)\n"
+ALL_LIVE = "sophia,metis,minerva"
 
 STUB_CTXLEN = 'import os\nprint(os.environ.get("TEST_CTXLEN", "128000"))\n'
 ALCF_TOKEN_IN_HARNESS = "test-alcf-token"  # what the harness's fake alcf-tokens prints
@@ -877,6 +898,10 @@ class AlcfEntrypointMixin:
 
     def config(self) -> dict:
         return yaml.safe_load((self.harness.home / "config.yaml").read_text(encoding="utf-8"))
+
+    def startup_log(self) -> str:
+        path = self.harness.home / "startup.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def assert_refused(self, res):
         self.assertEqual(res.returncode, 78, res.stderr)
@@ -934,9 +959,13 @@ class EntrypointLaunchProviderContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertEqual(self.config()["model"]["provider"], "custom:alcf-metis-reasoning")
 
     def test_unlisted_model_fails_closed(self):
-        res = self.run_alcf(ALCF_MODEL="not-a-served/model")
+        # With a LIVE catalog an absent model is really not served (or was
+        # excluded), so there is nothing to inject: refuse. (The static-fallback
+        # case is EntrypointCatalogOutageContract.)
+        res = self.run_alcf(ALCF_MODEL="not-a-served/model", ALCF_TEST_LIVE=ALL_LIVE)
         self.assert_refused(res)
         self.assertIn("not-a-served/model", res.stderr)
+        self.assertNotIn("catalog unavailable", res.stderr)
         self.assertEqual(self.printed_valid_list(res.stderr), sorted(pm.SOPHIA_FALLBACK))
 
     def test_model_in_two_providers_on_the_endpoint_fails_closed(self):
@@ -959,6 +988,198 @@ class EntrypointLaunchProviderContract(AlcfEntrypointMixin, unittest.TestCase):
         res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL="gpt-oss-120b")
         self.assert_refused(res)
         self.assertIn("gpt-oss-120b", res.stderr)
+
+
+class EntrypointLaunchClusterContract(AlcfEntrypointMixin, unittest.TestCase):
+    """B4b-I1: the launch cluster's providers are always generated, even when its
+    ALCF_ENABLE_<CLUSTER> flag is 0 (the flag only trims the OTHER clusters)."""
+
+    def test_disabled_launch_cluster_is_still_generated(self):
+        res = self.run_alcf(ALCF_CLUSTER="metis", ALCF_ENABLE_METIS="0", ALCF_MODEL="gemma-4-31B-it")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cfg = self.config()
+        self.assertEqual(cfg["model"]["provider"], "custom:alcf-metis-reasoning")
+        self.assertIn("gemma-4-31B-it", cfg["providers"]["alcf-metis-reasoning"]["models"])
+        overrides = [ln for ln in self.startup_log().splitlines()
+                     if "ALCF_ENABLE_METIS=0" in ln and "launch cluster" in ln]
+        self.assertEqual(len(overrides), 1, self.startup_log())
+
+    def test_disabled_launch_cluster_is_generated_when_discovered_live(self):
+        res = self.run_alcf(ALCF_CLUSTER="metis", ALCF_ENABLE_METIS="0", ALCF_MODEL="gpt-oss-120b",
+                            ALCF_TEST_LIVE=ALL_LIVE)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["model"]["provider"], "custom:alcf-metis-reasoning")
+
+    def test_disabled_non_launch_cluster_is_still_dropped(self):
+        res = self.run_alcf(ALCF_CLUSTER="sophia", ALCF_ENABLE_METIS="0",
+                            ALCF_MODEL="google/gemma-4-31B-it")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse([k for k in self.config()["providers"] if k.startswith("alcf-metis")])
+        self.assertNotIn("launch cluster", self.startup_log())
+
+
+class EntrypointCatalogOutageContract(AlcfEntrypointMixin, unittest.TestCase):
+    """B4b-I2: a launch model absent from the generated block.
+
+    - launch cluster discovered LIVE  -> exit 78 (EntrypointLaunchProviderContract
+      .test_unlisted_model_fails_closed);
+    - launch cluster on STATIC FALLBACK -> the launch model is injected into the
+      launch cluster's plain or -reasoning provider with the resolved launch
+      context (only if >= the 64k floor), with a loud outage notice;
+    - otherwise exit 78 with a distinct "catalog unavailable" message.
+    """
+
+    def assert_outage_notice(self, res, model):
+        notice = [ln for ln in res.stderr.splitlines() if "catalog" in ln.lower() and model in ln]
+        self.assertTrue(notice, f"no outage notice naming {model} on stderr:\n{res.stderr}")
+        self.assertIn(model, self.startup_log())
+
+    def test_fallback_injects_plain_launch_model(self):
+        model = "acme/new-chat-model"
+        res = self.run_alcf(ALCF_MODEL=model, TEST_CTXLEN="200000")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cfg = self.config()
+        self.assertEqual(cfg["model"]["provider"], "custom:alcf-sophia")
+        self.assertEqual(cfg["providers"]["alcf-sophia"]["models"][model], {"context_length": 200000})
+        self.assertEqual(cfg["providers"]["alcf-sophia"]["api"], pm.SOPHIA_BASE)
+        self.assert_outage_notice(res, model)
+
+    def test_fallback_injects_reasoning_launch_model_on_the_launch_cluster(self):
+        model = "gpt-oss-999b"
+        res = self.run_alcf(ALCF_CLUSTER="metis", ALCF_MODEL=model, TEST_CTXLEN="131072")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cfg = self.config()
+        self.assertEqual(cfg["model"]["provider"], "custom:alcf-metis-reasoning")
+        self.assertEqual(cfg["providers"]["alcf-metis-reasoning"]["models"][model],
+                         {"context_length": 131072})
+        for key, entry in cfg["providers"].items():
+            if not key.startswith("alcf-metis"):
+                self.assertNotIn(model, entry["models"], f"injected into non-launch cluster {key}")
+        self.assert_outage_notice(res, model)
+
+    def test_fallback_model_already_listed_is_not_injected_or_announced(self):
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cfg = self.config()
+        self.assertEqual(cfg["providers"]["alcf-sophia-reasoning"]["models"]["google/gemma-4-31B-it"],
+                         {"context_length": pm.SOPHIA_FALLBACK["google/gemma-4-31B-it"][0]})
+        self.assertNotIn("catalog unavailable", res.stderr)
+
+    def test_fallback_sub_floor_launch_context_refuses_distinctly(self):
+        model = "acme/new-chat-model"
+        res = self.run_alcf(ALCF_MODEL=model, ALCF_TEST_FORCE_LAUNCH_CONTEXT="32768")
+        self.assert_refused(res)
+        self.assertIn("catalog unavailable", res.stderr)
+        self.assertIn(f"'{model}' is not in the static fallback list", res.stderr)
+        self.assertEqual(self.printed_valid_list(res.stderr), sorted(pm.SOPHIA_FALLBACK))
+
+    def test_generation_failure_refuses_distinctly_for_unlisted_model(self):
+        (self.harness.alcf_dir / "populate_models.py").write_text(CRASHING_POPULATE, encoding="utf-8")
+        model = "acme/new-chat-model"
+        res = self.run_alcf(ALCF_MODEL=model)
+        self.assert_refused(res)
+        self.assertIn(f"'{model}' is not in the static fallback list", res.stderr)
+
+    def test_live_catalog_never_injects(self):
+        res = self.run_alcf(ALCF_MODEL="acme/new-chat-model", ALCF_TEST_LIVE=ALL_LIVE,
+                            TEST_CTXLEN="200000")
+        self.assert_refused(res)
+        self.assertNotIn("catalog unavailable", res.stderr)
+        self.assertIn("does not map to exactly", res.stderr)
+
+
+class PopulateLaunchClusterContract(unittest.TestCase):
+    """populate_models side of B4b-I1/I2, driven through build_block() offline.
+
+    Inputs: ALCF_LAUNCH_CLUSTER / ALCF_LAUNCH_MODEL / ALCF_LAUNCH_CONTEXT. The
+    launch cluster's source is reported to ALCF_LAUNCH_SOURCE_FILE as one of
+    live | fallback | fallback-injected | fallback-missing.
+    """
+
+    CLUSTERS = [("x", "alcf-x", "https://h/x/v1", None, {"chatty": (128000, False)}),
+                ("y", "alcf-y", "https://h/y/v1", None, {"thinky": (131072, True)})]
+
+    def build(self, *, live=(), **env):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        source = Path(tmp.name) / "launch-source"
+        clusters = [(c, p, b, (lambda _m, fb=fb: dict(fb)) if c in live else None, fb)
+                    for c, p, b, _s, fb in self.CLUSTERS]
+
+        def fetch(cluster, _token):
+            if cluster in live:
+                return []
+            raise RuntimeError("offline test")
+
+        full_env = {"ALCF_LAUNCH_SOURCE_FILE": str(source), **env}
+        with mock.patch.dict(os.environ, full_env), \
+                mock.patch.object(pm, "_get_token", return_value="fake-catalog-token"), \
+                mock.patch.object(pm, "_fetch_models", side_effect=fetch), \
+                mock.patch.object(pm, "_clusters", return_value=clusters), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            block = pm.build_block()
+        state = source.read_text(encoding="utf-8").strip() if source.exists() else None
+        return yaml.safe_load(block)["providers"], state, err.getvalue()
+
+    def test_fallback_injects_absent_launch_model_by_reasoning_class(self):
+        for model, key in (("acme/plain", "alcf-y"), ("acme/gpt-oss-x", "alcf-y-reasoning")):
+            with self.subTest(model=model):
+                providers, state, err = self.build(ALCF_LAUNCH_CLUSTER="y", ALCF_LAUNCH_MODEL=model,
+                                                   ALCF_LAUNCH_CONTEXT="100000")
+                self.assertEqual(providers[key]["models"][model], {"context_length": 100000})
+                self.assertEqual(state, "fallback-injected")
+                self.assertIn(model, err)
+                self.assertNotIn(model, providers["alcf-x"]["models"])
+
+    def test_live_launch_cluster_never_injects(self):
+        providers, state, _err = self.build(live=("x", "y"), ALCF_LAUNCH_CLUSTER="y",
+                                            ALCF_LAUNCH_MODEL="acme/plain", ALCF_LAUNCH_CONTEXT="100000")
+        self.assertNotIn("alcf-y", providers)
+        self.assertEqual(state, "live")
+
+    def test_fallback_with_sub_floor_or_unknown_context_does_not_inject(self):
+        for ctx in (str(pm.MIN_CONTEXT - 1), "", "not-a-number", "0"):
+            with self.subTest(ctx=ctx):
+                providers, state, _err = self.build(ALCF_LAUNCH_CLUSTER="y", ALCF_LAUNCH_MODEL="acme/plain",
+                                                    ALCF_LAUNCH_CONTEXT=ctx)
+                self.assertNotIn("alcf-y", providers)
+                self.assertEqual(state, "fallback-missing")
+
+    def test_fallback_with_listed_model_reports_plain_fallback(self):
+        providers, state, _err = self.build(ALCF_LAUNCH_CLUSTER="y", ALCF_LAUNCH_MODEL="thinky",
+                                            ALCF_LAUNCH_CONTEXT="100000")
+        self.assertEqual(providers["alcf-y-reasoning"]["models"]["thinky"], {"context_length": 131072})
+        self.assertEqual(state, "fallback")
+
+    def test_without_launch_inputs_nothing_changes(self):
+        providers, state, _err = self.build()
+        self.assertEqual(set(providers), {"alcf-x", "alcf-y-reasoning"})
+        self.assertIsNone(state)
+
+    def test_disabled_launch_cluster_is_included_with_a_diagnostic(self):
+        calls = []
+        real = pm._clusters
+
+        def spy(include_metis=True, include_minerva=True):
+            calls.append((include_metis, include_minerva))
+            return real(include_metis=include_metis, include_minerva=include_minerva)
+
+        for launch, flags, want in (("metis", (False, False), (True, False)),
+                                    ("minerva", (False, False), (False, True)),
+                                    ("sophia", (False, False), (False, False))):
+            with self.subTest(launch=launch):
+                calls.clear()
+                with mock.patch.dict(os.environ, {"ALCF_LAUNCH_CLUSTER": launch}), \
+                        mock.patch.object(pm, "_get_token", side_effect=RuntimeError("offline test")), \
+                        mock.patch.object(pm, "_clusters", side_effect=spy), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    block = pm.build_block(include_metis=flags[0], include_minerva=flags[1])
+                self.assertEqual(calls, [want])
+                names = set(yaml.safe_load(block)["providers"])
+                self.assertEqual(any(n.startswith("alcf-metis") for n in names), want[0])
+                self.assertEqual(any(n.startswith("alcf-minerva") for n in names), want[1])
+                overridden = launch in ("metis", "minerva")
+                self.assertEqual("launch cluster" in err.getvalue(), overridden, err.getvalue())
 
 
 class GenericRenderMixin:
