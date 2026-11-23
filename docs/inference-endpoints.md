@@ -119,13 +119,14 @@ Once authenticated, you can make a test call using cURL or Python.
 
 ### Available Clusters
 
-Three clusters are currently active, with additional systems coming soon:
+Four clusters are currently active, with additional systems coming soon:
 
 | Cluster | Status | Framework | Base URL | Supported Endpoints |
 |---------|--------|-----------|----------|---------------------|
 | **[NVIDIA A100 (Sophia)](https://docs.alcf.anl.gov/sophia/getting-started/)** | Active | vLLM | `/resource_server/sophia/vllm/v1` | `/chat/completions`<br>`/responses`<br>`/messages`<br>`/completions`<br>`/embeddings`<br>`/batches` |
 | **[SambaNova SN40L (Metis)](https://docs.alcf.anl.gov/ai-testbed/sn40l_inference/)** | Active | SambaNova API | `/resource_server/metis/api/v1` | `/chat/completions` |
 | **[NVIDIA B200 (Minerva)](https://www.alcf.anl.gov/minerva)** | Active | API | `/resource_server/minerva/api/v1` | `/chat/completions`<br>`/responses`<br>`/messages`<br>`/completions` |
+| **Tara** | Active | API | `/resource_server/tara/api/v1` | `/chat/completions`<br>`/responses`<br>`/messages` |
 
 
 !!! tip "Discovering Available Models"
@@ -745,6 +746,25 @@ Models are organized by cluster and marked with the following capabilities:
 
     - nemotron-3-ultra^H^
     - inkling-bf16^H^
+
+### Tara Cluster
+
+??? "Chat Language Models"
+
+    - google/gemma-4-31B-it-262k^RT^
+    - muse-spark-bf16^RT^
+    - mistral-large-4^RT^
+    - nemotron-3-ultra^RT^
+    - nemotron-35-super-vl^RT^
+    - openai/gpt-oss-120b^RT^
+    - openai/gpt-oss-20b^RT^
+    - beam-1.0-fp8^RT^
+    - inkling-bf16^RT^
+
+    !!! note "Tara models are not always hot"
+        No Tara model is kept always hot, so the first request after a quiet
+        period may wait for a cold start. (Added by hand from the ALCF
+        Available Models page of 2026-11-23, ahead of the next docs refresh.)
 
 ### Model Serving Configuration
 

@@ -87,6 +87,13 @@ Model ids are **HuggingFace-style**: `openai/gpt-oss-120b`, `openai/gpt-oss-20b`
 `google/gemma-4-31B-it`, `meta-llama/Meta-Llama-3.1-8B-Instruct`, `argonne/AuroraGPT-*`,
 embeddings `Salesforce/SFR-Embedding-Mistral`. Discover the live set via `list-endpoints`.
 
+Other clusters use `.../resource_server/<cluster>/api/v1/chat/completions` (metis,
+minerva, tara). **Tara** (`/resource_server/tara/api/v1`) hosts this agent's default
+model `muse-spark-bf16` (1M context, reasoning), plus `mistral-large-4`,
+`nemotron-3-ultra`, `inkling-bf16`, `openai/gpt-oss-120b` and others. Tara models
+are **not always hot**: the first request after a quiet period may get HTTP 503
+while the model loads — wait and retry rather than switching models.
+
 ## PITFALL: gpt-oss reasoning models eat the max_tokens budget
 
 `openai/gpt-oss-120b` / `gpt-oss-20b` are **reasoning models**. The visible answer is in

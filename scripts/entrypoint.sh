@@ -75,11 +75,19 @@ printf 'ALCF Agent in a Box\nalcf-agent-box commit: %s\nbuilt: %s\nhermes: %s\nr
   "$_alcf_sha" "$_alcf_date" "${_hermes_sha:-unknown}" > "${HERMES_HOME:-/opt/data}/ALCF_VERSION.txt" 2>/dev/null || true
 
 # --- 1. Resolve inference base_url ------------------------------------------
-case "${ALCF_CLUSTER:-sophia}" in
-  sophia) ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1" ;;
-  metis)  ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/metis/api/v1" ;;
-  *) err "Unknown ALCF_CLUSTER='$ALCF_CLUSTER' (expected sophia|metis)"; exit 1 ;;
+# Default launch: Muse Spark on Tara. ALCF_MODEL unset on another cluster keeps
+# that cluster's previous default (google/gemma-4-31B-it).
+ALCF_CLUSTER="${ALCF_CLUSTER:-tara}"
+case "$ALCF_CLUSTER" in
+  tara)    ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/tara/api/v1"
+           ALCF_MODEL="${ALCF_MODEL:-muse-spark-bf16}" ;;
+  sophia)  ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1" ;;
+  metis)   ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/metis/api/v1" ;;
+  minerva) ALCF_BASE_URL="https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1" ;;
+  *) err "Unknown ALCF_CLUSTER='$ALCF_CLUSTER' (expected sophia|metis|minerva|tara)"
+     exit 78 ;;   # EX_CONFIG
 esac
+ALCF_MODEL="${ALCF_MODEL:-google/gemma-4-31B-it}"
 export ALCF_BASE_URL
 
 STARTUP_LOG="$HERMES_HOME/startup.log"
@@ -256,18 +264,19 @@ GPYEOF
   # $ALCF_CONTEXT_LENGTH / 128000 if the lookup fails. Never fatal.
   ctxlen="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
             "$PY" "$ALCF_DIR/resolve_context_length.py" \
-            "$ALCF_BASE_URL" "${ALCF_MODEL:-google/gemma-4-31B-it}" 2>>"$CTXLEN_LOG")"
+            "$ALCF_BASE_URL" "$ALCF_MODEL" 2>>"$CTXLEN_LOG")"
   # Guard: if the resolver printed nothing usable, hard-default here too.
   case "$ctxlen" in ''|*[!0-9]*) ctxlen=128000 ;; esac
   diag "Model context window: $ctxlen tokens (from max_model_len; see $CTXLEN_LOG)"
 
   # Generate the switchable-model `providers:` block from the LIVE ALCF
-  # catalog on every serving cluster (sophia + metis + minerva). populate_models.py
-  # filters to chat models and assigns each its real serving context window; it
-  # always prints a valid block (committed static fallback on any discovery
-  # failure), so this is never fatal. ALCF_ENABLE_METIS=0 / ALCF_ENABLE_MINERVA=0
-  # drop those providers -- except the LAUNCH cluster's, which is always kept so
-  # the launch model can resolve on its own endpoint.
+  # catalog on every serving cluster (sophia + metis + minerva + tara).
+  # populate_models.py filters to chat models and assigns each its real serving
+  # context window; it always prints a valid block (committed static fallback on
+  # any discovery failure), so this is never fatal. ALCF_ENABLE_METIS=0 /
+  # ALCF_ENABLE_MINERVA=0 / ALCF_ENABLE_TARA=0 drop those providers -- except the
+  # LAUNCH cluster's, which is always kept so the launch model can resolve on its
+  # own endpoint.
   #
   # Catalog outage: if the launch cluster fell back to its static list and that
   # list lacks the launch model, populate_models.py adds the model (with the
@@ -275,19 +284,21 @@ GPYEOF
   # serves still starts. It reports the launch cluster's state (live | fallback
   # | fallback-injected | fallback-missing) in $LAUNCH_SOURCE_FILE (empty when
   # the launch cluster is not in the block); any other content refuses below.
-  local launch_source
+  local launch_source enable_var
   (umask 077 && : > "$LAUNCH_SOURCE_FILE")
-  case "${ALCF_CLUSTER:-sophia}" in
-    metis)
-      if [ "${ALCF_ENABLE_METIS:-1}" = "0" ]; then
-        diag "ALCF_ENABLE_METIS=0 ignored for the launch cluster metis (its providers are always generated)"
+  case "$ALCF_CLUSTER" in
+    metis|minerva|tara)
+      enable_var="ALCF_ENABLE_$(printf '%s' "$ALCF_CLUSTER" | tr '[:lower:]' '[:upper:]')"
+      if [ "${!enable_var:-1}" = "0" ]; then
+        diag "$enable_var=0 ignored for the launch cluster $ALCF_CLUSTER (its providers are always generated)"
       fi ;;
   esac
   providers_block="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
             ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
             ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
-            ALCF_LAUNCH_CLUSTER="${ALCF_CLUSTER:-sophia}" \
-            ALCF_LAUNCH_MODEL="${ALCF_MODEL:-google/gemma-4-31B-it}" \
+            ALCF_ENABLE_TARA="${ALCF_ENABLE_TARA:-1}" \
+            ALCF_LAUNCH_CLUSTER="$ALCF_CLUSTER" \
+            ALCF_LAUNCH_MODEL="$ALCF_MODEL" \
             ALCF_LAUNCH_CONTEXT="$ctxlen" \
             ALCF_LAUNCH_SOURCE_FILE="$LAUNCH_SOURCE_FILE" \
             ALCF_MAX_TOKENS="${ALCF_MAX_TOKENS:-2048}" \
@@ -312,9 +323,9 @@ GPYEOF
        err "populate_models produced no block; keeping static fallback list" ;;
   esac
   if [ "$launch_source" = "fallback-injected" ]; then
-    err "ALCF model catalog unavailable for ${ALCF_CLUSTER:-sophia}: using the static fallback list,"
-    err "with launch model '${ALCF_MODEL:-google/gemma-4-31B-it}' added to it (context $ctxlen; not verified against the catalog)."
-    diag "Catalog outage on ${ALCF_CLUSTER:-sophia}: launch model '${ALCF_MODEL:-google/gemma-4-31B-it}' injected into the static fallback list (context $ctxlen)"
+    err "ALCF model catalog unavailable for $ALCF_CLUSTER: using the static fallback list,"
+    err "with launch model '$ALCF_MODEL' added to it (context $ctxlen; not verified against the catalog)."
+    diag "Catalog outage on $ALCF_CLUSTER: launch model '$ALCF_MODEL' injected into the static fallback list (context $ctxlen)"
   fi
 
   # --- Launch-model context floor guard ------------------------------------
@@ -337,7 +348,7 @@ GPYEOF
   #     always useful. No step here can abort the launch except the intentional
   #     `exit 78`s.
   local floor=64000 launch_model valid_list launch_provider block_for_scan
-  launch_model="${ALCF_MODEL:-google/gemma-4-31B-it}"
+  launch_model="$ALCF_MODEL"
   # The block that will be written (single source of truth); else the
   # template's static fallback, which the splice step keeps in that case.
   if [ -n "$providers_block" ]; then
@@ -601,7 +612,7 @@ render_config
 if [[ "$GENERIC_MODE" == "1" ]]; then
   diag "Config rendered -> $CONFIG_OUT (mode 0600; generic endpoint from INFERENCE_URL, model '$INFERENCE_MODEL')"
 else
-  diag "Config rendered -> $CONFIG_OUT (mode 0600; cluster=$ALCF_CLUSTER model=${ALCF_MODEL:-google/gemma-4-31B-it})"
+  diag "Config rendered -> $CONFIG_OUT (mode 0600; cluster=$ALCF_CLUSTER model=$ALCF_MODEL)"
 fi
 
 # SECRET HYGIENE (generic mode): INFERENCE_TOKEN arrived in the container
@@ -635,6 +646,8 @@ if [ "$GENERIC_MODE" == "0" ] && [ "${ALCF_SHOW_MODEL_STATUS:-1}" != "0" ]; then
   ALCF_INFER_TOKEN="$("$ALCF_TOKENS" get-token inference 2>/dev/null || true)" ALCF_PY="$PY" \
     ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
     ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
+    ALCF_ENABLE_TARA="${ALCF_ENABLE_TARA:-1}" \
+    ALCF_LAUNCH_CLUSTER="$ALCF_CLUSTER" \
     "$PY" "$ALCF_DIR/populate_models.py" --status-report 2>>"$POPULATE_LOG" \
   | while IFS= read -r line; do diag "$line"; done || true
 fi

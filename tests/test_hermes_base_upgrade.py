@@ -321,6 +321,44 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
         except Exception:
             fail(stage)
 
+    # The main agent loop's request with agent.reasoning_effort UNSET, built the
+    # way chat_completion_helpers._build_chat_completions_kwargs does for a
+    # provider with a registered profile: reasoning_config is
+    # reasoning_params.unset_reasoning_default(agent) (_reasoning_config_for_wire)
+    # and the profile shapes the reasoning fields. supports_reasoning=False is
+    # what _supports_reasoning_extra_body() gives a non-OpenRouter/Nous host;
+    # CustomProfile ignores it either way.
+    def _agent_wire(out, model, rt, stage):
+        try:
+            from agent.reasoning_params import unset_reasoning_default
+            from providers import get_provider_profile
+
+            class _Agent:
+                api_mode = rt.get("api_mode")
+                provider = rt.get("provider")
+                _ollama_num_ctx = None
+            _Agent.model = model
+            default = unset_reasoning_default(_Agent())
+            profile = get_provider_profile(rt.get("provider"))
+            kwargs = transport.build_kwargs(
+                model, [{"role": "user", "content": "hi"}],
+                base_url=rt.get("base_url"), provider_profile=profile,
+                reasoning_config=default, supports_reasoning=False,
+                request_overrides=rt.get("request_overrides"))
+            seen.clear()
+            client = openai.OpenAI(api_key="fake-key", base_url=rt.get("base_url") or "http://x/v1",
+                                   http_client=httpx.Client(transport=httpx.MockTransport(_handler)))
+            client.chat.completions.create(**kwargs)
+            body = seen[-1]
+            out["agent_path"] = {
+                "profile": type(profile).__name__ if profile is not None else None,
+                "unset_reasoning_default": default,
+                "wire_max_tokens": body.get("max_tokens"),
+                "wire_reasoning_effort": body.get("reasoning_effort"),
+                "wire_keys": sorted(body)}
+        except Exception:
+            fail(stage)
+
     for check in checks:
         name, model = check["provider"], check["model"]
         out = ev["providers"][name] = {}
@@ -337,6 +375,8 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
         out["request_overrides"] = rt.get("request_overrides")
         _wire(out, model, rt.get("base_url"), rt.get("provider"),
               rt.get("request_overrides"), f"build_request[{name}]")
+        if check.get("agent_path"):
+            _agent_wire(out, model, rt, f"agent_request[{name}]")
 
     # In-session /model switch through upstream's ONE shared pipeline
     # (hermes_cli.model_switch.switch_model, used by the CLI, gateway and ACP),
@@ -1209,12 +1249,13 @@ OFFLINE_POPULATE = textwrap.dedent('''\
     pm._get_token = (lambda: "fake-catalog-token") if live else _offline
     pm._fetch_models = _fetch
     _real_clusters = pm._clusters
-    def _clusters(include_metis=True, include_minerva=True):
+    def _clusters(include_metis=True, include_minerva=True, include_tara=True):
         if os.environ.get("ALCF_TEST_CLUSTERS"):
             out = [(c, p, b, None, {{m: tuple(v) for m, v in fb.items()}})
                    for c, p, b, fb in json.loads(os.environ["ALCF_TEST_CLUSTERS"])]
         else:
-            out = _real_clusters(include_metis=include_metis, include_minerva=include_minerva)
+            out = _real_clusters(include_metis=include_metis, include_minerva=include_minerva,
+                                 include_tara=include_tara)
         return [(c, p, b, (lambda _models, fb=fb: dict(fb)) if c in live else sel, fb)
                 for c, p, b, sel, fb in out]
     pm._clusters = _clusters
@@ -1228,7 +1269,7 @@ OFFLINE_POPULATE = textwrap.dedent('''\
     sys.exit(rc)
     ''')
 CRASHING_POPULATE = "import sys\nsys.exit(1)\n"
-ALL_LIVE = "sophia,metis,minerva"
+ALL_LIVE = "sophia,metis,minerva,tara"
 
 STUB_CTXLEN = 'import os\nprint(os.environ.get("TEST_CTXLEN", "128000"))\n'
 ALCF_TOKEN_IN_HARNESS = "test-alcf-token"  # what the harness's fake alcf-tokens prints
@@ -1338,19 +1379,24 @@ class EntrypointLaunchProviderContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertIn("alcf-shadow-reasoning", res.stderr)
 
     def test_delegation_model_resolves_to_exactly_one_provider(self):
-        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL="inkling-bf16")
+        # muse-spark-bf16 is listed only by alcf-tara-reasoning (not on sophia).
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it",
+                            ALCF_DELEGATION_MODEL="muse-spark-bf16")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(self.config()["delegation"],
-                         {"provider": "custom:alcf-minerva-reasoning", "model": "inkling-bf16"})
+                         {"provider": "custom:alcf-tara-reasoning", "model": "muse-spark-bf16"})
 
     def test_ambiguous_delegation_model_fails_closed(self):
-        # gpt-oss-120b is listed by alcf-metis-reasoning AND alcf-minerva-reasoning,
-        # neither of which is on the sophia launch endpoint.
-        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL="gpt-oss-120b")
-        self.assert_refused(res)
-        self.assertIn("gpt-oss-120b", res.stderr)
-        self.assertIn("alcf-metis-reasoning", res.stderr)
-        self.assertIn("alcf-minerva-reasoning", res.stderr)
+        # Each is listed by two providers, neither on the sophia launch endpoint:
+        # gpt-oss-120b by metis + minerva, inkling-bf16 by minerva + tara.
+        for model, providers in (("gpt-oss-120b", ("alcf-metis-reasoning", "alcf-minerva-reasoning")),
+                                 ("inkling-bf16", ("alcf-minerva-reasoning", "alcf-tara-reasoning"))):
+            with self.subTest(model=model):
+                res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL=model)
+                self.assert_refused(res)
+                self.assertIn(model, res.stderr)
+                for name in providers:
+                    self.assertIn(name, res.stderr)
 
 
 class EntrypointDelegationContract(AlcfEntrypointMixin, unittest.TestCase):
@@ -1434,6 +1480,87 @@ class EntrypointLaunchClusterContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse([k for k in self.config()["providers"] if k.startswith("alcf-metis")])
         self.assertNotIn("launch cluster", self.startup_log())
+
+
+class EntrypointClusterContract(AlcfEntrypointMixin, unittest.TestCase):
+    """T1: all four serving clusters are launchable; Tara + muse-spark-bf16 is
+    the default launch; an unknown cluster refuses with EX_CONFIG."""
+
+    def test_default_launch_is_muse_spark_on_tara(self):
+        # ALCF_CLUSTER / ALCF_MODEL unset (empty) -> the built-in defaults.
+        res = self.run_alcf(ALCF_CLUSTER="", ALCF_MODEL="")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        model = self.config()["model"]
+        self.assertEqual(model["provider"], "custom:alcf-tara-reasoning")
+        self.assertEqual(model["model"], "muse-spark-bf16")
+        self.assertEqual(model["base_url"], pm.TARA_BASE)
+        self.assertEqual(self.config()["providers"]["alcf-tara-reasoning"]["extra_body"],
+                         {"max_tokens": pm.REASONING_MAX_TOKENS})
+
+    def test_dockerfile_defaults_to_muse_spark_on_tara(self):
+        env = " ".join(i for i in dockerfile_instructions() if i.startswith("ENV ")).split()
+        self.assertIn("ALCF_CLUSTER=tara", env)
+        self.assertIn("ALCF_MODEL=muse-spark-bf16", env)
+        self.assertFalse([t for t in env if t.startswith(("ALCF_CLUSTER=", "ALCF_MODEL="))
+                          and t not in ("ALCF_CLUSTER=tara", "ALCF_MODEL=muse-spark-bf16")])
+
+    def test_tara_and_minerva_resolve_their_endpoints(self):
+        for cluster, model, base, provider in (
+                ("tara", "muse-spark-bf16", pm.TARA_BASE, "custom:alcf-tara-reasoning"),
+                ("minerva", "inkling-bf16", pm.MINERVA_BASE, "custom:alcf-minerva-reasoning")):
+            with self.subTest(cluster=cluster):
+                res = self.run_alcf(ALCF_CLUSTER=cluster, ALCF_MODEL=model)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(self.config()["model"]["base_url"], base)
+                self.assertEqual(self.config()["model"]["provider"], provider)
+
+    def test_sophia_default_model_is_unchanged(self):
+        # ALCF_CLUSTER=sophia with ALCF_MODEL unset keeps the old Sophia default.
+        res = self.run_alcf(ALCF_CLUSTER="sophia", ALCF_MODEL="")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["model"]["model"], "google/gemma-4-31B-it")
+        self.assertEqual(self.config()["model"]["provider"], "custom:alcf-sophia-reasoning")
+
+    def test_unknown_cluster_exits_78_listing_all_clusters(self):
+        res = self.run_alcf(ALCF_CLUSTER="polaris", ALCF_MODEL="muse-spark-bf16")
+        self.assert_refused(res)
+        self.assertIn("polaris", res.stderr)
+        for cluster in ("sophia", "metis", "minerva", "tara"):
+            self.assertIn(cluster, res.stderr)
+
+    def test_delegation_gpt_oss_120b_on_tara_launch_pins_to_tara(self):
+        # openai/gpt-oss-120b is listed by sophia AND tara; a tara launch pins it.
+        res = self.run_alcf(ALCF_CLUSTER="tara", ALCF_MODEL="muse-spark-bf16",
+                            ALCF_DELEGATION_MODEL="openai/gpt-oss-120b")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["delegation"],
+                         {"provider": "custom:alcf-tara-reasoning", "model": "openai/gpt-oss-120b"})
+
+    def test_disabled_tara_launch_cluster_is_still_generated(self):
+        res = self.run_alcf(ALCF_CLUSTER="tara", ALCF_ENABLE_TARA="0", ALCF_MODEL="muse-spark-bf16")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["model"]["provider"], "custom:alcf-tara-reasoning")
+        overrides = [ln for ln in self.startup_log().splitlines()
+                     if "ALCF_ENABLE_TARA=0" in ln and "launch cluster" in ln]
+        self.assertEqual(len(overrides), 1, self.startup_log())
+
+    def test_disabled_minerva_launch_cluster_is_diagnosed(self):
+        res = self.run_alcf(ALCF_CLUSTER="minerva", ALCF_ENABLE_MINERVA="0",
+                            ALCF_MODEL="inkling-bf16")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        overrides = [ln for ln in self.startup_log().splitlines()
+                     if "ALCF_ENABLE_MINERVA=0" in ln and "launch cluster" in ln]
+        self.assertEqual(len(overrides), 1, self.startup_log())
+
+    def test_disabled_tara_non_launch_cluster_is_dropped(self):
+        res = self.run_alcf(ALCF_CLUSTER="sophia", ALCF_ENABLE_TARA="0",
+                            ALCF_MODEL="google/gemma-4-31B-it")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse([k for k in self.config()["providers"] if k.startswith("alcf-tara")])
+
+    def test_entrypoint_passes_the_tara_flag_to_both_populate_calls(self):
+        body = (SCRIPTS / "entrypoint.sh").read_text(encoding="utf-8")
+        self.assertEqual(body.count('ALCF_ENABLE_TARA="${ALCF_ENABLE_TARA:-1}"'), 2)
 
 
 class EntrypointCatalogOutageContract(AlcfEntrypointMixin, unittest.TestCase):
@@ -1678,25 +1805,30 @@ class PopulateLaunchClusterContract(unittest.TestCase):
         calls = []
         real = pm._clusters
 
-        def spy(include_metis=True, include_minerva=True):
-            calls.append((include_metis, include_minerva))
-            return real(include_metis=include_metis, include_minerva=include_minerva)
+        def spy(include_metis=True, include_minerva=True, include_tara=True):
+            calls.append((include_metis, include_minerva, include_tara))
+            return real(include_metis=include_metis, include_minerva=include_minerva,
+                        include_tara=include_tara)
 
-        for launch, flags, want in (("metis", (False, False), (True, False)),
-                                    ("minerva", (False, False), (False, True)),
-                                    ("sophia", (False, False), (False, False))):
+        off = (False, False, False)
+        for launch, want in (("metis", (True, False, False)),
+                             ("minerva", (False, True, False)),
+                             ("tara", (False, False, True)),
+                             ("sophia", (False, False, False))):
             with self.subTest(launch=launch):
                 calls.clear()
                 with mock.patch.dict(os.environ, {"ALCF_LAUNCH_CLUSTER": launch}), \
                         mock.patch.object(pm, "_get_token", side_effect=RuntimeError("offline test")), \
                         mock.patch.object(pm, "_clusters", side_effect=spy), \
                         contextlib.redirect_stderr(io.StringIO()) as err:
-                    block = pm.build_block(include_metis=flags[0], include_minerva=flags[1])
+                    block = pm.build_block(include_metis=off[0], include_minerva=off[1],
+                                           include_tara=off[2])
                 self.assertEqual(calls, [want])
                 names = set(yaml.safe_load(block)["providers"])
                 self.assertEqual(any(n.startswith("alcf-metis") for n in names), want[0])
                 self.assertEqual(any(n.startswith("alcf-minerva") for n in names), want[1])
-                overridden = launch in ("metis", "minerva")
+                self.assertEqual(any(n.startswith("alcf-tara") for n in names), want[2])
+                overridden = launch in ("metis", "minerva", "tara")
                 self.assertEqual("launch cluster" in err.getvalue(), overridden, err.getvalue())
 
 
@@ -1874,6 +2006,42 @@ class UpstreamRuntimeContract(UpstreamHarnessMixin, unittest.TestCase):
         ev = self.run_upstream(config, checks)
         self.assert_runtime_contract(ev, checks)
         self.assert_config_version_current(ev)
+
+
+class UpstreamTaraDefaultRuntimeContract(UpstreamHarnessMixin, AlcfEntrypointMixin,
+                                         unittest.TestCase):
+    """T1: the DEFAULT launch config (entrypoint-rendered, ALCF_CLUSTER/ALCF_MODEL
+    unset) loaded by upstream Hermes v0.23.2: Tara's 12288 reasoning cap is on
+    the wire, and the reasoning effort Hermes sends with agent.reasoning_effort
+    unset is pinned.
+
+    Wire behaviour pinned here (upstream v0.23.2):
+    plugins/model-providers/custom/__init__.py CustomProfile.default_reasoning_config
+    returns {"enabled": True, "effort": "medium"} for any `custom` provider;
+    agent/reasoning_params.py unset_reasoning_default applies it unless the
+    models.dev catalog marks the model non-reasoning (muse-spark-bf16 is not in
+    it); CustomProfile.build_api_kwargs_extras puts it on the wire as top-level
+    `reasoning_effort: "medium"` (no extra_body.reasoning). So Hermes overrides
+    Muse Spark's server-side default effort (xhigh per the ALCF doc) with medium.
+    This test documents that; it does not change the effort or the cap.
+    """
+
+    def test_default_launch_carries_tara_cap_and_medium_effort_upstream(self):
+        self.upstream()
+        res = self.run_alcf(ALCF_CLUSTER="", ALCF_MODEL="")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        config = (self.harness.home / "config.yaml").read_text(encoding="utf-8")
+        checks = [{"provider": "custom:alcf-tara-reasoning", "model": "muse-spark-bf16",
+                   "base_url": pm.TARA_BASE, "max_tokens": pm.REASONING_MAX_TOKENS,
+                   "fake_token": ALCF_TOKEN_IN_HARNESS, "agent_path": True}]
+        ev = self.run_upstream(config, checks)
+        self.assert_runtime_contract(ev, checks)
+        agent = ev["providers"]["custom:alcf-tara-reasoning"]["agent_path"]
+        self.assertEqual(agent["profile"], "CustomProfile")
+        self.assertEqual(agent["unset_reasoning_default"], {"enabled": True, "effort": "medium"})
+        self.assertEqual(agent["wire_reasoning_effort"], "medium")
+        self.assertNotIn("reasoning", agent["wire_keys"])
+        self.assertEqual(agent["wire_max_tokens"], 12288)
 
 
 class UpstreamGenericRuntimeContract(UpstreamHarnessMixin, GenericRenderMixin, unittest.TestCase):

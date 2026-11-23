@@ -33,7 +33,8 @@ is Hermes + ALCF-specific content + a thin runtime wrapper, not a new framework.
                     ▼                             ▼                            ▼
         ALCF Inference Service          IRI Facility API             Globus Compute
         inference-api.alcf.anl.gov      api.alcf.anl.gov              (compute-node bash)
-        (LLM brain: gemma-4-31B-it)     (job submit / fs ops)
+        (LLM brain: muse-spark-bf16     (job submit / fs ops)
+         on Tara)
 ```
 
 A single named volume (`alcf-agent-home` → `/opt/data`) holds Globus tokens
@@ -125,7 +126,7 @@ Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
    published spec and Hermes' family table would otherwise over-estimate it.
    Defaults to 128000 on any failure (so the floor guard fails open).
 3. **Model-list generation** (`populate_models.py`). Queries the live catalog on
-   both clusters, filters to chat models with a real ≥64k window, and emits a
+   every enabled cluster (sophia, metis, minerva, tara), filters to chat models with a real ≥64k window, and emits a
    keyed `providers:` block (the Hermes v0.23.2 schema). Each cluster is split
    into a baseline provider and a `-reasoning` provider (see quirk #1), each
    carrying its own output cap as `extra_body.max_tokens`.
@@ -273,5 +274,10 @@ remaining items are genuinely optional follow-ups:
   consistently *hot* on Sophia, so it avoids both the cold-start HTTP 503 and
   gpt-oss's reasoning-token thrash under agentic load. All models stay
   switchable in the dashboard.
+- ✅ Default model changed (2026-11-23): `muse-spark-bf16` on Tara (1M context,
+  reasoning, with the `-reasoning` provider's 12288-token cap). Trade-off: no
+  Tara model is kept always hot, so the first request may wait for a cold
+  start. `ALCF_CLUSTER=sophia ALCF_MODEL=google/gemma-4-31B-it` restores the
+  previous always-hot default.
 - ✅ Repo created under `jtchilders-ai-assistant` with GHCR publish + nightly
   docs-refresh CI. (Move to `argonne-lcf` if this becomes official.)

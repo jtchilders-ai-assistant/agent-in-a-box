@@ -6,9 +6,9 @@ credentials, and get a local web chat that can:
 
 - **Answer questions about ALCF** using the latest ALCF documentation and a
   curated knowledge base (baked into the image).
-- **Run inference on the [ALCF Inference Service]** (Sophia / Metis) — no
-  external LLM provider, no API key to manage. The agent's own brain *is* an
-  ALCF-hosted open model (default `google/gemma-4-31B-it`).
+- **Run inference on the [ALCF Inference Service]** (Sophia / Metis / Minerva /
+  Tara) — no external LLM provider, no API key to manage. The agent's own brain
+  *is* an ALCF-hosted open model (default `muse-spark-bf16` on Tara).
 - **Submit and manage jobs** on ALCF systems (Polaris, Crux, Aurora) through the
   [IRI Facility API], plus filesystem operations on Home/Eagle.
 - **Run commands on ALCF compute nodes** through Globus Compute, using the
@@ -287,8 +287,8 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `ALCF_MODEL` | `google/gemma-4-31B-it` | Model id on the inference service |
-| `ALCF_CLUSTER` | `sophia` | `sophia` (vLLM) or `metis` (SambaNova) |
+| `ALCF_MODEL` | `muse-spark-bf16` | Model id on the inference service (the launch model). Tara models are not kept always hot, so the first request may wait for a cold start; `-e ALCF_CLUSTER=sophia -e ALCF_MODEL=google/gemma-4-31B-it` restores the previous always-hot default |
+| `ALCF_CLUSTER` | `tara` | `tara`, `sophia` (vLLM), `metis` (SambaNova) or `minerva`; anything else refuses to start (exit 78) |
 | `ALCF_MAX_TOKENS` | `2048` | Baseline per-response output cap for **plain chat** models |
 | `ALCF_REASONING_MAX_TOKENS` | `12288` | Per-response output cap for **reasoning** models (gpt-oss, gemma-4, nemotron-3-super, *-Thinking). They spend part of the output budget on a hidden reasoning channel, so they need more headroom than chat models. |
 | `ALCF_DASHBOARD_PORT` | `8787` | Web chat port inside the container |
@@ -297,7 +297,8 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 | `ALCF_ENABLE_IRI` | `1` | Enable IRI job/filesystem tools (the official combined login still requests the IRI credential when disabled) |
 | `ALCF_ENABLE_GLOBUS_COMPUTE` | `1` | Enable compute-node execution (the official combined login still requests the Compute credential when disabled) |
 | `ALCF_ENABLE_METIS` | `1` | Include the Metis cluster's models in the switchable list (ignored when `ALCF_CLUSTER=metis`: the launch cluster is always included) |
-| `ALCF_ENABLE_MINERVA` | `1` | Include the Minerva cluster's models in the switchable list |
+| `ALCF_ENABLE_MINERVA` | `1` | Include the Minerva cluster's models in the switchable list (ignored when `ALCF_CLUSTER=minerva`) |
+| `ALCF_ENABLE_TARA` | `1` | Include the Tara cluster's models in the switchable list (ignored when `ALCF_CLUSTER=tara`, the default) |
 | `ALCF_SHOW_MODEL_STATUS` | `1` | Print the model availability banner (LIVE/QUEUED/OFFLINE + context windows) at startup |
 | `ALCF_BASH_ACCOUNT` | *(unset)* | **Recommended:** your default ALCF project for the compute-node `bash` tool. When set, the agent holds ONE warm compute node across the whole conversation instead of paying repeated cold starts; when unset, it must ask/look up a project first. |
 
@@ -505,17 +506,23 @@ In the web chat, click the **MODEL** selector and pick a provider + model. The
 providers are named by cluster and reasoning class:
 
 - **`alcf-sophia`** — Sophia plain-chat models (e.g. `argonne/AuroraGPT-IT-v4-0125`)
-- **`alcf-sophia-reasoning`** — Sophia reasoning models (`google/gemma-4-31B-it`
-  (default), `openai/gpt-oss-120b`, `openai/gpt-oss-20b`,
+- **`alcf-tara-reasoning`** — Tara models (`muse-spark-bf16` (default),
+  `mistral-large-4`, `nemotron-3-ultra`, `inkling-bf16`, `openai/gpt-oss-120b`,
+  …; drop with `-e ALCF_ENABLE_TARA=0` when not launching on Tara). Tara models
+  are not kept always hot, so the first request may wait for a cold start.
+- **`alcf-sophia-reasoning`** — Sophia reasoning models (`google/gemma-4-31B-it`,
+  `openai/gpt-oss-120b`, `openai/gpt-oss-20b`,
   `nvidia/nemotron-3-super-120b`, `arcee-ai/Trinity-Large-Thinking-…`)
 - **`alcf-metis`** / **`alcf-metis-reasoning`** — the Metis equivalents (drop the
   Metis providers with `-e ALCF_ENABLE_METIS=0`)
 - **`alcf-minerva-reasoning`** — Minerva models (`gpt-oss-120b`, `inkling-bf16`,
   `nemotron-3-ultra`; drop with `-e ALCF_ENABLE_MINERVA=0`)
 
-A fourth ALCF cluster, **`tara`**, is registered upstream but is still being
-provisioned (it serves no models yet), so it gets no provider. The startup banner
-reports it as provisioning; it will appear automatically once it serves models.
+The default launch is **`muse-spark-bf16` on Tara** (1M-token context, a
+reasoning model with the 12288-token reasoning output cap). The trade-off: Tara
+models are not "always hot", so the first request after a quiet period may wait
+for a cold start. To go back to the previous always-hot default, run with
+`-e ALCF_CLUSTER=sophia -e ALCF_MODEL=google/gemma-4-31B-it`.
 
 Three behaviors are worth knowing:
 
@@ -577,6 +584,8 @@ subagent model) must each map to **one unambiguous** generated provider:
   there must). Otherwise exactly one provider on another cluster must list it.
   So `gpt-oss-120b` (on both Metis and Minerva) delegates on Metis when
   `ALCF_CLUSTER=metis`, but is ambiguous, and refused, when launching on Sophia.
+  Likewise `openai/gpt-oss-120b` (on Sophia and Tara) delegates on Tara when
+  launching on Tara.
   If `ALCF_DELEGATION_MODEL` is unset or equals the launch model, subagents
   simply reuse the launch provider.
 
@@ -626,7 +635,8 @@ docker build -t alcf-agent:dev .
 **Working, verified end-to-end in a real container.** A `docker run` does the
 Globus login, persists the token to the volume (subsequent starts skip re-auth),
 serves an auth-gated web chat, and the in-container agent drives ALCF inference
-(default `google/gemma-4-31B-it`) *with working tool calls*. Remaining polish is
+(verified with the then-default `google/gemma-4-31B-it` on Sophia; the default
+is now `muse-spark-bf16` on Tara) *with working tool calls*. Remaining polish is
 tracked in
 [docs/DESIGN.md](docs/DESIGN.md) → "Open items".
 

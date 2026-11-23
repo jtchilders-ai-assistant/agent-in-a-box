@@ -146,11 +146,13 @@ RUN printf '%s\n%s\n' "${ALCF_GIT_SHA}" "${ALCF_BUILD_DATE}" > /opt/alcf/.alcf_v
     && chown hermes:hermes /opt/alcf/.alcf_version
 
 # ALCF defaults (override at `docker run` with -e).
-# Default model: google/gemma-4-31B-it — a NON-reasoning model that is
-# consistently kept "hot" on Sophia (multiple always-on instances), so it avoids
-# both (a) the HTTP 503 "online but not ready" cold-start you get from
-# less-popular models and (b) gpt-oss-120b's reasoning-token thrash/garble under
-# agentic load. All models remain switchable in the dashboard.
+# Default model: muse-spark-bf16 on Tara (1M-token context, reasoning; it gets
+# the alcf-tara-reasoning provider's 12288-token output cap). TRADE-OFF: Tara
+# models are not kept "always hot", so the first request after a quiet period
+# may wait for a cold start (HTTP 503 until loaded). To restore the previous
+# always-hot default, run with -e ALCF_CLUSTER=sophia -e
+# ALCF_MODEL=google/gemma-4-31B-it. All models remain switchable in the
+# dashboard.
 #
 # Notable OPTIONAL run-time envs (unset by default; see entrypoint.sh):
 #   ALCF_BASH_ACCOUNT       default ALCF project for the MCP `bash` tool (else
@@ -167,8 +169,8 @@ RUN printf '%s\n%s\n' "${ALCF_GIT_SHA}" "${ALCF_BUILD_DATE}" > /opt/alcf/.alcf_v
 #                           1800 here lets both the config default below and a
 #                           model-requested long wait through. Must stay >= the
 #                           `terminal.timeout` in config.template.yaml.
-ENV ALCF_MODEL=google/gemma-4-31B-it \
-    ALCF_CLUSTER=sophia \
+ENV ALCF_MODEL=muse-spark-bf16 \
+    ALCF_CLUSTER=tara \
     ALCF_MAX_TOKENS=2048 \
     ALCF_REASONING_MAX_TOKENS=12288 \
     ALCF_DASHBOARD_PORT=8787 \
