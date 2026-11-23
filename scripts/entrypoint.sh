@@ -187,17 +187,20 @@ render_config() {
     # One named provider carrying EVERY catalog-enabled model with its real
     # context window (static mapping — discover_models off, like ALCF mode).
     # The api_key stays a ${...} placeholder; the token is substituted once at
-    # template render, exactly like the ALCF path.
+    # template render, exactly like the ALCF path. The output cap lives in
+    # extra_body: Hermes v0.23.2 ignores a provider-level max_tokens.
     providers_block="$("$PY" - "$gmanifest" "${INFERENCE_MAX_TOKENS:-4096}" <<'GPYEOF'
 import json, sys
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 lines = [
-    "custom_providers:",
-    "  - name: generic-inference",
-    "    base_url: " + json.dumps(manifest["base_url"]),
+    "providers:",
+    "  generic-inference:",
+    "    name: generic-inference",
+    "    api: " + json.dumps(manifest["base_url"]),
     '    api_key: "${ALCF_ACCESS_TOKEN}"',
     "    discover_models: false",
-    "    max_tokens: %d" % int(sys.argv[2]),
+    "    extra_body:",
+    "      max_tokens: %d" % int(sys.argv[2]),
     "    models:",
 ]
 for model_id, ctx in sorted(manifest["enabled_models"].items()):
@@ -207,7 +210,7 @@ print("\n".join(lines))
 GPYEOF
 )"
     case "$providers_block" in
-      custom_providers:*) : ;;
+      providers:*) : ;;
       *) err "generic_inference produced no providers block; refusing to start"; exit 78 ;;
     esac
     block_for_scan="$providers_block"
@@ -224,7 +227,7 @@ GPYEOF
   case "$ctxlen" in ''|*[!0-9]*) ctxlen=128000 ;; esac
   diag "Model context window: $ctxlen tokens (from max_model_len; see /tmp/ctxlen.log)"
 
-  # Generate the switchable-model `custom_providers:` block from the LIVE ALCF
+  # Generate the switchable-model `providers:` block from the LIVE ALCF
   # catalog on every serving cluster (sophia + metis + minerva). populate_models.py
   # filters to chat models and assigns each its real serving context window; it
   # always prints a valid block (committed static fallback on any discovery
@@ -236,11 +239,11 @@ GPYEOF
             ALCF_MAX_TOKENS="${ALCF_MAX_TOKENS:-2048}" \
             ALCF_REASONING_MAX_TOKENS="${ALCF_REASONING_MAX_TOKENS:-12288}" \
             "$PY" "$ALCF_DIR/populate_models.py" 2>>/tmp/populate_models.log)"
-  # Guard: a generated block MUST start with 'custom_providers:'. If somehow it
-  # didn't (script crashed hard), leave $providers_block empty so the splice step
-  # keeps the template's committed static fallback instead.
+  # Guard: a generated block MUST start with 'providers:'. If somehow it didn't
+  # (script crashed hard), leave $providers_block empty so the splice step keeps
+  # the template's committed static fallback instead.
   case "$providers_block" in
-    custom_providers:*) diag "Model list generated from live catalog (see /tmp/populate_models.log)" ;;
+    providers:*) diag "Model list generated from live catalog (see /tmp/populate_models.log)" ;;
     *) providers_block=""; err "populate_models produced no block; keeping static fallback list" ;;
   esac
 
@@ -257,26 +260,32 @@ GPYEOF
   #     `case` above), and 128000 >= floor, so a broken/unreachable resolver
   #     NEVER trips this guard -- it fails OPEN (launch proceeds), never closed.
   #   * We only block on a genuine, positive sub-floor integer reading.
-  #   * The valid-model list is derived from the block we just generated; if that
-  #     extraction yields nothing (block empty/unparseable) we fall back to a
-  #     hardcoded hint so the message is always useful. No step here can abort
-  #     the launch except the one intentional `exit 78`.
-  local floor=64000 launch_model valid_list
+  #   * The valid-model list is read (structured, via populate_models.py
+  #     --list-models) from the providers on the launch endpoint in the block we
+  #     just generated, or the template's static fallback if generation failed;
+  #     if that yields nothing we fall back to a hardcoded hint so the message is
+  #     always useful. No step here can abort the launch except the intentional
+  #     `exit 78`s.
+  local floor=64000 launch_model valid_list launch_provider block_for_scan
   launch_model="${ALCF_MODEL:-google/gemma-4-31B-it}"
+  # The block that will be written (single source of truth); else the
+  # template's static fallback, which the splice step keeps in that case.
+  if [ -n "$providers_block" ]; then
+    block_for_scan="$providers_block"
+  else
+    block_for_scan="$(cat "$ALCF_DIR/config.template.yaml" 2>/dev/null || true)"
+  fi
+  # `|| true` so a parse failure can't abort under `set -e`.
+  valid_list="$(printf '%s\n' "$block_for_scan" \
+    | "$PY" "$ALCF_DIR/populate_models.py" --list-models --base-url "$ALCF_BASE_URL" \
+      2>>/tmp/populate_models.log || true)"
+  if [ -z "$valid_list" ]; then
+    valid_list="openai/gpt-oss-120b, openai/gpt-oss-20b, google/gemma-4-31B-it, google/gemma-4-26B-A4B-it, nvidia/nemotron-3-super-120b, argonne/AuroraGPT-IT-v4-0125"
+  fi
   # Compare defensively: only treat $ctxlen as sub-floor when it is a clean
   # positive integer AND strictly less than the floor. `case` already guarantees
   # $ctxlen is all-digits, but re-check so this block is safe if moved.
   if printf '%s' "$ctxlen" | grep -Eq '^[0-9]+$' && [ "$ctxlen" -gt 0 ] && [ "$ctxlen" -lt "$floor" ]; then
-    # Extract the sophia provider's model ids from the generated block for the
-    # hint. `|| true` so a grep miss can't abort under `set -e`.
-    valid_list="$(printf '%s\n' "$providers_block" \
-      | sed -n '/name: alcf-sophia/,/name: alcf-metis/p' \
-      | grep -E '^      [A-Za-z0-9].*:$' \
-      | sed -E 's/^ +//; s/:$//' \
-      | sort | awk 'NR>1{printf ", "}{printf "%s",$0}END{print ""}' 2>/dev/null || true)"
-    if [ -z "$valid_list" ]; then
-      valid_list="openai/gpt-oss-120b, openai/gpt-oss-20b, google/gemma-4-31B-it, google/gemma-4-26B-A4B-it, nvidia/nemotron-3-super-120b, argonne/AuroraGPT-IT-v4-0125"
-    fi
     err "======================================================================"
     err "REFUSING TO START: model '$launch_model' has a context window of"
     err "$ctxlen tokens on the ALCF gateway, below Hermes' required minimum of"
@@ -294,43 +303,29 @@ GPYEOF
   # --- end launch-model context floor guard --------------------------------
 
   # --- Resolve the launch model's named provider (per-model output cap) -----
-  # The top-level model: block resolves through a NAMED custom provider so the
-  # LAUNCH turn inherits that provider's max_tokens (reasoning models get 12288,
-  # plain chat 2048). Hermes has no top-level per-model max_tokens, so this is how
-  # turn-one gets the right cap; /model switches on the dashboard then resolve the
-  # cap per-provider on their own.
+  # The top-level model: block resolves through a NAMED provider so the LAUNCH
+  # turn gets that provider's extra_body output cap (reasoning models 12288,
+  # plain chat 2048) -- the same cap a /model switch to it would get.
   #
-  # Derive the provider from the SAME block that will be written (single source of
-  # truth): find which `- name: alcf-*` section lists the launch model id, so a
-  # model the live catalog classified as reasoning (e.g. nemotron via its
+  # Derive the provider from the SAME block that will be written: exactly one
+  # provider on the launch endpoint must list the launch model id, so a model
+  # the live catalog classified as reasoning (e.g. nemotron via its
   # reasoning_parser) lands in the -reasoning provider even though its id has no
-  # reasoning keyword. Falls back to the id-heuristic Python resolver if the scan
-  # finds nothing (e.g. block unreadable), and finally to custom:alcf-sophia.
-  local launch_provider block_for_scan
-  # Scan the generated block if we have one; else the template's static fallback.
-  if [ -n "$providers_block" ]; then
-    block_for_scan="$providers_block"
-  else
-    block_for_scan="$(cat "$ALCF_DIR/config.template.yaml" 2>/dev/null || true)"
+  # reasoning keyword. Zero or several matches REFUSE to start: guessing would
+  # silently apply the wrong cap (or a provider that does not list the model).
+  if ! launch_provider="$(printf '%s\n' "$block_for_scan" \
+        | "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$launch_model" \
+          --base-url "$ALCF_BASE_URL" 2>/tmp/launch_provider.log)"; then
+    err "======================================================================"
+    err "REFUSING TO START: launch model '$launch_model' does not map to exactly"
+    err "one model provider on $ALCF_BASE_URL:"
+    while IFS= read -r _lline; do err "  $_lline"; done </tmp/launch_provider.log
+    err ""
+    err "Set ALCF_MODEL to one of these models served on this endpoint and restart the container:"
+    err "  $valid_list"
+    err "======================================================================"
+    exit 78   # EX_CONFIG: launch model is unresolvable
   fi
-  launch_provider="$(printf '%s\n' "$block_for_scan" | awk -v m="$launch_model" '
-    /^  - name: / { prov = $3; next }
-    $0 ~ "^      " m ":$" { print prov; exit }
-  ')"
-  if [ -z "$launch_provider" ]; then
-    # Fallback: ask the Python resolver (id heuristic + best-effort catalog).
-    launch_provider="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
-        ALCF_BASE_URL="$ALCF_BASE_URL" \
-        "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$launch_model" \
-        2>>/tmp/populate_models.log || true)"
-    # awk printed a bare provider name (alcf-sophia-reasoning); the Python path
-    # already prints the custom: prefix. Normalise: prefix bare names.
-    case "$launch_provider" in custom:*) : ;; ?*) launch_provider="custom:$launch_provider" ;; esac
-  else
-    launch_provider="custom:$launch_provider"
-  fi
-  # Last-resort default so the config always has a valid provider.
-  [ -n "$launch_provider" ] || launch_provider="custom:alcf-sophia"
   diag "Launch model '$launch_model' -> provider $launch_provider (per-model output cap)"
   # --- end launch-model provider resolution --------------------------------
   render_base_url="$ALCF_BASE_URL"
@@ -382,22 +377,23 @@ GPYEOF
       fi
       delegation_provider="custom:generic-inference"
     else
-      # Same provider scan as the launch model (which named provider lists it),
-      # with the same Python-resolver + static fallbacks.
-      delegation_provider="$(printf '%s\n' "$block_for_scan" | awk -v m="$delegation_model" '
-        /^  - name: / { prov = $3; next }
-        $0 ~ "^      " m ":$" { print prov; exit }
-      ')"
-      if [ -z "$delegation_provider" ]; then
-        delegation_provider="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
-            ALCF_BASE_URL="$ALCF_BASE_URL" \
-            "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$delegation_model" \
-            2>>/tmp/populate_models.log || true)"
-        case "$delegation_provider" in custom:*) : ;; ?*) delegation_provider="custom:$delegation_provider" ;; esac
-      else
-        delegation_provider="custom:$delegation_provider"
+      # Same exactly-one-provider rule as the launch model, but across EVERY
+      # cluster (subagents may run on any endpoint): a model listed by no
+      # provider, or by several (e.g. gpt-oss-120b on metis AND minerva), has
+      # no unambiguous route, so refuse rather than guess.
+      if ! delegation_provider="$(printf '%s\n' "$block_for_scan" \
+            | "$PY" "$ALCF_DIR/populate_models.py" --launch-provider "$delegation_model" \
+              2>/tmp/launch_provider.log)"; then
+        err "======================================================================"
+        err "REFUSING TO START: delegation model '$delegation_model'"
+        err "(ALCF_DELEGATION_MODEL) does not map to exactly one model provider:"
+        while IFS= read -r _lline; do err "  $_lline"; done </tmp/launch_provider.log
+        err ""
+        err "Set ALCF_DELEGATION_MODEL to a model listed by exactly one provider,"
+        err "or unset it to delegate on the launch model '$launch_model'."
+        err "======================================================================"
+        exit 78   # EX_CONFIG: delegation model is unresolvable
       fi
-      [ -n "$delegation_provider" ] || delegation_provider="custom:alcf-sophia"
     fi
     extra_block+="$(cat <<EOF
 
@@ -482,9 +478,9 @@ src, dst = sys.argv[1], sys.argv[2]
 tmpl = open(src, encoding="utf-8").read()
 
 # Splice: replace from the sentinel line (inclusive) to EOF with the generated
-# custom_providers block, when one was produced. The sentinel is a YAML comment,
-# so the template stays valid even if this splice is skipped.
-SENTINEL = "#__ALCF_CUSTOM_PROVIDERS__"
+# providers block, when one was produced. The sentinel is a YAML comment, so
+# the template stays valid even if this splice is skipped.
+SENTINEL = "#__ALCF_PROVIDERS__"
 block = os.environ.get("ALCF_PROVIDERS_BLOCK", "").strip()
 if block:
     idx = tmpl.find(SENTINEL)
