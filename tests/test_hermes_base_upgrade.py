@@ -47,9 +47,14 @@ FAKE_TOKEN = "fake-alcf-test-token"
 UPSTREAM_ENV = "HERMES_UPSTREAM_CHECKOUT"
 SENTINEL_RE = re.compile(r"^#__ALCF_[A-Z_]+__", re.M)
 
-# Words that mark a README mention of the retired patch as history, not as the
-# current state of the image.
-HISTORY_MARKERS = ("no longer", "removed", "retired", "previously", "formerly", "obsolete")
+# Phrases that mark a README mention of the retired patch as history, not as the
+# current state of the image. Matched as whole words, within the SAME sentence
+# as the mention (or in the enclosing heading), never anywhere on the line.
+HISTORY_MARKERS = ("no longer", "removed", "retired", "previously", "formerly", "obsolete",
+                   "historical", "history")
+PATCH_MENTION = re.compile(r"strip_tool_message_name|0001-strip-tool-message-name")
+_HISTORY_RE = re.compile(r"\b(?:" + "|".join(re.escape(m) for m in HISTORY_MARKERS) + r")\b", re.I)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
 # --- helpers -------------------------------------------------------------------
@@ -87,13 +92,42 @@ def readme_component_base() -> str:
     return hermes[0][1].strip("`")
 
 
+def readme_current_patch_mentions(text: str) -> list:
+    """README mentions of the retired patch that are NOT framed as history.
+
+    A mention is history only if a history marker appears as a whole word in
+    the same sentence, or in the heading of the section it sits in. A marker
+    elsewhere on the line does not count, and a table row always describes the
+    current image, so a mention there is never history.
+    """
+    current, heading = [], ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            heading = line
+        if not PATCH_MENTION.search(line):
+            continue
+        if line.startswith("|"):
+            current.append(line)
+            continue
+        if _HISTORY_RE.search(heading) and not line.startswith("#"):
+            continue
+        current += [s for s in _SENTENCE_SPLIT.split(line)
+                    if PATCH_MENTION.search(s) and not _HISTORY_RE.search(s)]
+    return current
+
+
 def assert_provider_schema(tc: unittest.TestCase, doc, *, where: str) -> dict:
     """The v0.23.2 keyed `providers:` contract shared by every emitter."""
     tc.assertIsInstance(doc, dict, f"{where}: not a YAML mapping")
     tc.assertFalse("custom_providers" in doc,
                    f"{where}: still emits the legacy custom_providers list")
     tc.assertTrue("providers" in doc, f"{where}: no root `providers` key")
-    providers = doc["providers"]
+    return assert_provider_entries(tc, doc["providers"], where=where)
+
+
+def assert_provider_entries(tc: unittest.TestCase, providers, *, where: str) -> dict:
+    """The keyed entries that live under `providers:` ({key: entry})."""
     tc.assertIsInstance(providers, dict, f"{where}: `providers` must be a mapping, not a list")
     tc.assertTrue(providers, f"{where}: `providers` is empty")
     for key, entry in providers.items():
@@ -191,11 +225,21 @@ def build_test_block() -> str:
 
 UPSTREAM_HARNESS = textwrap.dedent(r'''
     """Run upstream Hermes against a rendered config; print one JSON evidence blob."""
-    import json, logging, os, sys, traceback
+    import json, logging, os, socket, sys, traceback
+
+    # Hard network deny: models.dev lookups / endpoint probes inside upstream
+    # (e.g. switch_model's capability fetch) must fail fast, never leave the box.
+    def _no_network(*_a, **_k):
+        raise OSError("network disabled in contract harness")
+    socket.socket.connect = _no_network
+    socket.socket.connect_ex = _no_network
+    socket.create_connection = _no_network
+    socket.getaddrinfo = _no_network
 
     config_path, checks = sys.argv[1], json.loads(sys.argv[2])
+    switches = json.loads(sys.argv[3]) if len(sys.argv) > 3 else []
     ev = {"harness_error": None, "validate_issues": [], "unknown_key_warnings": [],
-          "providers": {}, "tool_message": None}
+          "providers": {}, "switches": [], "tool_message": None}
 
     def fail(stage):
         ev["harness_error"] = f"{stage}: {traceback.format_exc(limit=3)}"
@@ -244,6 +288,23 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": "ok"}}]})
 
+    def _wire(out, model, base_url, provider_name, request_overrides, stage):
+        try:
+            kwargs = transport.build_kwargs(
+                model, [{"role": "user", "content": "hi"}],
+                base_url=base_url, provider_name=provider_name,
+                request_overrides=request_overrides)
+            out["api_kwargs_extra_body"] = kwargs.get("extra_body")
+            seen.clear()
+            client = openai.OpenAI(api_key="fake-key", base_url=base_url or "http://x/v1",
+                                   http_client=httpx.Client(transport=httpx.MockTransport(_handler)))
+            client.chat.completions.create(**kwargs)
+            body = seen[-1]
+            out["wire_max_tokens"] = body.get("max_tokens")
+            out["wire_keys"] = sorted(body)
+        except Exception:
+            fail(stage)
+
     for check in checks:
         name, model = check["provider"], check["model"]
         out = ev["providers"][name] = {}
@@ -258,21 +319,43 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
         out["base_url"] = rt.get("base_url")
         out["api_key_is_fake"] = rt.get("api_key") == check.get("fake_token")
         out["request_overrides"] = rt.get("request_overrides")
+        _wire(out, model, rt.get("base_url"), rt.get("provider"),
+              rt.get("request_overrides"), f"build_request[{name}]")
+
+    # In-session /model switch through upstream's ONE shared pipeline
+    # (hermes_cli.model_switch.switch_model, used by the CLI, gateway and ACP),
+    # called the way acp_adapter/server.py does: providers dict + compatible
+    # custom-provider list from the loaded config. The outgoing request is then
+    # built with the switch RESULT's request_overrides, as the agent does.
+    for sw in switches:
+        out = {"from_provider": sw["from_provider"], "to_model": sw["to_model"]}
+        ev["switches"].append(out)
         try:
-            kwargs = transport.build_kwargs(
-                model, [{"role": "user", "content": "hi"}],
-                base_url=rt.get("base_url"), provider_name=rt.get("provider"),
-                request_overrides=rt.get("request_overrides"))
-            out["api_kwargs_extra_body"] = kwargs.get("extra_body")
-            seen.clear()
-            client = openai.OpenAI(api_key="fake-key", base_url=rt.get("base_url") or "http://x/v1",
-                                   http_client=httpx.Client(transport=httpx.MockTransport(_handler)))
-            client.chat.completions.create(**kwargs)
-            body = seen[-1]
-            out["wire_max_tokens"] = body.get("max_tokens")
-            out["wire_keys"] = sorted(body)
+            from hermes_cli.config import load_config
+            from hermes_cli.model_switch import switch_model
+            live = load_config()
+            with frozen_runtime_config(live):
+                res = switch_model(
+                    raw_input=sw["to_model"], current_provider=sw["from_provider"],
+                    current_model=sw["from_model"], current_base_url=sw["from_base_url"],
+                    current_api_key=sw["fake_token"],
+                    explicit_provider=sw.get("explicit_provider", ""),
+                    user_providers=live.get("providers") if isinstance(live.get("providers"), dict) else {},
+                    custom_providers=get_compatible_custom_providers(live))
         except Exception:
-            fail(f"build_request[{name}]")
+            fail(f"switch_model[{sw['to_model']}]")
+        out["success"] = bool(res.success)
+        out["error_message"] = res.error_message
+        out["new_model"] = res.new_model
+        out["target_provider"] = res.target_provider
+        out["provider_changed"] = res.provider_changed
+        out["base_url"] = res.base_url
+        out["api_mode"] = res.api_mode
+        out["api_key_is_fake"] = res.api_key == sw["fake_token"]
+        out["request_overrides"] = res.request_overrides
+        if res.success:
+            _wire(out, res.new_model, res.base_url, res.target_provider,
+                  res.request_overrides or None, f"build_request[switch:{sw['to_model']}]")
 
     try:
         msgs = [{"role": "tool", "tool_call_id": "c1", "name": "terminal", "content": "ok"}]
@@ -283,6 +366,20 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
 
     print(json.dumps(ev, default=str))
 ''')
+
+
+UPSTREAM_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TMPDIR")
+
+
+def upstream_subprocess_env(root: Path, *, home: Path, hermes_home: Path) -> dict:
+    """Allowlisted env for the upstream harness: nothing from the caller's
+    environment leaks in (no credentials, no proxies, no HERMES_* settings)
+    except the few variables needed to run Python at all."""
+    env = {k: os.environ[k] for k in UPSTREAM_ENV_ALLOWLIST if k in os.environ}
+    env.setdefault("LANG", "C.UTF-8")
+    env.update(HOME=str(home), HERMES_HOME=str(hermes_home), PYTHONPATH=str(root),
+               PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1")
+    return env
 
 
 class UpstreamHarnessMixin:
@@ -299,20 +396,20 @@ class UpstreamHarnessMixin:
         self.assertTrue(py.exists(), f"{UPSTREAM_ENV}={root} has no .venv/bin/python")
         return root_path
 
-    def run_upstream(self, config_text: str, checks: list) -> dict:
+    def run_upstream(self, config_text: str, checks: list, switches: list | None = None) -> dict:
         root = self.upstream()
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
-            home.mkdir()
-            cfg = Path(tmp) / "rendered.yaml"
+            hermes_home = home / ".hermes"
+            hermes_home.mkdir(parents=True)
+            # Upstream's load_config() (used by the switch pipeline) reads
+            # $HERMES_HOME/config.yaml, so the rendered config lives there.
+            cfg = hermes_home / "config.yaml"
             cfg.write_text(config_text, encoding="utf-8")
-            env = {k: v for k, v in os.environ.items()
-                   if not k.endswith(("_API_KEY", "_TOKEN")) and k != "HERMES_HOME"}
-            env.update(HERMES_HOME=str(home), PYTHONPATH=str(root),
-                       PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1")
+            env = upstream_subprocess_env(root, home=home, hermes_home=hermes_home)
             proc = subprocess.run(
                 [str(root / ".venv" / "bin" / "python"), "-c", UPSTREAM_HARNESS,
-                 str(cfg), json.dumps(checks)],
+                 str(cfg), json.dumps(checks), json.dumps(switches or [])],
                 cwd=str(root), env=env, text=True, capture_output=True, timeout=120)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")]
         self.assertEqual(proc.returncode, 0, f"upstream harness crashed:\n{proc.stderr[-4000:]}")
@@ -348,11 +445,41 @@ class UpstreamHarnessMixin:
         self.assertNotIn("name", tool, "upstream no longer strips `name` from role:tool messages")
         self.assertEqual(tool["tool_call_id"], "c1")
 
+    def assert_switch_contract(self, ev: dict, switches: list) -> None:
+        """A /model switch must carry the TARGET provider's cap onto the wire."""
+        self.assertEqual(len(ev["switches"]), len(switches))
+        for sw, out in zip(switches, ev["switches"]):
+            with self.subTest(switch=f"{sw['from_model']} -> {sw['to_model']}"):
+                self.assertTrue(out["success"], f"switch_model failed: {out['error_message']}")
+                self.assertEqual(out["new_model"], sw["to_model"])
+                # Upstream reports a user `providers:` entry either as its bare key
+                # or as custom:<key> (runtime_provider_custom.persisted_provider_id);
+                # both name the same endpoint.
+                self.assertEqual(out["target_provider"].removeprefix("custom:"),
+                                 sw["expect_provider"].removeprefix("custom:"))
+                self.assertTrue(out["provider_changed"])
+                self.assertEqual(out["base_url"], sw["from_base_url"])
+                self.assertEqual(out["api_mode"], "chat_completions")
+                self.assertTrue(out["api_key_is_fake"], "switched api_key is not the rendered token")
+                self.assertEqual(((out["request_overrides"] or {}).get("extra_body") or {})
+                                 .get("max_tokens"), sw["max_tokens"],
+                                 "switch result request_overrides lacks the target provider's cap")
+                self.assertEqual(out["wire_max_tokens"], sw["max_tokens"],
+                                 "outgoing body after the switch does not carry the target cap")
+
 
 ALCF_CHECKS = [
     {"provider": "custom:alcf-x", "model": "chatty", "base_url": "https://h/v1",
      "max_tokens": pm.BASELINE_MAX_TOKENS, "fake_token": FAKE_TOKEN},
     {"provider": "custom:alcf-x-reasoning", "model": "thinky", "base_url": "https://h/v1",
+     "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN},
+]
+
+# Launch on the plain model, then /model-switch to the reasoning one: the turn
+# after the switch must use alcf-x-reasoning's 12288 cap, not the launch 2048.
+ALCF_SWITCHES = [
+    {"from_provider": "custom:alcf-x", "from_model": "chatty", "from_base_url": "https://h/v1",
+     "to_model": "thinky", "expect_provider": "custom:alcf-x-reasoning",
      "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN},
 ]
 
@@ -428,21 +555,41 @@ class PatchRetirementContract(unittest.TestCase):
                          "config.template.yaml still mentions strip_tool_message_name")
 
     def test_readme_mentions_patch_only_as_history(self):
-        current = [ln for ln in (ROOT / "README.md").read_text(encoding="utf-8").splitlines()
-                   if ("strip_tool_message_name" in ln or "0001-strip-tool-message-name" in ln)
-                   and not any(m in ln.lower() for m in HISTORY_MARKERS)]
+        current = readme_current_patch_mentions((ROOT / "README.md").read_text(encoding="utf-8"))
         self.assertEqual(current, [], "README still describes the patch in current tense")
+
+    def test_history_heuristic_is_sentence_scoped(self):
+        """Guards the README check itself against the brittle any-word-on-the-line rule."""
+        cases = {
+            # current tense, a marker word elsewhere on the line: still current
+            "Hermes was removed from PATH. We apply `strip_tool_message_name` at build.": 1,
+            "| Tool-message patch (retired) | `patches/0001-strip-tool-message-name.patch` | x |": 1,
+            "The patch `0001-strip-tool-message-name` is applied; unremoved hunks fail.": 1,
+            # genuine history
+            "The `strip_tool_message_name` patch was retired in v0.23.2.": 0,
+            "Previously the image applied `0001-strip-tool-message-name.patch`.": 0,
+            "### History\n\nThe image applied `0001-strip-tool-message-name.patch`.": 0,
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(len(readme_current_patch_mentions(text)), want)
 
 
 class PopulateModelsSchemaContract(unittest.TestCase):
     def test_emit_cluster_output_matches_providers_schema(self):
+        """_emit_cluster CONTRACT: it returns the lines of one cluster's keyed
+        provider ENTRIES, every line indented two spaces so build_block can nest
+        them directly under its single `providers:` root. On their own the lines
+        parse to the {provider_key: entry} mapping itself (no list, no root key)."""
         mapping = {"chatty": (128000, False), "thinky": (262144, True)}
-        doc = yaml.safe_load("\n".join(pm._emit_cluster("alcf-x", "https://h/v1", mapping)))
-        if isinstance(doc, list):  # legacy list items: still a contract failure below
-            doc = {"custom_providers": doc}
-        elif isinstance(doc, dict) and "providers" not in doc and "custom_providers" not in doc:
-            doc = {"providers": doc}  # bare mapping entries, to be nested under providers:
-        providers = assert_provider_schema(self, doc, where="_emit_cluster")
+        lines = pm._emit_cluster("alcf-x", "https://h/v1", mapping)
+        self.assertIsInstance(lines, list)
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertTrue(line.startswith("  ") and not line.startswith("  - "),
+                            f"not a 2-space keyed-entry line: {line!r}")
+        doc = yaml.safe_load("\n".join(lines))
+        providers = assert_provider_entries(self, doc, where="_emit_cluster")
         self.assertEqual(set(providers), {"alcf-x", "alcf-x-reasoning"})
         self.assertEqual(providers["alcf-x"]["api"], "https://h/v1")
         self.assertEqual(providers["alcf-x"]["extra_body"]["max_tokens"], pm.BASELINE_MAX_TOKENS)
@@ -451,6 +598,12 @@ class PopulateModelsSchemaContract(unittest.TestCase):
         self.assertEqual(providers["alcf-x"]["models"], {"chatty": {"context_length": 128000}})
         self.assertEqual(providers["alcf-x-reasoning"]["models"],
                          {"thinky": {"context_length": 262144}})
+
+    def test_build_block_is_providers_root_over_emit_cluster(self):
+        """build_block = one `providers:` root + each cluster's _emit_cluster lines."""
+        _cluster, provider, base, _sel, fallback = TEST_CLUSTER[0]
+        self.assertEqual(build_test_block(),
+                         "providers:\n" + "\n".join(pm._emit_cluster(provider, base, fallback)) + "\n")
 
     def test_build_block_matches_providers_schema(self):
         providers = assert_provider_schema(self, yaml.safe_load(build_test_block()),
@@ -501,6 +654,313 @@ class TemplateFallbackContract(unittest.TestCase):
         assert_provider_schema(self, doc, where="config.template.yaml")
 
 
+class ProviderParsingContract(unittest.TestCase):
+    """pm.parse_providers is the yaml-free structured reader entrypoint.sh uses
+    (the Hermes runtime venv ships no PyYAML): {key: {"api", "models": {id: ctx}}}."""
+
+    @staticmethod
+    def via_yaml(text: str) -> dict:
+        doc = yaml.safe_load(text)
+        return {k: {"api": e["api"],
+                    "models": {m: v["context_length"] for m, v in e["models"].items()}}
+                for k, e in doc["providers"].items()}
+
+    def test_parse_matches_yaml_on_generated_block(self):
+        block = build_test_block()
+        self.assertEqual(pm.parse_providers(block), self.via_yaml(block))
+
+    def test_parse_matches_yaml_on_whole_template(self):
+        text = (ROOT / "config" / "config.template.yaml").read_text(encoding="utf-8")
+        self.assertEqual(pm.parse_providers(text), self.via_yaml(text))
+
+    def test_parse_handles_quoted_ids_and_comments(self):
+        text = textwrap.dedent('''\
+            model:
+              provider: "custom:x"
+            providers:
+              # a comment
+              generic-inference:
+                name: generic-inference
+                api: "http://127.0.0.1:9/v1"
+                api_key: "${ALCF_ACCESS_TOKEN}"
+                discover_models: false
+                extra_body:
+                  max_tokens: 4096
+                models:
+                  "selected/model":
+                    context_length: 131072
+                  'other:tag':
+                    context_length: 70000
+            delegation:
+              provider: "custom:x"
+            ''')
+        self.assertEqual(pm.parse_providers(text), self.via_yaml(text))
+
+    def test_parse_rejects_legacy_or_missing_providers(self):
+        for text in ("custom_providers:\n  - name: a\n", "model:\n  provider: x\n", ""):
+            with self.subTest(text=text):
+                self.assertEqual(pm.parse_providers(text), {})
+
+
+CROSS_CLUSTER_BLOCK = textwrap.dedent(f'''\
+    providers:
+      alcf-a-reasoning:
+        name: alcf-a-reasoning
+        api: "https://h/a/v1"
+        api_key: "${{ALCF_ACCESS_TOKEN}}"
+        discover_models: false
+        extra_body:
+          max_tokens: {pm.REASONING_MAX_TOKENS}
+        models:
+          shared-model:
+            context_length: 131072
+          only-a:
+            context_length: 131072
+      alcf-b:
+        name: alcf-b
+        api: "https://h/b/v1"
+        api_key: "${{ALCF_ACCESS_TOKEN}}"
+        discover_models: false
+        extra_body:
+          max_tokens: {pm.BASELINE_MAX_TOKENS}
+        models:
+          plain-b:
+            context_length: 128000
+      alcf-b-reasoning:
+        name: alcf-b-reasoning
+        api: "https://h/b/v1/"
+        api_key: "${{ALCF_ACCESS_TOKEN}}"
+        discover_models: false
+        extra_body:
+          max_tokens: {pm.REASONING_MAX_TOKENS}
+        models:
+          shared-model:
+            context_length: 131072
+          dup-on-b:
+            context_length: 131072
+      alcf-b-extra:
+        name: alcf-b-extra
+        api: "https://h/b/v1"
+        api_key: "${{ALCF_ACCESS_TOKEN}}"
+        discover_models: false
+        extra_body:
+          max_tokens: {pm.BASELINE_MAX_TOKENS}
+        models:
+          dup-on-b:
+            context_length: 128000
+    ''')
+
+
+class LaunchProviderContract(unittest.TestCase):
+    """launch_provider(model, providers_text, base_url=None) CONTRACT.
+
+    The launch model maps to EXACTLY ONE named provider that lists it, among
+    the providers whose `api` is the launch endpoint (base_url; trailing slash
+    ignored) -- or among all providers when base_url is None (delegation, which
+    may target any cluster). Zero or several matches raise LaunchProviderError
+    with a non-secret message; there is no heuristic or default fallback. It
+    never touches the network (catalog fetchers are patched to explode).
+    """
+
+    def setUp(self):
+        for name in ("_get_token", "_fetch_models"):
+            p = mock.patch.object(pm, name, side_effect=AssertionError(f"{name}: network used"))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_exactly_one_provider_on_the_endpoint_is_selected(self):
+        self.assertEqual(pm.launch_provider("plain-b", CROSS_CLUSTER_BLOCK, "https://h/b/v1"),
+                         "custom:alcf-b")
+        self.assertEqual(pm.launch_provider("shared-model", CROSS_CLUSTER_BLOCK, "https://h/b/v1"),
+                         "custom:alcf-b-reasoning")
+        self.assertEqual(pm.launch_provider("shared-model", CROSS_CLUSTER_BLOCK, "https://h/a/v1/"),
+                         "custom:alcf-a-reasoning")
+        self.assertEqual(pm.launch_provider("only-a", CROSS_CLUSTER_BLOCK), "custom:alcf-a-reasoning")
+
+    def test_generated_block_selection_follows_reasoning_class(self):
+        block = build_test_block()
+        self.assertEqual(pm.launch_provider("chatty", block, "https://h/v1"), "custom:alcf-x")
+        self.assertEqual(pm.launch_provider("thinky", block, "https://h/v1"),
+                         "custom:alcf-x-reasoning")
+
+    def test_zero_providers_fails_closed(self):
+        for model, base in (("unknown/model", "https://h/b/v1"),
+                            ("only-a", "https://h/b/v1"),     # served, but not on this endpoint
+                            ("plain-b", "https://elsewhere/v1")):
+            with self.subTest(model=model, base=base):
+                with self.assertRaises(pm.LaunchProviderError) as cm:
+                    pm.launch_provider(model, CROSS_CLUSTER_BLOCK, base)
+                self.assertIn(model, str(cm.exception))
+        with self.assertRaises(pm.LaunchProviderError):
+            pm.launch_provider("chatty", "", "https://h/v1")
+
+    def test_duplicate_providers_fail_closed(self):
+        with self.assertRaises(pm.LaunchProviderError) as cm:
+            pm.launch_provider("dup-on-b", CROSS_CLUSTER_BLOCK, "https://h/b/v1")
+        self.assertIn("alcf-b-extra", str(cm.exception))
+        self.assertIn("alcf-b-reasoning", str(cm.exception))
+        # Without an endpoint, a model served by two clusters is ambiguous too.
+        with self.assertRaises(pm.LaunchProviderError):
+            pm.launch_provider("shared-model", CROSS_CLUSTER_BLOCK)
+
+    def run_cli(self, *args, stdin=CROSS_CLUSTER_BLOCK):
+        env = {k: v for k, v in os.environ.items() if not k.endswith(("_TOKEN", "_API_KEY"))}
+        env["ALCF_INFER_TOKEN"] = FAKE_TOKEN
+        return subprocess.run([sys.executable, str(SCRIPTS / "populate_models.py"), *args],
+                              input=stdin, text=True, capture_output=True, env=env, timeout=30)
+
+    def test_cli_selects_exactly_one_provider(self):
+        res = self.run_cli("--launch-provider", "plain-b", "--base-url", "https://h/b/v1")
+        self.assertEqual((res.returncode, res.stdout.strip()), (0, "custom:alcf-b"), res.stderr)
+
+    def test_cli_zero_or_duplicate_exits_non_zero_without_secrets(self):
+        for model in ("unknown/model", "dup-on-b"):
+            with self.subTest(model=model):
+                res = self.run_cli("--launch-provider", model, "--base-url", "https://h/b/v1")
+                self.assertNotEqual(res.returncode, 0)
+                self.assertEqual(res.stdout.strip(), "", "no provider may be printed on failure")
+                self.assertIn(model, res.stderr)
+                self.assertFalse(FAKE_TOKEN in res.stderr + res.stdout)
+
+    def test_cli_lists_models_on_the_endpoint(self):
+        res = self.run_cli("--list-models", "--base-url", "https://h/b/v1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "dup-on-b, plain-b, shared-model")
+        res = self.run_cli("--list-models", "--base-url", "https://nowhere/v1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual(res.stdout.strip(), "")
+
+
+# Offline stand-in for /opt/alcf/populate_models.py inside the bounded
+# entrypoint: runs the REAL module with every catalog/token fetcher disabled (so
+# it emits its committed static fallback), optionally over a test cluster list.
+OFFLINE_POPULATE = textwrap.dedent('''\
+    import importlib.util, json, os, sys
+    spec = importlib.util.spec_from_file_location("populate_models_real", {real!r})
+    pm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pm)
+    def _offline(*_a, **_k):
+        raise RuntimeError("offline contract test")
+    pm._get_token = pm._fetch_models = _offline
+    if os.environ.get("ALCF_TEST_CLUSTERS"):
+        _cl = [(c, p, b, None, {{m: tuple(v) for m, v in fb.items()}})
+               for c, p, b, fb in json.loads(os.environ["ALCF_TEST_CLUSTERS"])]
+        pm._clusters = lambda include_metis=True, include_minerva=True: _cl
+    sys.exit(pm.main())
+    ''')
+
+STUB_CTXLEN = 'import os\nprint(os.environ.get("TEST_CTXLEN", "128000"))\n'
+ALCF_TOKEN_IN_HARNESS = "test-alcf-token"  # what the harness's fake alcf-tokens prints
+HINT_LIST = ("openai/gpt-oss-120b, openai/gpt-oss-20b, google/gemma-4-31B-it, "
+             "google/gemma-4-26B-A4B-it, nvidia/nemotron-3-super-120b, argonne/AuroraGPT-IT-v4-0125")
+_ERR_PREFIX = re.compile(r"^\x1b\[31m\[agent-in-a-box\]\x1b\[0m ?")
+
+
+class AlcfEntrypointMixin:
+    """ALCF-mode run of the bounded entrypoint from tests/test_generic_inference.py."""
+
+    def setUp(self):
+        self.harness = tgi.EntrypointAndWorkflowContractTests(
+            "test_rendered_credential_bearing_config_is_forced_to_mode_0600")
+        self.harness.setUp()
+        self.addCleanup(self.harness.doCleanups)
+        alcf = self.harness.alcf_dir
+        (alcf / "populate_models.py").write_text(
+            OFFLINE_POPULATE.format(real=str(SCRIPTS / "populate_models.py")), encoding="utf-8")
+        (alcf / "resolve_context_length.py").write_text(STUB_CTXLEN, encoding="utf-8")
+
+    def run_alcf(self, **env):
+        res = self.harness.run_entrypoint(**env)
+        self.assertFalse(ALCF_TOKEN_IN_HARNESS in res.stdout + res.stderr,
+                         "the inference token leaked into startup output")
+        return res
+
+    def config(self) -> dict:
+        return yaml.safe_load((self.harness.home / "config.yaml").read_text(encoding="utf-8"))
+
+    def assert_refused(self, res):
+        self.assertEqual(res.returncode, 78, res.stderr)
+        self.assertFalse((self.harness.home / "config.yaml").exists(),
+                         "a refused launch must not leave a rendered config")
+
+    @staticmethod
+    def printed_valid_list(stderr: str) -> list:
+        lines = [_ERR_PREFIX.sub("", ln) for ln in stderr.splitlines()]
+        for i, line in enumerate(lines):
+            if "Set ALCF_MODEL to one of these" in line:
+                return sorted(x.strip() for x in lines[i + 1].split(",") if x.strip())
+        raise AssertionError(f"no valid-model list in stderr:\n{stderr}")
+
+
+class EntrypointFloorGuardContract(AlcfEntrypointMixin, unittest.TestCase):
+    """I4: sub-floor launch model -> exit 78 + the GENERATED valid-model list."""
+
+    def test_sub_floor_model_lists_generated_launch_endpoint_models(self):
+        res = self.run_alcf(ALCF_MODEL="meta-llama/Llama-3.3-70B-Instruct", TEST_CTXLEN="16384")
+        self.assert_refused(res)
+        self.assertIn("REFUSING TO START", res.stderr)
+        self.assertEqual(self.printed_valid_list(res.stderr), sorted(pm.SOPHIA_FALLBACK))
+
+    def test_sub_floor_on_metis_lists_metis_models(self):
+        res = self.run_alcf(ALCF_CLUSTER="metis", ALCF_MODEL="Mistral-Large-3-675B",
+                            TEST_CTXLEN="8192")
+        self.assert_refused(res)
+        self.assertEqual(self.printed_valid_list(res.stderr), sorted(pm.METIS_FALLBACK))
+
+    def test_hint_fallback_when_no_generated_model_on_endpoint(self):
+        clusters = [["x", "alcf-x", "https://elsewhere/v1", {"m": [131072, False]}]]
+        res = self.run_alcf(ALCF_MODEL="tiny/model", TEST_CTXLEN="16384",
+                            ALCF_TEST_CLUSTERS=json.dumps(clusters))
+        self.assert_refused(res)
+        self.assertEqual(self.printed_valid_list(res.stderr),
+                         sorted(x.strip() for x in HINT_LIST.split(",")))
+
+
+class EntrypointLaunchProviderContract(AlcfEntrypointMixin, unittest.TestCase):
+    """I1: the entrypoint maps the launch model to exactly one provider or exits 78."""
+
+    def test_unique_model_selects_its_provider(self):
+        for model, want in (("google/gemma-4-31B-it", "custom:alcf-sophia-reasoning"),
+                            ("argonne/AuroraGPT-IT-v4-0125", "custom:alcf-sophia")):
+            with self.subTest(model=model):
+                res = self.run_alcf(ALCF_MODEL=model)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(self.config()["model"]["provider"], want)
+
+    def test_model_on_several_clusters_resolves_on_the_launch_endpoint(self):
+        # gpt-oss-120b is served by metis AND minerva; ALCF_CLUSTER=metis pins it.
+        res = self.run_alcf(ALCF_CLUSTER="metis", ALCF_MODEL="gpt-oss-120b")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["model"]["provider"], "custom:alcf-metis-reasoning")
+
+    def test_unlisted_model_fails_closed(self):
+        res = self.run_alcf(ALCF_MODEL="not-a-served/model")
+        self.assert_refused(res)
+        self.assertIn("not-a-served/model", res.stderr)
+        self.assertEqual(self.printed_valid_list(res.stderr), sorted(pm.SOPHIA_FALLBACK))
+
+    def test_model_in_two_providers_on_the_endpoint_fails_closed(self):
+        clusters = [["sophia", "alcf-sophia", pm.SOPHIA_BASE, {"dup/model": [131072, False]}],
+                    ["sophia", "alcf-shadow", pm.SOPHIA_BASE, {"dup/model": [131072, True]}]]
+        res = self.run_alcf(ALCF_MODEL="dup/model", ALCF_TEST_CLUSTERS=json.dumps(clusters))
+        self.assert_refused(res)
+        self.assertIn("dup/model", res.stderr)
+        self.assertIn("alcf-sophia", res.stderr)
+        self.assertIn("alcf-shadow-reasoning", res.stderr)
+
+    def test_delegation_model_resolves_to_exactly_one_provider(self):
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL="inkling-bf16")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["delegation"],
+                         {"provider": "custom:alcf-minerva-reasoning", "model": "inkling-bf16"})
+
+    def test_ambiguous_delegation_model_fails_closed(self):
+        # gpt-oss-120b is listed by alcf-metis-reasoning AND alcf-minerva-reasoning.
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_DELEGATION_MODEL="gpt-oss-120b")
+        self.assert_refused(res)
+        self.assertIn("gpt-oss-120b", res.stderr)
+
+
 class GenericRenderMixin:
     """Reuses the bounded-entrypoint harness from tests/test_generic_inference.py."""
 
@@ -549,6 +1009,19 @@ class UpstreamRuntimeContract(UpstreamHarnessMixin, unittest.TestCase):
         self.assertNotIn("${ALCF_ACCESS_TOKEN}", config)
         ev = self.run_upstream(config, ALCF_CHECKS)
         self.assert_runtime_contract(ev, ALCF_CHECKS)
+
+    def test_positive_control_model_switch_uses_target_provider_cap(self):
+        """Proves the switch harness: a correct config switches to the 12288 cap today."""
+        ev = self.run_upstream(POSITIVE_CONTROL_CONFIG, [], ALCF_SWITCHES)
+        self.assert_switch_contract(ev, ALCF_SWITCHES)
+
+    def test_rendered_alcf_config_model_switch_uses_target_provider_cap(self):
+        config = render_alcf_config(build_test_block(), launch_provider="custom:alcf-x",
+                                    model="chatty")
+        ev = self.run_upstream(config, [], ALCF_SWITCHES)
+        self.assert_switch_contract(ev, ALCF_SWITCHES)
+        self.assertEqual(ev["unknown_key_warnings"], [],
+                         "Hermes ignored provider keys (e.g. max_tokens) in the rendered config")
 
     def test_rendered_template_fallback_resolves_caps_in_upstream(self):
         """No generated block: the committed template fallback is what Hermes loads."""
