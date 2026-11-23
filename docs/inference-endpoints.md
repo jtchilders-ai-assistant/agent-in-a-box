@@ -761,6 +761,7 @@ Models are organized by cluster and marked with the following capabilities:
     - openai/gpt-oss-20b^RT^
     - beam-1.0-fp8^RT^
     - inkling-bf16^RT^
+    - inkling-2-small^RT^ (live catalog 2026-11-23; not yet in the docs table)
 
     !!! note "Tara models are not always hot"
         No Tara model is kept always hot, so the first request after a quiet

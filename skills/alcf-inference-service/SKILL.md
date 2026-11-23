@@ -88,9 +88,12 @@ Model ids are **HuggingFace-style**: `openai/gpt-oss-120b`, `openai/gpt-oss-20b`
 embeddings `Salesforce/SFR-Embedding-Mistral`. Discover the live set via `list-endpoints`.
 
 Other clusters use `.../resource_server/<cluster>/api/v1/chat/completions` (metis,
-minerva, tara). **Tara** (`/resource_server/tara/api/v1`) hosts this agent's default
+minerva, tara), and their model ids are NOT always HuggingFace-style: Metis serves
+`gemma-4-31B-it` (no `google/` prefix); **Minerva** serves `muse-spark-bf16`,
+`mistral-large-4-nvfp4` and `inkling-2-small`. **Tara** (`/resource_server/tara/api/v1`) hosts this agent's default
 model `muse-spark-bf16` (1M context, reasoning), plus `mistral-large-4`,
-`nemotron-3-ultra`, `inkling-bf16`, `openai/gpt-oss-120b` and others. Tara models
+`nemotron-3-ultra`, `inkling-bf16`, `inkling-2-small`, `openai/gpt-oss-120b` and others.
+`muse-spark-bf16` is on both Minerva and Tara, so always name the cluster endpoint. Tara models
 are **not always hot**: the first request after a quiet period may get HTTP 503
 while the model loads — wait and retry rather than switching models.
 
