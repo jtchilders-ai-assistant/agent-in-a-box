@@ -544,6 +544,115 @@ class BaseTagContract(unittest.TestCase):
         self.assertEqual(tags, {dockerfile_base_arg()})
 
 
+def dockerfile_instructions() -> list:
+    """Dockerfile instructions with comments dropped, `\\` continuations joined
+    and whitespace runs collapsed to one space."""
+    out, cur = [], ""
+    for raw in (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("\\"):
+            cur += line[:-1] + " "
+            continue
+        out.append(cur + line)
+        cur = ""
+    if cur:
+        out.append(cur)
+    return [" ".join(i.split()) for i in out]
+
+
+# `uv` in command position (`uv pip ...`, `&& uv ...`, `uvx ...`); not "$uv" or a path.
+BARE_UV = re.compile(r"(?<![\w$/.\-\"'])uvx?\s+[\w-]")
+UV_GLOB = "/opt/hermes/tools/uv-*/uv"
+DEPS = "alcf-tokens==0.3.0 globus-compute-sdk requests"
+
+
+class DependencyInstallContract(unittest.TestCase):
+    """The base venv is PM-built and sealed; uv is internal tooling, not on PATH
+    (CI run 45195114759: `uv: not found`, exit 127). The ALCF deps must go in
+    through the base's own pinned uv, found by an exactly-one glob, behind a
+    guard that fails the build if any pre-existing package changes version."""
+
+    def install_run(self) -> str:
+        runs = [i for i in dockerfile_instructions() if i.startswith("RUN ") and DEPS in i]
+        self.assertEqual(len(runs), 1, "expected exactly one RUN installing the ALCF deps")
+        return runs[0]
+
+    def test_bare_uv_detector_catches_the_broken_line(self):
+        self.assertRegex("RUN uv pip install --python /opt/hermes/.venv/bin/python x", BARE_UV)
+        self.assertRegex("RUN set -e && uvx foo run", BARE_UV)
+        self.assertNotRegex('"$uv" pip install --python "$py" x', BARE_UV)
+        self.assertNotRegex("/opt/hermes/tools/uv-0.13.5-linux-x64/uv pip freeze", BARE_UV)
+
+    def test_dockerfile_never_invokes_bare_uv(self):
+        for inst in dockerfile_instructions():
+            if inst.startswith("RUN "):
+                self.assertNotRegex(inst, BARE_UV, f"bare uv on PATH does not exist: {inst[:80]}")
+
+    def test_install_runs_as_root_under_set_eu(self):
+        insts = dockerfile_instructions()
+        run = self.install_run()
+        users = [(n, i) for n, i in enumerate(insts) if i.startswith("USER ")]
+        before = [i for n, i in users if n < insts.index(run)]
+        self.assertTrue(before and before[-1] == "USER root", "install layer must run as root")
+        self.assertTrue(run.startswith("RUN set -eu;"), run[:40])
+
+    def test_uv_is_the_single_pinned_binary_from_the_base(self):
+        run = self.install_run()
+        self.assertIn(f"for c in {UV_GLOB}; do", run)
+        self.assertIn('[ -x "$c" ]', run)
+        self.assertRegex(run, r'if \[ "\$n" -ne 1 \]; then .*exactly one.*exit 1; fi')
+        self.assertIn('"$uv" pip install --python "$py" --no-cache ' + DEPS, run)
+        self.assertIn("py=/opt/hermes/.venv/bin/python", run)
+
+    def test_drift_guard_compares_freezes_around_the_install(self):
+        run = self.install_run()
+        before = run.index('"$uv" pip freeze --python "$py" > /tmp/venv-before.txt')
+        install = run.index('"$uv" pip install')
+        after = run.index('"$uv" pip freeze --python "$py" > /tmp/venv-after.txt')
+        self.assertLess(before, install)
+        self.assertLess(install, after)
+        self.assertRegex(run[before:install], r"\[ ! -s /tmp/venv-before.txt \].*exit 1")
+        guard = run[after:]
+        self.assertIn("grep -vxFf /tmp/venv-after.txt /tmp/venv-before.txt", guard)
+        self.assertRegex(guard, r'if \[ -n "\$changed" \]; then .*diff /tmp/venv-before.txt '
+                                r'/tmp/venv-after.txt.*exit 1; fi')
+
+    def test_install_run_is_valid_posix_sh(self):
+        res = subprocess.run(["sh", "-n", "-c", self.install_run()[len("RUN "):]],
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_drift_guard_semantics(self):
+        """Run the Dockerfile's own guard command over fake freezes: additions
+        pass; a version change or a removal is reported."""
+        run = self.install_run()
+        cmd = re.search(r'changed="\$\((grep -vxFf [^)]*)\)"', run).group(1)
+        base = "hermes-agent @ file:///opt/hermes\nrequests==2.32.5\nruamel-yaml==0.18.16\n"
+        cases = {
+            "addition only": (base + "alcf-tokens==0.3.0\n", ""),
+            "version change": (base.replace("2.32.5", "2.33.0") + "alcf-tokens==0.3.0\n",
+                               "requests==2.32.5"),
+            "removal": (base.replace("ruamel-yaml==0.18.16\n", ""), "ruamel-yaml==0.18.16"),
+        }
+        for name, (after, expected) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                script = cmd.replace("/tmp/", tmp + "/")
+                Path(tmp, "venv-before.txt").write_text(base, encoding="utf-8")
+                Path(tmp, "venv-after.txt").write_text(after, encoding="utf-8")
+                res = subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+                                     timeout=10)
+                self.assertEqual(res.stdout.strip(), expected, res.stderr)
+
+    def test_smoke_imports_after_install(self):
+        run = self.install_run()
+        smoke = run.index('"$py" -c "import hermes_cli, alcf_tokens.auth, globus_compute_sdk, '
+                          'requests, ruamel.yaml"')
+        self.assertLess(run.index('"$uv" pip install'), smoke)
+        self.assertIn("/opt/hermes/.venv/bin/alcf-tokens --help >/dev/null", run[smoke:])
+
+
 class PatchRetirementContract(unittest.TestCase):
     def test_local_tool_message_patch_is_removed(self):
         self.assertFalse(PATCH.exists(), f"{PATCH.relative_to(ROOT)} still present")

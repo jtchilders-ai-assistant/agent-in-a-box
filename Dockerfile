@@ -37,16 +37,52 @@ COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
 COPY config/Caddyfile /opt/alcf/Caddyfile
 
 # ---------------------------------------------------------------------------
-# 1. Official alcf-tokens package + Globus Compute SDK. The base image's venv
-#    is uv-managed (no pip binary), so install with `uv pip`. alcf-tokens
-#    provides the `alcf-tokens` CLI (login / get-token) and the
-#    `alcf_tokens.auth` Python API (get_access_token / get_service_authorizer)
-#    used by the runtime helpers. Pin the exact released wheel for
-#    reproducibility; bump deliberately after verifying the new version's
-#    scope/policy contract.
+# 1. Official alcf-tokens package + Globus Compute SDK. alcf-tokens provides
+#    the `alcf-tokens` CLI (login / get-token) and the `alcf_tokens.auth`
+#    Python API (get_access_token / get_service_authorizer) used by the runtime
+#    helpers. Pin the exact released wheel for reproducibility; bump
+#    deliberately after verifying the new version's scope/policy contract.
+#
+#    How: the base's /opt/hermes/.venv is built and sealed by upstream's
+#    package manager (pyvenv.cfg: hermes-pm-built = true); it has no pip, and
+#    uv is internal PM tooling, NOT on PATH. We run the base's own pinned uv
+#    (/opt/hermes/tools/uv-<version>-linux-<arch>/uv, located by glob so it
+#    works on amd64 and arm64; exactly one must exist), so the installer is the
+#    same one that built the venv. Version-drift guard: every package already
+#    in the venv must keep its exact version (additions are fine), otherwise
+#    the build fails and prints what changed -- our deps may never silently
+#    upgrade or remove the upstream sealed environment.
 # ---------------------------------------------------------------------------
-RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache \
-    alcf-tokens==0.3.0 globus-compute-sdk requests
+RUN set -eu; \
+    py=/opt/hermes/.venv/bin/python; \
+    uv=""; n=0; \
+    for c in /opt/hermes/tools/uv-*/uv; do \
+        if [ -f "$c" ] && [ -x "$c" ]; then uv="$c"; n=$((n + 1)); fi; \
+    done; \
+    if [ "$n" -ne 1 ]; then \
+        echo "ERROR: expected exactly one executable /opt/hermes/tools/uv-*/uv in the base image, found $n" >&2; \
+        ls -d /opt/hermes/tools/uv-* >&2 || true; \
+        exit 1; \
+    fi; \
+    echo "Using the base image's pinned uv: $uv ($("$uv" --version))"; \
+    "$uv" pip freeze --python "$py" > /tmp/venv-before.txt; \
+    if [ ! -s /tmp/venv-before.txt ]; then \
+        echo "ERROR: empty package snapshot of $py; refusing to install without a drift guard" >&2; \
+        exit 1; \
+    fi; \
+    "$uv" pip install --python "$py" --no-cache \
+        alcf-tokens==0.3.0 globus-compute-sdk requests; \
+    "$uv" pip freeze --python "$py" > /tmp/venv-after.txt; \
+    changed="$(grep -vxFf /tmp/venv-after.txt /tmp/venv-before.txt || true)"; \
+    if [ -n "$changed" ]; then \
+        echo "ERROR: installing the ALCF deps changed or removed packages in the sealed base venv:" >&2; \
+        echo "$changed" >&2; \
+        diff /tmp/venv-before.txt /tmp/venv-after.txt >&2 || true; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/venv-before.txt /tmp/venv-after.txt; \
+    "$py" -c "import hermes_cli, alcf_tokens.auth, globus_compute_sdk, requests, ruamel.yaml"; \
+    /opt/hermes/.venv/bin/alcf-tokens --help >/dev/null
 
 # ---------------------------------------------------------------------------
 # 2. ALCF content (changes most often -> last for cache friendliness).
