@@ -368,6 +368,14 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
 ''')
 
 
+def run_populate_cli(*args, stdin: str) -> subprocess.CompletedProcess:
+    """Run scripts/populate_models.py with a fake token and no caller credentials."""
+    env = {k: v for k, v in os.environ.items() if not k.endswith(("_TOKEN", "_API_KEY"))}
+    env["ALCF_INFER_TOKEN"] = FAKE_TOKEN
+    return subprocess.run([sys.executable, str(SCRIPTS / "populate_models.py"), *args],
+                          input=stdin, text=True, capture_output=True, env=env, timeout=30)
+
+
 UPSTREAM_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TMPDIR")
 
 
@@ -654,9 +662,10 @@ class TemplateFallbackContract(unittest.TestCase):
         assert_provider_schema(self, doc, where="config.template.yaml")
 
 
-class ProviderParsingContract(unittest.TestCase):
-    """pm.parse_providers is the yaml-free structured reader entrypoint.sh uses
-    (the Hermes runtime venv ships no PyYAML): {key: {"api", "models": {id: ctx}}}."""
+class ProviderParsingContract(UpstreamHarnessMixin, unittest.TestCase):
+    """pm.parse_providers is the structured reader entrypoint.sh uses: a real YAML
+    parser (ruamel.yaml, which the Hermes runtime venv ships, else PyYAML) and
+    {key: {"api", "models": {id: ctx}}}. Anything unreadable fails closed."""
 
     @staticmethod
     def via_yaml(text: str) -> dict:
@@ -700,6 +709,93 @@ class ProviderParsingContract(unittest.TestCase):
         for text in ("custom_providers:\n  - name: a\n", "model:\n  provider: x\n", ""):
             with self.subTest(text=text):
                 self.assertEqual(pm.parse_providers(text), {})
+
+    def test_malformed_yaml_fails_closed(self):
+        """Invalid YAML never yields a partial map: the first provider below is
+        well formed, so a line-oriented reader would happily return it."""
+        good = textwrap.dedent('''\
+            providers:
+              alcf-x:
+                api: "https://h/v1"
+                models:
+                  chatty:
+                    context_length: 131072
+            ''')
+        for bad in (good + '  alcf-y: [unclosed\n',
+                    good + '  alcf-y:\n    api: "https://h/v1\n',
+                    good + '\tbad-tab: 1\n',
+                    good + '  alcf-x:\n    api: "https://dup/v1"\n    models: {}\n'):
+            with self.subTest(bad=bad[len(good):]):
+                with self.assertRaises(pm.ProviderParseError):
+                    pm.parse_providers(bad)
+                with self.assertRaises(pm.LaunchProviderError):
+                    pm.launch_provider("chatty", bad, "https://h/v1")
+
+    def test_malformed_structure_fails_closed(self):
+        for bad in ("- providers\n",
+                    "providers:\n",
+                    "providers: [a, b]\n",
+                    "providers:\n  alcf-x: just-a-string\n",
+                    "providers:\n  alcf-x:\n    models: {m: {context_length: 70000}}\n",
+                    "providers:\n  alcf-x:\n    api: https://h/v1\n",
+                    "providers:\n  alcf-x:\n    api: https://h/v1\n    models: [m]\n",
+                    "providers:\n  alcf-x:\n    api: https://h/v1\n    models: {m: {}}\n",
+                    "providers:\n  alcf-x:\n    api: https://h/v1\n"
+                    "    models: {m: {context_length: big}}\n"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(pm.ProviderParseError):
+                    pm.parse_providers(bad)
+
+    def test_no_yaml_parser_fails_closed(self):
+        block = build_test_block()
+        with mock.patch.dict(sys.modules, {"ruamel": None, "ruamel.yaml": None, "yaml": None}):
+            with self.assertRaises(pm.ProviderParseError) as cm:
+                pm.parse_providers(block)
+        self.assertIn("no YAML parser", str(cm.exception))
+
+    def test_cli_fails_closed_on_malformed_yaml(self):
+        bad = CROSS_CLUSTER_BLOCK + "  alcf-c: [unclosed\n"
+        for args in (("--launch-provider", "plain-b", "--base-url", "https://h/b/v1"),
+                     ("--list-models", "--base-url", "https://h/b/v1")):
+            with self.subTest(args=args):
+                res = run_populate_cli(*args, stdin=bad)
+                self.assertEqual(res.returncode, 1, res.stderr)
+                self.assertEqual(res.stdout.strip(), "")
+                self.assertIn("not valid YAML", res.stderr)
+                self.assertNotIn(FAKE_TOKEN, res.stderr)
+
+    def test_ruamel_path_under_upstream_runtime(self):
+        """Under the Hermes runtime interpreter (ruamel.yaml; PyYAML blocked so it
+        cannot be the one used) the reader and CLI agree with PyYAML here."""
+        root = self.upstream()
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "alcf_tokens"
+            stub.mkdir()
+            (stub / "__init__.py").write_text("", encoding="utf-8")
+            (stub / "auth.py").write_text(
+                "def get_access_token(*a, **k):\n    raise RuntimeError('offline test')\n",
+                encoding="utf-8")
+            code = textwrap.dedent(f'''\
+                import io, json, sys
+                sys.modules["yaml"] = None
+                sys.path[:0] = [{str(SCRIPTS)!r}, {tmp!r}]
+                import populate_models as pm
+                block = sys.stdin.read()
+                print(json.dumps(pm.parse_providers(block), sort_keys=True))
+                sys.stdin = io.StringIO(block)
+                sys.argv = ["populate_models.py", "--launch-provider", "shared-model",
+                            "--base-url", "https://h/b/v1"]
+                sys.exit(pm.main())
+                ''')
+            env = upstream_subprocess_env(root, home=Path(tmp), hermes_home=Path(tmp))
+            env.pop("PYTHONPATH")
+            res = subprocess.run([str(root / ".venv" / "bin" / "python"), "-c", code],
+                                 input=CROSS_CLUSTER_BLOCK, text=True, capture_output=True,
+                                 env=env, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        parsed, provider = res.stdout.strip().splitlines()
+        self.assertEqual(json.loads(parsed), self.via_yaml(CROSS_CLUSTER_BLOCK))
+        self.assertEqual(provider, "custom:alcf-b-reasoning")
 
 
 CROSS_CLUSTER_BLOCK = textwrap.dedent(f'''\
@@ -804,10 +900,7 @@ class LaunchProviderContract(unittest.TestCase):
             pm.launch_provider("shared-model", CROSS_CLUSTER_BLOCK)
 
     def run_cli(self, *args, stdin=CROSS_CLUSTER_BLOCK):
-        env = {k: v for k, v in os.environ.items() if not k.endswith(("_TOKEN", "_API_KEY"))}
-        env["ALCF_INFER_TOKEN"] = FAKE_TOKEN
-        return subprocess.run([sys.executable, str(SCRIPTS / "populate_models.py"), *args],
-                              input=stdin, text=True, capture_output=True, env=env, timeout=30)
+        return run_populate_cli(*args, stdin=stdin)
 
     def test_cli_selects_exactly_one_provider(self):
         res = self.run_cli("--launch-provider", "plain-b", "--base-url", "https://h/b/v1")

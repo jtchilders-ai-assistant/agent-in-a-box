@@ -70,8 +70,8 @@ Usage
 
 Prints the YAML block to stdout (and to --out if given). --launch-provider and
 --list-models read an already-generated block (or a whole config) on stdin,
-parse it without PyYAML (the Hermes runtime venv has none) and never touch the
-network. Reads:
+parse it with ruamel.yaml (the Hermes runtime venv's parser) or PyYAML, exit 1
+if it cannot be parsed, and never touch the network. Reads:
     ALCF_INFER_TOKEN    optional pre-fetched inference token
     ALCF_PY             python used to run the auth helper (default: this python)
     ALCF_ENABLE_METIS   include the Metis provider?   "1" (default) / "0"
@@ -724,66 +724,83 @@ class LaunchProviderError(Exception):
     """The launch/delegation model does not map to exactly one provider."""
 
 
-def _scalar(s: str) -> tuple:
-    """Split a leading YAML scalar off ``s`` -> (value, rest).
-
-    Handles "double" and 'single' quoting; a bare scalar ends at the first
-    ``:`` that is followed by whitespace or end-of-line (YAML's key separator).
-    """
-    if s.startswith('"'):
-        m = re.match(r'"((?:[^"\\]|\\.)*)"', s)
-        if m:
-            return json.loads(m.group(0)), s[m.end():]
-    if s.startswith("'"):
-        m = re.match(r"'((?:[^']|'')*)'", s)
-        if m:
-            return m.group(1).replace("''", "'"), s[m.end():]
-    m = re.search(r":(\s|$)", s)
-    return (s[:m.start()], s[m.start():]) if m else (s, "")
+class ProviderParseError(LaunchProviderError):
+    """The providers text cannot be read: no YAML parser, bad YAML or bad shape."""
 
 
-def _key_value(line: str) -> tuple:
-    """``key: value  # comment`` -> (key, value); (None, None) if not a key line."""
-    key, rest = _scalar(line)
-    if not rest.startswith(":"):
-        return None, None
-    rest = rest[1:].strip()
-    if rest.startswith(('"', "'")):
-        return key, _scalar(rest)[0]
-    return key, re.sub(r"(^|\s)#.*$", "", rest).strip()
+def _yaml_load(text: str):
+    """Parse ``text`` with ruamel.yaml (what the Hermes runtime venv ships), else
+    PyYAML. With neither importable, or on any parse error, raise
+    ProviderParseError: a half-read block must never pick a provider."""
+    try:
+        from ruamel.yaml import YAML
+    except ImportError:
+        YAML = None
+    if YAML is not None:
+        try:
+            return YAML(typ="safe", pure=True).load(text)
+        except Exception as e:  # ruamel raises several unrelated error types
+            raise ProviderParseError(f"providers text is not valid YAML: {e}") from None
+    try:
+        import yaml
+    except ImportError:
+        raise ProviderParseError(
+            "no YAML parser available (need ruamel.yaml or PyYAML)") from None
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        """SafeLoader that, like ruamel, rejects duplicate mapping keys."""
+
+        def construct_mapping(self, node, deep=False):
+            seen = set()
+            for key_node, _value in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, f"duplicate key {key!r}", key_node.start_mark)
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
+    try:
+        return yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 (SafeLoader subclass)
+    except Exception as e:
+        raise ProviderParseError(f"providers text is not valid YAML: {e}") from None
 
 
 def parse_providers(text: str) -> dict:
-    """Read the ``providers:`` mapping of a config or block WITHOUT PyYAML.
+    """Read the ``providers:`` mapping of a config or block with a real YAML parser.
 
-    The entrypoint runs this under the Hermes runtime venv, which ships no
-    PyYAML. It understands the block-style subset this script and the template
-    emit (indented ``key: value`` lines, comments, quoted keys and values) and
-    returns ``{provider_key: {"api": url, "models": {model_id: context_length}}}``.
-    Text with no top-level ``providers:`` mapping (e.g. the legacy
-    ``custom_providers:`` list) yields ``{}``.
+    Returns ``{provider_key: {"api": url, "models": {model_id: context_length}}}``.
+    Text with no top-level ``providers:`` key (e.g. the legacy
+    ``custom_providers:`` list, or empty text) yields ``{}``. Anything else
+    that is not that shape -- invalid YAML, a non-mapping ``providers``, an
+    entry without a string ``api`` and a ``models`` mapping, a model without an
+    integer ``context_length`` -- raises ProviderParseError (fail closed).
     """
+    doc = _yaml_load(text or "")
+    if doc is None:
+        return {}
+    if not isinstance(doc, dict):
+        raise ProviderParseError("providers text is not a YAML mapping")
+    if "providers" not in doc:
+        return {}
+    providers = doc["providers"]
+    if not isinstance(providers, dict):
+        raise ProviderParseError("'providers' is not a mapping")
     out: dict = {}
-    path: list = []  # [(indent, key)] from the root down to the current line
-    for raw in (text or "").splitlines():
-        body = raw.lstrip(" ")
-        if not body or body.startswith("#"):
-            continue
-        indent = len(raw) - len(body)
-        key, val = _key_value(body)
-        while path and path[-1][0] >= indent:
-            path.pop()
-        path.append((indent, key))
-        keys = [k for _i, k in path]
-        if keys[0] != "providers" or key is None:
-            continue
-        if len(keys) == 2:
-            out.setdefault(key, {"api": "", "models": {}})
-        elif len(keys) == 3 and key == "api" and keys[1] in out:
-            out[keys[1]]["api"] = val
-        elif (len(keys) == 5 and keys[2] == "models" and key == "context_length"
-              and keys[1] in out and val.isdigit()):
-            out[keys[1]]["models"][keys[3]] = int(val)
+    for key, entry in providers.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            raise ProviderParseError(f"provider {key!r} is not a named mapping")
+        api, models = entry.get("api"), entry.get("models")
+        if not isinstance(api, str) or not isinstance(models, dict):
+            raise ProviderParseError(
+                f"provider {key!r} needs a string 'api' and a 'models' mapping")
+        out[key] = {"api": api, "models": {}}
+        for mid, meta in models.items():
+            ctx = meta.get("context_length") if isinstance(meta, dict) else None
+            if (not isinstance(mid, str) or not isinstance(ctx, int)
+                    or isinstance(ctx, bool)):
+                raise ProviderParseError(
+                    f"provider {key!r} model {mid!r} needs an integer context_length")
+            out[key]["models"][mid] = ctx
     return out
 
 
@@ -863,7 +880,11 @@ def main() -> int:
         return 0
 
     if args.list_models:
-        ids = list_models(sys.stdin.read(), args.base_url or None)
+        try:
+            ids = list_models(sys.stdin.read(), args.base_url or None)
+        except ProviderParseError as e:
+            print(f"[populate_models] {e}", file=sys.stderr)
+            return 1
         if not ids:
             return 1
         sys.stdout.write(", ".join(ids) + "\n")
