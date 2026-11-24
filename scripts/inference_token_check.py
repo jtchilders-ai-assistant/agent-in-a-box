@@ -13,6 +13,10 @@ Two steps:
    an uncaught traceback, also exit 1 -- that is `unavailable`, NOT `auth`.
    A Globus API error is classified by its HTTP status: 401/403 and a
    rejected refresh token (400 invalid_grant) are `auth`, other 4xx `unknown`.
+   A timeout exception (TimeoutError, socket.timeout, requests Timeout,
+   urllib3 Read/ConnectTimeoutError, GlobusTimeoutError) is `unavailable`.
+   Only the TERMINAL exception of the last traceback (plus the body lines
+   after it) is examined: an earlier, chained exception never decides.
    Any other traceback, and any non-traceback failure without the real
    AuthError text (e.g. "Unknown token name"), is `unknown`.
 2. get-token exits 0 with a locally cached/refreshed token even when ALCF
@@ -67,6 +71,20 @@ UNAVAILABLE_HTTP = {408, 429}
 # Only the tuple's status field is read, so a "503" in the URL or body cannot
 # be mistaken for the status.
 _GLOBUS_API_STATUS = re.compile(r"APIError:\s*\(\s*'[A-Z]+',\s*'[^']*',\s*[^,]*,\s*(\d{3})\b")
+# Exception class names (last dotted component) that mean a timeout: builtin
+# TimeoutError, socket.timeout, requests' Timeout/ReadTimeout/ConnectTimeout,
+# urllib3's TimeoutError/ReadTimeoutError/ConnectTimeoutError, and
+# globus_sdk's GlobusTimeoutError. Matched against the terminal exception's
+# NAME only, never its message or the response body.
+TIMEOUT_EXCEPTIONS = frozenset({
+    "TimeoutError", "timeout", "Timeout", "ReadTimeout", "ConnectTimeout",
+    "ReadTimeoutError", "ConnectTimeoutError", "GlobusTimeoutError",
+})
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
+# A top-level (column 0) exception line: "pkg.mod.SomeError: message" or a bare
+# "SomeError".
+_EXCEPTION_LINE = re.compile(
+    r"^(?:[A-Za-z_][\w.]*(?:Error|Exception|Timeout|timeout)\b|[A-Za-z_][\w.]*: )")
 # The real alcf-tokens AuthError messages (alcf_tokens/auth.py): only these make
 # a non-traceback get-token failure `auth`.
 _AUTH_ERROR_MARKERS = ("No valid tokens found", "Please authenticate by running")
@@ -154,6 +172,30 @@ def _network_marker(stderr: str):
     return None
 
 
+def _terminal_exception(stderr: str):
+    """The terminal exception of the LAST traceback in *stderr*: its exception
+    line plus every line after it (a Globus API error's response body follows
+    its tuple line). '' when there is a traceback but no exception line; None
+    when there is no traceback. Earlier, chained exceptions are excluded."""
+    head, sep, tail = stderr.rpartition(_TRACEBACK_HEADER)
+    if not sep:
+        return None
+    lines = tail.splitlines()
+    # The frames are indented; the first column-0 exception line ends them.
+    # Taking the FIRST (not the last) keeps body lines that happen to look like
+    # an exception from being mistaken for it.
+    for i, line in enumerate(lines):
+        if _EXCEPTION_LINE.match(line):
+            return "\n".join(lines[i:])
+    return ""
+
+
+def _exception_name(terminal: str) -> str:
+    """Last dotted component of the terminal exception's class name."""
+    first = terminal.split("\n", 1)[0]
+    return first.split(":", 1)[0].strip().rsplit(".", 1)[-1]
+
+
 def classify_get_token(returncode: int, stdout: str, stderr: str):
     """(status, reason) for a FAILED `alcf-tokens get-token inference`, or None
     when it printed a token (then test-token decides). *stdout* is only
@@ -163,20 +205,30 @@ def classify_get_token(returncode: int, stdout: str, stderr: str):
         if (stdout or "").strip():
             return None
         return "unknown", "get-token printed no token"
-    match = _GLOBUS_API_STATUS.search(stderr)
+    # A traceback is decided on its terminal exception only; plain stderr (an
+    # AuthError message, a shell error) is examined whole.
+    terminal = _terminal_exception(stderr)
+    text = stderr if terminal is None else terminal
+    # In a traceback the status tuple must be on the terminal exception line
+    # itself (its body lines follow and cannot supply one).
+    match = _GLOBUS_API_STATUS.search(text if terminal is None else text.split("\n", 1)[0])
     if match:
         code = int(match.group(1))
         if code in (401, 403):
             return "auth", f"get-token inference failed: Globus HTTP {code}"
         if code >= 500 or code in UNAVAILABLE_HTTP:
             return "unavailable", f"get-token: Globus HTTP {code}"
-        if code == 400 and "invalid_grant" in stderr[match.end():]:
+        if code == 400 and "invalid_grant" in text[match.end():]:
             return "auth", "get-token inference failed: refresh token rejected (invalid_grant)"
         return "unknown", f"get-token: Globus HTTP {code}"
-    marker = _network_marker(stderr)
+    if terminal:
+        name = _exception_name(terminal)
+        if name in TIMEOUT_EXCEPTIONS:
+            return "unavailable", f"get-token network timeout: {name}"
+    marker = _network_marker(text)
     if marker:
         return "unavailable", f"get-token network error: {marker}"
-    if "Traceback" in stderr:
+    if terminal is not None or "Traceback" in stderr:
         return "unknown", f"get-token failed unexpectedly (exit {returncode})"
     if any(m in stderr for m in _AUTH_ERROR_MARKERS):
         return "auth", f"get-token inference failed: {_auth_phrase(stderr)}"

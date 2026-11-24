@@ -130,6 +130,54 @@ GET_TOKEN_CASES = {
             400, '{"error":"invalid_request","detail":"HTTP 503 upstream","request_id":"503"}',
             url="https://auth.globus.org/v2/oauth2/token?retry=503"),
         want=("unknown", "get-token: Globus HTTP 400")),
+    # Timeouts (decided on the terminal exception's NAME) are unreachable.
+    "builtin_timeout_error": dict(
+        stderr=_traceback("TimeoutError: timed out"),
+        want=("unavailable", "get-token network timeout: TimeoutError")),
+    "socket_timeout": dict(
+        stderr=_traceback("socket.timeout: timed out"),
+        want=("unavailable", "get-token network timeout: timeout")),
+    "requests_timeout": dict(
+        stderr=_traceback("requests.exceptions.Timeout: HTTPSConnectionPool(host='auth.globus.org'"
+                          ", port=443): Read timed out. (read timeout=60)"),
+        want=("unavailable", "get-token network timeout: Timeout")),
+    "urllib3_timeout_error": dict(
+        stderr=_traceback("urllib3.exceptions.TimeoutError: timed out"),
+        want=("unavailable", "get-token network timeout: TimeoutError")),
+    "read_timeout_error": dict(
+        stderr=_traceback("urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool("
+                          "host='auth.globus.org', port=443): Read timed out."),
+        want=("unavailable", "get-token network timeout: ReadTimeoutError")),
+    "connect_timeout_error": dict(
+        stderr=_traceback("urllib3.exceptions.ConnectTimeoutError: (<conn>, 'Connection to "
+                          "auth.globus.org timed out.')"),
+        want=("unavailable", "get-token network timeout: ConnectTimeoutError")),
+    "globus_timeout_error": dict(
+        stderr=_traceback("globus_sdk.transport.requests.GlobusTimeoutError: timed out"),
+        want=("unavailable", "get-token network timeout: GlobusTimeoutError")),
+    "globus_tuple_401_body_mentions_timeout": dict(
+        stderr=_globus_api_error(
+            401, 'TimeoutError: session timeout\n{"error":"invalid_token","detail":"timeout"}'),
+        want=("auth", "get-token inference failed: Globus HTTP 401")),
+    "message_mentions_timeout_but_is_not_one": dict(
+        stderr=_traceback("KeyError: 'TimeoutError timeout'"),
+        want=("unknown", "get-token failed unexpectedly (exit 1)")),
+    # Chained tracebacks: only the TERMINAL exception decides.
+    "chained_401_then_keyerror": dict(
+        stderr=(_globus_api_error(401, '{"error":"invalid_token"}')
+                + "\nDuring handling of the above exception, another exception occurred:\n\n"
+                + _traceback("KeyError: 'access_token'")),
+        want=("unknown", "get-token failed unexpectedly (exit 1)")),
+    "chained_keyerror_then_503": dict(
+        stderr=(_traceback("KeyError: 'access_token'")
+                + "\nDuring handling of the above exception, another exception occurred:\n\n"
+                + _globus_api_error(503, "<html>Service Unavailable</html>")),
+        want=("unavailable", "get-token: Globus HTTP 503")),
+    "chained_connection_error_then_keyerror": dict(
+        stderr=(_traceback("requests.exceptions.ConnectionError: Max retries exceeded")
+                + "\nThe above exception was the direct cause of the following exception:\n\n"
+                + _traceback("KeyError: 'access_token'")),
+        want=("unknown", "get-token failed unexpectedly (exit 1)")),
     "unknown_traceback": dict(
         stderr=_traceback("KeyError: 'access_token'"),
         want=("unknown", "get-token failed unexpectedly (exit 1)")),
