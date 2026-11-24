@@ -9,9 +9,12 @@ Run:  python3 -m unittest discover -s tests -v
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO, "scripts")
@@ -44,6 +47,8 @@ METIS_MODELS = [
     {"id": "Mistral-Large-3-675B-Instruct-2512", "framework": "api"},
 ]
 
+# The 2026-08-24 live Minerva capture: it exercises the capabilities selector,
+# not today's model set (that is MINERVA_FALLBACK / TestMinervaFallback).
 MINERVA_MODELS = [
     {"id": "gpt-oss-120b", "framework": "api", "capabilities": {
         "context_window_tokens": 131072, "reasoning": {"supported": True},
@@ -54,6 +59,26 @@ MINERVA_MODELS = [
     {"id": "nemotron-3-ultra", "framework": "api", "capabilities": {
         "context_window_tokens": 262144, "reasoning": {"supported": True},
         "api_protocols": ["chat_completions", "responses"]}},
+]
+
+# Tara publishes the same capabilities schema (v1) as Minerva. Ids/windows from
+# the ALCF models doc (plans/evidence/tara/alcf-models-doc-2026-11-23.md); the
+# responses-only and sub-floor entries are synthetic negatives.
+TARA_MODELS = [
+    {"id": "muse-spark-bf16", "framework": "api", "capabilities": {
+        "context_window_tokens": 1048576, "reasoning": {"supported": True},
+        "api_protocols": ["chat_completions", "responses"]}},
+    {"id": "openai/gpt-oss-20b", "framework": "api", "capabilities": {
+        "context_window_tokens": 65536, "reasoning": {"supported": True},
+        "api_protocols": ["chat_completions"]}},
+    # no chat_completions protocol -> not a chat model for Hermes
+    {"id": "responses-only-model", "framework": "api", "capabilities": {
+        "context_window_tokens": 1048576, "reasoning": {"supported": True},
+        "api_protocols": ["responses"]}},
+    # below the 64k floor -> excluded and recorded under tara
+    {"id": "small-window-model", "framework": "api", "capabilities": {
+        "context_window_tokens": 32768, "reasoning": {"supported": False},
+        "api_protocols": ["chat_completions"]}},
 ]
 
 # Sophia was fully down at capture time: nothing running, two queued jobs whose
@@ -129,6 +154,83 @@ class TestSelectors(unittest.TestCase):
         self.assertEqual(sel["plain-chat-model"],
                          (pm.MINERVA_DEFAULT_CONTEXT, False))
 
+    def test_tara_reads_capabilities(self):
+        sel = pm._select_tara(TARA_MODELS)
+        self.assertEqual(sel, {"muse-spark-bf16": (1048576, True),
+                               "openai/gpt-oss-20b": (65536, True)})
+
+    def test_tara_skips_model_without_chat_completions(self):
+        self.assertNotIn("responses-only-model", pm._select_tara(TARA_MODELS))
+        self.assertNotIn("responses-only-model", pm.EXCLUDED_BY_FLOOR.get("tara", {}))
+
+    def test_tara_sub_floor_model_excluded_and_recorded(self):
+        sel = pm._select_tara(TARA_MODELS)
+        self.assertNotIn("small-window-model", sel)
+        self.assertEqual(pm.EXCLUDED_BY_FLOOR["tara"]["small-window-model"], 32768)
+        self.assertNotIn("minerva", pm.EXCLUDED_BY_FLOOR)
+
+    def test_tara_falls_back_to_default_window_without_capabilities(self):
+        sel = pm._select_tara([{"id": "plain-chat-model", "framework": "api"}])
+        self.assertEqual(sel["plain-chat-model"], (pm.TARA_DEFAULT_CONTEXT, False))
+
+    def test_minerva_and_tara_share_one_capabilities_selector(self):
+        # One implementation parameterised by cluster + default window, not a copy.
+        for cluster, default in (("minerva", pm.MINERVA_DEFAULT_CONTEXT),
+                                 ("tara", pm.TARA_DEFAULT_CONTEXT)):
+            with self.subTest(cluster=cluster):
+                pm.EXCLUDED_BY_FLOOR.clear()
+                sel = pm._select_capabilities(cluster, default)(TARA_MODELS + [
+                    {"id": "plain-chat-model", "framework": "api"}])
+                self.assertEqual(sel["plain-chat-model"], (default, False))
+                self.assertEqual(set(pm.EXCLUDED_BY_FLOOR), {cluster})
+
+
+class TestMinervaFallback(unittest.TestCase):
+    def test_fallback_is_the_documented_table(self):
+        # The Minerva table of plans/evidence/tara/alcf-models-doc-2026-11-23.md.
+        self.assertEqual(pm.MINERVA_FALLBACK, {
+            "muse-spark-bf16": (1048576, True),
+            "mistral-large-4-nvfp4": (1048576, True),
+            "inkling-2-small": (1048576, True),
+        })
+
+    def test_muse_spark_is_on_minerva_and_tara(self):
+        self.assertIn("muse-spark-bf16", pm.MINERVA_FALLBACK)
+        self.assertIn("muse-spark-bf16", pm.TARA_FALLBACK)
+
+
+class TestTaraFallback(unittest.TestCase):
+    def test_fallback_is_the_documented_table(self):
+        self.assertEqual(pm.TARA_FALLBACK, {
+            "google/gemma-4-31B-it-262k": (262144, True),
+            "muse-spark-bf16": (1048576, True),
+            "mistral-large-4": (1048576, True),
+            "nemotron-3-ultra": (1048576, True),
+            "nemotron-35-super-vl": (1048576, True),
+            "openai/gpt-oss-120b": (131072, True),
+            "openai/gpt-oss-20b": (65536, True),
+            "beam-1.0-fp8": (1048576, True),
+            "inkling-bf16": (1048576, True),
+            "inkling-2-small": (1048576, True),
+        })
+
+    def test_catalog_failure_uses_fallback(self):
+        with mock.patch.object(pm, "_fetch_models", side_effect=RuntimeError("offline test")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            mapping, src = pm._resolve_cluster("tara", "fake-token", pm._select_tara,
+                                               pm.TARA_FALLBACK)
+        self.assertEqual(src, "fallback")
+        self.assertEqual(mapping, pm.TARA_FALLBACK)
+
+    def test_tara_is_registered_with_its_endpoint(self):
+        (entry,) = [c for c in pm._clusters() if c[0] == "tara"]
+        _cluster, provider, base, selector, fallback = entry
+        self.assertEqual(provider, "alcf-tara")
+        self.assertEqual(base, f"{pm.INFER_HOST}/tara/api/v1")
+        self.assertEqual(base, pm.TARA_BASE)
+        self.assertIs(selector, pm._select_tara)
+        self.assertIs(fallback, pm.TARA_FALLBACK)
+
 
 class TestJobClassification(unittest.TestCase):
     """_fetch_job_states parsing, exercised through the pure helpers."""
@@ -168,19 +270,22 @@ class TestFormatting(unittest.TestCase):
 
 
 class TestClusterRegistry(unittest.TestCase):
-    def test_default_registry_has_three_serving_clusters(self):
+    def test_default_registry_has_four_serving_clusters(self):
         names = [c[0] for c in pm._clusters()]
-        self.assertEqual(names, ["sophia", "metis", "minerva"])
+        self.assertEqual(names, ["sophia", "metis", "minerva", "tara"])
 
     def test_toggles_drop_clusters(self):
         self.assertEqual([c[0] for c in pm._clusters(include_minerva=False)],
-                         ["sophia", "metis"])
+                         ["sophia", "metis", "tara"])
         self.assertEqual([c[0] for c in pm._clusters(include_metis=False)],
-                         ["sophia", "minerva"])
+                         ["sophia", "minerva", "tara"])
+        self.assertEqual([c[0] for c in pm._clusters(include_tara=False)],
+                         ["sophia", "metis", "minerva"])
 
     def test_provisioning_cluster_has_no_provider(self):
-        # tara is registered upstream but serves nothing yet; it must never
-        # produce a provider block (its models list is empty).
+        # A cluster registered upstream that serves nothing yet must never
+        # produce a provider block. None is provisioning today (tara serves).
+        self.assertEqual(pm.PROVISIONING_CLUSTERS, ())
         names = [c[0] for c in pm._clusters()]
         for cluster in pm.PROVISIONING_CLUSTERS:
             self.assertNotIn(cluster, names)
@@ -194,6 +299,92 @@ class TestClusterRegistry(unittest.TestCase):
                 self.assertGreaterEqual(
                     ctx, pm.MIN_CONTEXT,
                     f"{cluster} fallback {mid} is below the context floor")
+
+
+class TestTaraToggle(unittest.TestCase):
+    """ALCF_ENABLE_TARA=0 drops Tara unless it is the launch cluster."""
+
+    def providers(self, launch="", **build_kwargs):
+        env = {"ALCF_LAUNCH_CLUSTER": launch}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(pm, "_get_token", side_effect=RuntimeError("offline test")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            block = pm.build_block(**build_kwargs)
+        return block, err.getvalue()
+
+    def test_disabled_tara_is_dropped(self):
+        block, err = self.providers(launch="sophia", include_tara=False)
+        self.assertNotIn("alcf-tara", block)
+        self.assertNotIn("launch cluster", err)
+
+    def test_disabled_tara_kept_when_it_is_the_launch_cluster(self):
+        block, err = self.providers(launch="tara", include_tara=False)
+        self.assertIn("  alcf-tara-reasoning:\n", block)
+        self.assertIn("ALCF_ENABLE_TARA=0 overridden: tara is the launch cluster", err)
+
+    def test_main_reads_the_env_flag_and_cli_switch(self):
+        for argv, env, want in ((["populate_models.py"], {"ALCF_ENABLE_TARA": "0"}, False),
+                                (["populate_models.py"], {"ALCF_ENABLE_TARA": "1"}, True),
+                                (["populate_models.py", "--no-tara"], {}, False)):
+            with self.subTest(argv=argv, env=env):
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch.dict(os.environ, env), \
+                        mock.patch.object(pm, "build_block", return_value="providers:\n") as bb, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(pm.main(), 0)
+                self.assertEqual(bb.call_args.kwargs["include_tara"], want)
+
+    def test_status_report_reads_the_env_flag(self):
+        seen = []
+
+        def spy(**kwargs):
+            seen.append(kwargs["include_tara"])
+            return []
+
+        for env, want in (({"ALCF_ENABLE_TARA": "0", "ALCF_LAUNCH_CLUSTER": "sophia"}, False),
+                          ({"ALCF_ENABLE_TARA": "0", "ALCF_LAUNCH_CLUSTER": "tara"}, True)):
+            with self.subTest(env=env):
+                seen.clear()
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(pm, "_get_token", return_value="fake-token"), \
+                        mock.patch.object(pm, "_clusters", side_effect=spy), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    pm.status_report()
+                self.assertEqual(seen, [want])
+
+
+class TestStatusReportWarning(unittest.TestCase):
+    """The "no model is LIVE" warning needs at least one cluster whose /jobs
+    status was actually read; unknown everywhere is not "none live"."""
+
+    CLUSTERS = [("a", "alcf-a", "https://h/a/v1", None, {"m1": (131072, True)}),
+                ("b", "alcf-b", "https://h/b/v1", None, {"m2": (131072, False)})]
+
+    def report(self, job_states):
+        with mock.patch.object(pm, "_get_token", return_value="fake-token"), \
+                mock.patch.object(pm, "_clusters", return_value=self.CLUSTERS), \
+                mock.patch.object(pm, "_resolve_cluster",
+                                  side_effect=lambda c, _t, _s, fb: (dict(fb), "fallback")), \
+                mock.patch.object(pm, "_fetch_job_states", side_effect=job_states), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pm.status_report(), 0)
+        return out.getvalue()
+
+    def test_no_warning_when_every_status_is_unknown(self):
+        out = self.report(RuntimeError("offline test"))
+        self.assertEqual(out.count("status unknown"), 2)
+        self.assertNotIn("no model is LIVE", out)
+
+    def test_warning_when_a_known_cluster_has_nothing_live(self):
+        out = self.report([RuntimeError("offline test"), (set(), {})])
+        self.assertIn("status unknown", out)
+        self.assertIn("WARNING: no model is LIVE on any cluster", out)
+
+    def test_no_warning_when_a_model_is_live(self):
+        out = self.report([(set(), {}), ({"m2"}, {})])
+        self.assertNotIn("no model is LIVE", out)
 
 
 class TestEmit(unittest.TestCase):

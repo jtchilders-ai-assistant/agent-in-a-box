@@ -15,9 +15,10 @@
 #   3. ALCF content baked as image defaults: skills, curated MEMORY.md, a docs
 #      snapshot, the config template, SOUL.md, the runtime helper scripts
 #      (Globus/IRI facility helpers, remote bash + its MCP server, context-window
-#      and model-catalog resolvers, generic-inference validator) and our
-#      entrypoint, which does first-run Globus auth, renders the config with a
-#      fresh token, and launches the dashboard.
+#      and model-catalog resolvers, generic-inference validator, live
+#      inference-token check) and our entrypoint, which does first-run Globus
+#      auth, renders the config (ALCF providers mint their token per request
+#      via key_cmd), and launches the dashboard.
 #   4. The ALCF-agent-box git revision + build date (/opt/alcf/.alcf_version).
 #   5. ALCF_* ENV defaults, a healthcheck through Caddy, and the entrypoint,
 #      run as the non-root hermes user.
@@ -130,11 +131,12 @@ COPY scripts/alcf_bash_mcp.py /opt/alcf/alcf_bash_mcp.py
 COPY scripts/resolve_context_length.py /opt/alcf/resolve_context_length.py
 COPY scripts/populate_models.py /opt/alcf/populate_models.py
 COPY scripts/generic_inference.py /opt/alcf/generic_inference.py
+COPY scripts/inference_token_check.py /opt/alcf/inference_token_check.py
 RUN chmod +x /opt/alcf/entrypoint.sh /opt/alcf/iri_hello_world.py \
              /opt/alcf/alcf_facility.py /opt/alcf/alcf_remote_bash.py \
              /opt/alcf/alcf_bash_mcp.py \
              /opt/alcf/resolve_context_length.py /opt/alcf/populate_models.py \
-             /opt/alcf/generic_inference.py \
+             /opt/alcf/generic_inference.py /opt/alcf/inference_token_check.py \
     && chown -R hermes:hermes /opt/alcf
 
 # Bake the ALCF-agent-box git revision + build date so the container can print
@@ -146,11 +148,15 @@ RUN printf '%s\n%s\n' "${ALCF_GIT_SHA}" "${ALCF_BUILD_DATE}" > /opt/alcf/.alcf_v
     && chown hermes:hermes /opt/alcf/.alcf_version
 
 # ALCF defaults (override at `docker run` with -e).
-# Default model: google/gemma-4-31B-it — a NON-reasoning model that is
-# consistently kept "hot" on Sophia (multiple always-on instances), so it avoids
-# both (a) the HTTP 503 "online but not ready" cold-start you get from
-# less-popular models and (b) gpt-oss-120b's reasoning-token thrash/garble under
-# agentic load. All models remain switchable in the dashboard.
+# The default model depends on ALCF_CLUSTER, so ALCF_MODEL is deliberately NOT
+# set here (an image-wide value would survive -e ALCF_CLUSTER=sophia). The
+# entrypoint picks it: tara (the default cluster) -> muse-spark-bf16 (1M-token
+# context, reasoning; the alcf-tara-reasoning 12288-token output cap); sophia ->
+# google/gemma-4-31B-it; metis -> gemma-4-31B-it; minerva -> muse-spark-bf16. An explicit -e ALCF_MODEL wins.
+# TRADE-OFF: Tara models are not kept "always hot", so the first request after
+# a quiet period may wait for a cold start (HTTP 503 until loaded). For the
+# previous always-hot default, run with -e ALCF_CLUSTER=sophia. All models
+# remain switchable in the dashboard.
 #
 # Notable OPTIONAL run-time envs (unset by default; see entrypoint.sh):
 #   ALCF_BASH_ACCOUNT       default ALCF project for the MCP `bash` tool (else
@@ -167,8 +173,7 @@ RUN printf '%s\n%s\n' "${ALCF_GIT_SHA}" "${ALCF_BUILD_DATE}" > /opt/alcf/.alcf_v
 #                           1800 here lets both the config default below and a
 #                           model-requested long wait through. Must stay >= the
 #                           `terminal.timeout` in config.template.yaml.
-ENV ALCF_MODEL=google/gemma-4-31B-it \
-    ALCF_CLUSTER=sophia \
+ENV ALCF_CLUSTER=tara \
     ALCF_MAX_TOKENS=2048 \
     ALCF_REASONING_MAX_TOKENS=12288 \
     ALCF_DASHBOARD_PORT=8787 \

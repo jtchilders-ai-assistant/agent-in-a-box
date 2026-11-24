@@ -33,7 +33,8 @@ is Hermes + ALCF-specific content + a thin runtime wrapper, not a new framework.
                     ▼                             ▼                            ▼
         ALCF Inference Service          IRI Facility API             Globus Compute
         inference-api.alcf.anl.gov      api.alcf.anl.gov              (compute-node bash)
-        (LLM brain: gemma-4-31B-it)     (job submit / fs ops)
+        (LLM brain: muse-spark-bf16     (job submit / fs ops)
+         on Tara)
 ```
 
 A single named volume (`alcf-agent-home` → `/opt/data`) holds Globus tokens
@@ -60,7 +61,7 @@ request them all in **one combined Globus login** (`alcf-tokens login`):
 
 | Service | Python API | Token used for |
 |---|---|---|
-| Inference | `alcf_tokens.auth.get_access_token('inference')` | The agent's LLM calls (as `api_key`) |
+| Inference | `alcf_tokens.auth.get_access_token('inference')` | The agent's LLM calls (minted per request through each provider's `key_cmd`) |
 | IRI API | `alcf_tokens.auth.get_access_token('iri')` | Job submission, filesystem ops |
 | Globus Compute | `alcf_tokens.auth.get_service_authorizer('globus-compute')` | Compute-node command execution |
 
@@ -74,14 +75,49 @@ login` has no `--force` flag; simply re-run to trigger a new login.
 Consequences baked into the design:
 - **No credentials in the image.** First run does one interactive `alcf-tokens login`;
   tokens live in the mounted `~/.globus` volume.
-- The entrypoint runs a **token-refresh loop** (every 6h) that re-renders the
-  Hermes config with a fresh inference access token, because the token is the
-  `api_key` and it rotates.
+- **The rendered config holds no inference token.** Every ALCF provider (the
+  generated block and the template fallback) carries
+  `key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"` and no
+  `api_key`; `model.api_key` renders empty in ALCF mode. Hermes v0.23.2 turns
+  `key_cmd` into a callable credential (`agent/command_token_source.py`) that
+  the wire clients call per request, caching the token and re-minting at most
+  every 15 minutes (`_NO_TTL_REFRESH_SECONDS = 900`), so a token `alcf-tokens`
+  refreshed on disk reaches the running agent with no re-render.
+- **Live login check at startup** (ALCF mode). `get-token inference` succeeds
+  with a cached token even when ALCF rejects it (e.g. after a high-assurance
+  timeout), so it cannot gate startup. `scripts/inference_token_check.py` runs
+  `alcf-tokens test-token inference` (GET `whoami`) under a timeout
+  (`ALCF_TOKEN_CHECK_TIMEOUT`, default 20s) and prints one sanitized
+  `STATUS<TAB>reason` line: `ok`, `auth` (no login / 401 / 403), `unavailable`
+  (5xx / 429 / 408 / network / timeout) or `unknown`. It never echoes a
+  response body, stdout or stderr. `auth` with a TTY runs `alcf-tokens login`
+  and re-checks (exit 1 unless ok); `auth` with no TTY **exits 77** with the
+  reason and the `docker run -it` / `docker exec -it ... alcf-tokens login`
+  fix, and never starts a login. `unavailable` / `unknown` warn, write the
+  status file and continue. The checker runs `get-token` first (its stdout,
+  the token, is discarded): the real `AuthError` message ("No valid tokens
+  found ... Please authenticate by running ..."), a Globus HTTP 401/403 or a
+  Globus 400 `invalid_grant` counts as `auth`; a refresh that cannot reach
+  Globus (connection error, Globus 5xx/429, timeout) is `unavailable`, never
+  `auth` / `EXPIRED`; any other traceback or unrecognised output (e.g.
+  "Unknown token name") is `unknown`. The ALCF helpers (`populate_models.py`,
+  `resolve_context_length.py`) mint their token through `ALCF_TOKENS_BIN`
+  themselves; no token is passed through a child environment.
+  `ALCF_TOKEN_CHECK=0` restores the old local-`get-token` gate. Generic mode
+  keeps the local gate.
+- The entrypoint runs a **login-check loop** (every `ALCF_TOKEN_CHECK_INTERVAL`
+  seconds, default 6h): `get-token`, then the live check. `ok` re-renders the
+  config and clears `$HERMES_HOME/.inference_token_status`; `auth` logs a
+  banner and writes `EXPIRED`; `unavailable` / `unknown` write `UNREACHABLE` /
+  `UNKNOWN`. Neither the loop nor `key_cmd` can renew an expired login (30-day
+  limit or high-assurance timeout): that needs a new interactive login.
 
 ### Secret hygiene
 
 The rendered `config.yaml` is the only intended durable home of an inference
-credential; the entrypoint forces it to mode 0600 on every render. In generic
+credential; the entrypoint forces it to mode 0600 on every render. In ALCF
+mode it holds none (providers mint through `key_cmd`); the credential is the
+`alcf-tokens` store on the volume. In generic
 mode, `INFERENCE_TOKEN` arrives through `docker run -e`; once it is in the
 config, the entrypoint `unset`s it before launching anything. The generic-mode
 invariant is therefore: **the token is not inherited by long-lived descendants;
@@ -116,16 +152,16 @@ Diagnostic and state files for a start (`ctxlen.log`, `populate_models.log`,
 private run directory, `mktemp -d "${TMPDIR:-/tmp}/aib-run.XXXXXX"` (mode 0700,
 files 0600), never at fixed `/tmp` paths. `startup.log` names it.
 
-Order of operations in `render_config()` (re-run by the 6h token-refresh loop):
+Order of operations in `render_config()` (re-run by the 6h login-check loop):
 
-1. **Fresh inference token.** The token is the `api_key` and rotates, so it's
-   re-fetched on every render.
+1. **Fresh inference token** for the catalog and context-window lookups below.
+   It is not written to the config (providers use `key_cmd`).
 2. **Launch-model context window** (`resolve_context_length.py`). Reads the real
    `max_model_len` from the gateway because ALCF caps some models below their
    published spec and Hermes' family table would otherwise over-estimate it.
    Defaults to 128000 on any failure (so the floor guard fails open).
 3. **Model-list generation** (`populate_models.py`). Queries the live catalog on
-   both clusters, filters to chat models with a real ≥64k window, and emits a
+   every enabled cluster (sophia, metis, minerva, tara), filters to chat models with a real ≥64k window, and emits a
    keyed `providers:` block (the Hermes v0.23.2 schema). Each cluster is split
    into a baseline provider and a `-reasoning` provider (see quirk #1), each
    carrying its own output cap as `extra_body.max_tokens`.
@@ -273,5 +309,11 @@ remaining items are genuinely optional follow-ups:
   consistently *hot* on Sophia, so it avoids both the cold-start HTTP 503 and
   gpt-oss's reasoning-token thrash under agentic load. All models stay
   switchable in the dashboard.
+- ✅ Default model changed (2026-11-23): `muse-spark-bf16` on Tara (1M context,
+  reasoning, with the `-reasoning` provider's 12288-token cap). Trade-off: no
+  Tara model is kept always hot, so the first request may wait for a cold
+  start. The default model depends on `ALCF_CLUSTER` (the image sets no
+  `ALCF_MODEL`; the entrypoint holds the one table), so `ALCF_CLUSTER=sophia`
+  alone restores the previous always-hot default (`google/gemma-4-31B-it`).
 - ✅ Repo created under `jtchilders-ai-assistant` with GHCR publish + nightly
   docs-refresh CI. (Move to `argonne-lcf` if this becomes official.)

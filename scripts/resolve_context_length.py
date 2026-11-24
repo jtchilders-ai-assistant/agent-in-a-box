@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -37,6 +38,8 @@ import urllib.request
 from alcf_tokens.auth import get_access_token
 
 DEFAULT_CONTEXT = 128000
+# Same default as populate_models.DEFAULT_ALCF_TOKENS_BIN (the image's CLI).
+DEFAULT_ALCF_TOKENS_BIN = "/opt/hermes/.venv/bin/alcf-tokens"
 
 
 def _exc_summary(e: BaseException) -> str:
@@ -68,15 +71,50 @@ def _models_url(vllm_base_url: str) -> str:
 
 
 def _get_token() -> str:
-    # Support passing a pre-fetched token via env to avoid extra alcf-tokens calls.
-    pre = os.environ.get("ALCF_INFER_TOKEN", "").strip()
-    if pre:
-        return pre
-    return get_access_token("inference")
+    """The inference token, minted by the alcf-tokens CLI (ALCF_TOKENS_BIN) and
+    kept in this process's memory: the entrypoint passes no token through the
+    environment. Falls back to the official Python API only when the CLI is not
+    installed (outside the image). Never puts the CLI's output in an exception."""
+    binary = os.environ.get("ALCF_TOKENS_BIN") or DEFAULT_ALCF_TOKENS_BIN
+    try:
+        proc = subprocess.run([binary, "get-token", "inference"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, check=False)
+    except FileNotFoundError:
+        return get_access_token("inference")
+    token = proc.stdout.strip()
+    if proc.returncode != 0 or not token or "\n" in token:
+        raise RuntimeError(f"alcf-tokens get-token inference failed (exit {proc.returncode})")
+    return token
+
+
+def _context_window(m: dict):
+    """Context window only; see _context_window_with_source."""
+    return _context_window_with_source(m)[0]
+
+
+def _context_window_with_source(m: dict):
+    """(window, field name) or (None, None).
+
+    A /models entry's serving window: ``max_model_len`` (Sophia vLLM) or,
+    when that is absent, ``capabilities.context_window_tokens`` (the structured
+    schema Minerva and Tara publish instead) -- the fields populate_models.py's
+    _select_sophia / _select_capabilities read. None if neither is a positive int."""
+    mml = m.get("max_model_len")
+    if isinstance(mml, int) and mml > 0:
+        return mml, "max_model_len"
+    caps = m.get("capabilities")
+    ctx = caps.get("context_window_tokens") if isinstance(caps, dict) else None
+    if isinstance(ctx, int) and ctx > 0:
+        return ctx, "capabilities.context_window_tokens"
+    return None, None
+
+
+# model id -> catalog field the window was read from (filled by _fetch_max_lens)
+_SOURCES: dict = {}
 
 
 def _fetch_max_lens(vllm_base_url: str) -> dict:
-    """Return {model_id: max_model_len} for every model that reports one."""
+    """Return {model_id: context window} for every model that reports one."""
     url = _models_url(vllm_base_url)
     token = _get_token()
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
@@ -89,9 +127,10 @@ def _fetch_max_lens(vllm_base_url: str) -> dict:
             if not isinstance(m, dict):
                 continue
             mid = m.get("id") or m.get("Models")
-            mml = m.get("max_model_len")
-            if mid and isinstance(mml, int) and mml > 0:
-                out[str(mid)] = mml
+            ctx, src = _context_window_with_source(m)
+            if mid and ctx:
+                out[str(mid)] = ctx
+                _SOURCES[str(mid)] = src
     return out
 
 
@@ -100,8 +139,9 @@ def _mode_value(vllm_base_url: str, model_id: str) -> None:
         lens = _fetch_max_lens(vllm_base_url)
         val = lens.get(model_id)
         if not (isinstance(val, int) and val > 0):
-            raise ValueError(f"no usable max_model_len for {model_id!r}")
-        print(f"resolved max_model_len={val} for {model_id} from server",
+            raise ValueError(f"no usable context window for {model_id!r}")
+        src = _SOURCES.get(model_id, "server catalog")
+        print(f"resolved context window={val} for {model_id} from server ({src})",
               file=sys.stderr)
         print(val)
     except Exception as e:  # noqa: BLE001

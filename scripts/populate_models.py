@@ -8,10 +8,12 @@ mapping that carries every model's REAL serving context window:
   - ``alcf-sophia``   (vLLM,  full OpenAI-compat)  api .../sophia/vllm/v1
   - ``alcf-metis``    (SambaNova, chat-only)       api .../metis/api/v1
   - ``alcf-minerva``  (api framework)              api .../minerva/api/v1
+  - ``alcf-tara``     (api framework)              api .../tara/api/v1
 
-``tara`` also appears in list-endpoints but is still being provisioned
-(``/models`` -> ``[]``, ``/jobs`` -> HTTP 500), so it gets no provider; the status
-banner reports it as provisioning. Promote it in ``_clusters()`` once it serves.
+Tara + ``muse-spark-bf16`` is the default launch (Dockerfile ALCF_CLUSTER /
+ALCF_MODEL). A cluster that appears in list-endpoints but serves nothing yet
+belongs in PROVISIONING_CLUSTERS (no provider; the banner reports it as
+provisioning); none does today.
 
 Why this exists
 ---------------
@@ -25,8 +27,8 @@ so the dropdown reflects the live catalog and every model gets its correct
 switch). Without the right per-model window a switch overflows the real context
 and the gateway silently drops the SSE stream (EmptyStreamError).
 
-Three clusters, three catalog shapes
-------------------------------------
+Four clusters, three catalog shapes
+-----------------------------------
 * Sophia entries report ``framework`` + (for served LLMs) ``max_model_len``. We
   keep ``framework == "vllm"`` chat models and derive ``context_length`` from
   ``max_model_len``. We EXCLUDE non-chat frameworks (triton/dinoserver/sam3service)
@@ -47,6 +49,8 @@ Three clusters, three catalog shapes
   ``capabilities.context_window_tokens`` and ``capabilities.reasoning.supported``
   are authoritative, so Minerva needs neither a hardcoded window table nor the
   reasoning id heuristic. Read them; the heuristic is only a last resort there.
+* Tara entries use the same capabilities schema as Minerva and share its
+  selector (``_select_capabilities``).
 
 Allowlist add-backs
 -------------------
@@ -63,7 +67,7 @@ committed static fallback for that cluster, and the script always prints a valid
 
 Usage
 -----
-    populate_models.py [--out PATH] [--no-metis] [--no-minerva]
+    populate_models.py [--out PATH] [--no-metis] [--no-minerva] [--no-tara]
     populate_models.py --status-report        # LIVE/QUEUED/OFFLINE + windows
     populate_models.py --launch-provider ID [--base-url URL] < providers-block
     populate_models.py --list-models [--base-url URL]       < providers-block
@@ -72,10 +76,12 @@ Prints the YAML block to stdout (and to --out if given). --launch-provider and
 --list-models read an already-generated block (or a whole config) on stdin,
 parse it with ruamel.yaml (the Hermes runtime venv's parser) or PyYAML, exit 1
 if it cannot be parsed, and never touch the network. Reads:
-    ALCF_INFER_TOKEN    optional pre-fetched inference token
+    ALCF_TOKENS_BIN     alcf-tokens CLI that mints the inference token (and the
+                        key_cmd every provider runs); default /opt/hermes/.venv/bin/alcf-tokens
     ALCF_PY             python used to run the auth helper (default: this python)
     ALCF_ENABLE_METIS   include the Metis provider?   "1" (default) / "0"
     ALCF_ENABLE_MINERVA include the Minerva provider? "1" (default) / "0"
+    ALCF_ENABLE_TARA    include the Tara provider?    "1" (default) / "0"
     ALCF_LAUNCH_CLUSTER the launch cluster: always included, whatever its
                         ALCF_ENABLE_<CLUSTER> flag says
     ALCF_LAUNCH_MODEL   the launch model; with ALCF_LAUNCH_CONTEXT (its resolved
@@ -83,10 +89,14 @@ if it cannot be parsed, and never touch the network. Reads:
                         discovery failed and the fallback lacks it (>= 64k only)
     ALCF_LAUNCH_SOURCE_FILE  where to write the launch cluster's state: live |
                         fallback | fallback-injected | fallback-missing
+    ALCF_TOKENS_BIN     alcf-tokens CLI for each provider's key_cmd
+                        (default /opt/hermes/.venv/bin/alcf-tokens)
 """
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import textwrap
 import urllib.error
@@ -98,17 +108,20 @@ INFER_HOST = "https://inference-api.alcf.anl.gov/resource_server"
 SOPHIA_BASE = f"{INFER_HOST}/sophia/vllm/v1"
 METIS_BASE = f"{INFER_HOST}/metis/api/v1"
 MINERVA_BASE = f"{INFER_HOST}/minerva/api/v1"
+TARA_BASE = f"{INFER_HOST}/tara/api/v1"
 
 # Clusters that appear in list-endpoints but are NOT yet serving models. We do
 # not build a provider for these; the status banner reports them as
 # "provisioning" so the user knows to check back rather than assuming a bug.
-# Verified 2026-08-24: tara /models -> [] and /jobs -> HTTP 500
-# ("Failed to read Tara router config: FIRST_V2_REDIS_URL is not set"), i.e.
-# the machine is still being accepted. Re-check and promote it to a real
-# cluster once /models returns entries.
-PROVISIONING_CLUSTERS = ("tara",)
+# Empty today: tara (provisioning on 2026-08-24) serves models per the ALCF
+# models doc of 2026-11-23 and is a real cluster in _clusters().
+PROVISIONING_CLUSTERS = ()
 
 PY = os.environ.get("ALCF_PY", sys.executable)
+# The alcf-tokens CLI every provider's key_cmd runs (env ALCF_TOKENS_BIN
+# overrides; the entrypoint passes its own $ALCF_TOKENS). Keep in sync with the
+# static fallback's key_cmd in config/config.template.yaml.
+DEFAULT_ALCF_TOKENS_BIN = "/opt/hermes/.venv/bin/alcf-tokens"
 # Fallback context window for a chat model that reports no server value.
 DEFAULT_CONTEXT = 32768
 
@@ -193,12 +206,17 @@ METIS_DEFAULT_CONTEXT = 32768
 #   capabilities.context_window_tokens   int
 #   capabilities.reasoning.supported     bool
 # Verified live 2026-08-24: gpt-oss-120b 131072, inkling-bf16 262144,
-# nemotron-3-ultra 262144 — all reasoning:true, all tool_calling:true.
+# nemotron-3-ultra 262144 — all reasoning:true, all tool_calling:true. (The
+# 2026-11-23 Minerva set is different: see MINERVA_FALLBACK.)
 # NOTE the id heuristic MISSES inkling-bf16 and nemotron-3-ultra, so without the
 # capabilities read they would land in the 2048-token baseline provider and
 # return empty content (their reasoning channel eats the whole budget —
 # reproduced: inkling-bf16 @ max_tokens=30 -> content:null finish_reason:length).
 MINERVA_DEFAULT_CONTEXT = 131072
+# Tara (framework: api) publishes the same capabilities schema as Minerva, so it
+# shares Minerva's selector; this window is only for an entry without
+# capabilities.context_window_tokens.
+TARA_DEFAULT_CONTEXT = 131072
 
 # Frameworks that are NOT chat completion endpoints — exclude outright.
 NON_CHAT_FRAMEWORKS = {"triton", "dinoserver", "sam3service"}
@@ -230,13 +248,34 @@ METIS_FALLBACK = {
     mid: (ctx, _is_reasoning_id(mid))
     for mid, ctx in METIS_CONTEXT.items() if ctx >= MIN_CONTEXT
 }
-# Minerva fallback: verified live 2026-08-24 from capabilities.*. All three are
-# reasoning models (capabilities.reasoning.supported = true), all well above the
-# 64k floor.
+# Minerva fallback: the Minerva table of the ALCF "Available Models" doc as of
+# 2026-11-23 (plans/evidence/tara/alcf-models-doc-2026-11-23.md). All three are
+# marked R (reasoning), T and H. muse-spark-bf16 is ALSO on Tara, so delegating
+# it from a launch on neither cluster is ambiguous (exit 78). The 2026-08-24
+# set (gpt-oss-120b, inkling-bf16, nemotron-3-ultra) is no longer listed.
 MINERVA_FALLBACK = {
-    "gpt-oss-120b": (131072, True),
-    "inkling-bf16": (262144, True),
-    "nemotron-3-ultra": (262144, True),
+    "muse-spark-bf16": (1048576, True),
+    "mistral-large-4-nvfp4": (1048576, True),
+    "inkling-2-small": (1048576, True),
+}
+# Tara fallback: the Tara table of the ALCF "Available Models" doc as of
+# 2026-11-23, plus inkling-2-small from the live catalog the same day (plans/evidence/tara/alcf-models-doc-2026-11-23.md). Every model is
+# marked R (reasoning) and T, none H: Tara models are not kept always hot, so a
+# first request may wait for a cold start. Note the "openai/" prefix on the
+# gpt-oss ids, unlike Metis/Minerva.
+TARA_FALLBACK = {
+    "google/gemma-4-31B-it-262k": (262144, True),
+    "muse-spark-bf16": (1048576, True),
+    "mistral-large-4": (1048576, True),
+    "nemotron-3-ultra": (1048576, True),
+    "nemotron-35-super-vl": (1048576, True),
+    "openai/gpt-oss-120b": (131072, True),
+    "openai/gpt-oss-20b": (65536, True),
+    "beam-1.0-fp8": (1048576, True),
+    "inkling-bf16": (1048576, True),
+    # Not in the doc table; present in the LIVE Tara catalog and running
+    # (plans/evidence/tara/probe-live-2026-11-23.txt). Also on Minerva.
+    "inkling-2-small": (1048576, True),
 }
 
 
@@ -253,12 +292,21 @@ def _exc_summary(e: BaseException) -> str:
 
 
 def _get_token() -> str:
-    # Support passing a pre-fetched token via env (set by entrypoint to avoid
-    # extra alcf-tokens calls during the same render_config invocation).
-    pre = os.environ.get("ALCF_INFER_TOKEN", "").strip()
-    if pre:
-        return pre
-    return get_access_token("inference")
+    """The inference token, minted by the alcf-tokens CLI (ALCF_TOKENS_BIN, the
+    same binary every provider's key_cmd runs) and kept in this process's memory:
+    the entrypoint passes no token through the environment. Falls back to the
+    official Python API only when the CLI is not installed (outside the image).
+    Never puts the CLI's output in an exception: it is the token."""
+    binary = os.environ.get("ALCF_TOKENS_BIN") or DEFAULT_ALCF_TOKENS_BIN
+    try:
+        proc = subprocess.run([binary, "get-token", "inference"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, check=False)
+    except FileNotFoundError:
+        return get_access_token("inference")
+    token = proc.stdout.strip()
+    if proc.returncode != 0 or not token or "\n" in token:
+        raise RuntimeError(f"alcf-tokens get-token inference failed (exit {proc.returncode})")
+    return token
 
 
 def _fetch_models(cluster: str, token: str) -> list:
@@ -350,41 +398,51 @@ def _select_metis(models: list) -> dict:
     return out
 
 
-def _select_minerva(models: list) -> dict:
-    """{model_id: (context_length, is_reasoning)} for Minerva models.
+def _select_capabilities(cluster: str, default_ctx: int):
+    """Selector for a cluster that publishes the structured ``capabilities``
+    object (schema_version 1): Minerva and Tara.
 
-    Minerva (framework: api) publishes a structured ``capabilities`` object, so
-    unlike Sophia/Metis we do NOT have to guess: read
-    ``capabilities.context_window_tokens`` for the window and
-    ``capabilities.reasoning.supported`` for the reasoning class, falling back to
-    the id heuristic only when the field is absent. This matters — inkling-bf16
-    and nemotron-3-ultra match no reasoning id pattern but ARE reasoning models,
-    and the id heuristic alone would starve them of output budget.
+    Returns ``select(models) -> {model_id: (context_length, is_reasoning)}``.
+    Unlike Sophia/Metis we do NOT have to guess: read
+    ``capabilities.context_window_tokens`` for the window (``default_ctx`` when
+    absent) and ``capabilities.reasoning.supported`` for the reasoning class,
+    falling back to the id heuristic only when the field is absent. This
+    matters — inkling-bf16 and nemotron-3-ultra match no reasoning id pattern
+    but ARE reasoning models, and the id heuristic alone would starve them of
+    output budget. A model whose ``api_protocols`` lacks ``chat_completions`` is
+    skipped (Hermes talks Chat Completions to these endpoints); sub-floor models
+    are recorded under ``cluster`` for the status banner.
     """
-    out = {}
-    for m in models:
-        mid = m.get("id")
-        if not mid:
-            continue
-        fw = (m.get("framework") or "").lower()
-        if fw in NON_CHAT_FRAMEWORKS:
-            continue
-        if _is_non_chat_id(mid):
-            continue
-        caps = m.get("capabilities") or {}
-        protos = caps.get("api_protocols")
-        if isinstance(protos, list) and protos and "chat_completions" not in protos:
-            continue
-        ctx = caps.get("context_window_tokens")
-        if not (isinstance(ctx, int) and ctx > 0):
-            ctx = MINERVA_DEFAULT_CONTEXT
-        if ctx < MIN_CONTEXT:
-            _note_excluded("minerva", mid, ctx)
-            continue
-        reasoning = (caps.get("reasoning") or {}).get("supported")
-        is_reasoning = bool(reasoning) if reasoning is not None else _is_reasoning_id(mid)
-        out[mid] = (ctx, is_reasoning)
-    return out
+    def select(models: list) -> dict:
+        out = {}
+        for m in models:
+            mid = m.get("id")
+            if not mid:
+                continue
+            fw = (m.get("framework") or "").lower()
+            if fw in NON_CHAT_FRAMEWORKS:
+                continue
+            if _is_non_chat_id(mid):
+                continue
+            caps = m.get("capabilities") or {}
+            protos = caps.get("api_protocols")
+            if isinstance(protos, list) and protos and "chat_completions" not in protos:
+                continue
+            ctx = caps.get("context_window_tokens")
+            if not (isinstance(ctx, int) and ctx > 0):
+                ctx = default_ctx
+            if ctx < MIN_CONTEXT:
+                _note_excluded(cluster, mid, ctx)
+                continue
+            reasoning = (caps.get("reasoning") or {}).get("supported")
+            is_reasoning = bool(reasoning) if reasoning is not None else _is_reasoning_id(mid)
+            out[mid] = (ctx, is_reasoning)
+        return out
+    return select
+
+
+_select_minerva = _select_capabilities("minerva", MINERVA_DEFAULT_CONTEXT)
+_select_tara = _select_capabilities("tara", TARA_DEFAULT_CONTEXT)
 
 
 def _resolve_cluster(cluster: str, token: str, selector, fallback: dict) -> tuple:
@@ -410,6 +468,17 @@ def _yaml_key(mid: str) -> str:
     return mid if _PLAIN_ID.fullmatch(mid) else json.dumps(mid)
 
 
+def alcf_key_cmd() -> str:
+    """The provider credential command: ``<alcf-tokens> get-token inference``.
+
+    Hermes runs a ``key_cmd`` per request and caches the token (re-minting at
+    most every 15 min, agent/command_token_source.py), so the rendered config
+    carries NO token and a rotated token is picked up without a re-render.
+    """
+    binary = os.environ.get("ALCF_TOKENS_BIN") or DEFAULT_ALCF_TOKENS_BIN
+    return f"{shlex.quote(binary)} get-token inference"
+
+
 def _emit_provider(name: str, base_url: str, mapping: dict,
                    max_tokens: int) -> list:
     """Render one keyed ``providers`` entry, indented to sit under ``providers:``.
@@ -424,7 +493,7 @@ def _emit_provider(name: str, base_url: str, mapping: dict,
         f"  {name}:",
         f"    name: {name}",
         f'    api: "{base_url}"',
-        '    api_key: "${ALCF_ACCESS_TOKEN}"',
+        f"    key_cmd: {json.dumps(alcf_key_cmd())}",
         "    discover_models: false",
         "    extra_body:",
         f"      max_tokens: {max_tokens}",
@@ -465,7 +534,8 @@ def _emit_cluster(name: str, base_url: str, mapping: dict) -> list:
     return lines
 
 
-def _clusters(include_metis: bool = True, include_minerva: bool = True) -> list:
+def _clusters(include_metis: bool = True, include_minerva: bool = True,
+              include_tara: bool = True) -> list:
     """Ordered cluster registry: (cluster, provider_name, base_url, selector, fallback).
 
     Single source of truth shared by build_block() and the status banner, so
@@ -479,10 +549,13 @@ def _clusters(include_metis: bool = True, include_minerva: bool = True) -> list:
     if include_minerva:
         out.append(("minerva", "alcf-minerva", MINERVA_BASE,
                     _select_minerva, MINERVA_FALLBACK))
+    if include_tara:
+        out.append(("tara", "alcf-tara", TARA_BASE, _select_tara, TARA_FALLBACK))
     return out
 
 
-def _include_flags(include_metis: bool, include_minerva: bool) -> tuple:
+def _include_flags(include_metis: bool, include_minerva: bool,
+                   include_tara: bool = True) -> tuple:
     """Apply the launch-cluster override to the ALCF_ENABLE_<CLUSTER> flags.
 
     The launch model must resolve on the launch endpoint, so the launch cluster
@@ -490,11 +563,12 @@ def _include_flags(include_metis: bool, include_minerva: bool) -> tuple:
     clusters. Logs one line when a flag is overridden.
     """
     launch = os.environ.get("ALCF_LAUNCH_CLUSTER", "")
-    for cluster, enabled in (("metis", include_metis), ("minerva", include_minerva)):
+    flags = (("metis", include_metis), ("minerva", include_minerva), ("tara", include_tara))
+    for cluster, enabled in flags:
         if launch == cluster and not enabled:
             print(f"[populate_models] ALCF_ENABLE_{cluster.upper()}=0 overridden: "
                   f"{cluster} is the launch cluster", file=sys.stderr)
-    return include_metis or launch == "metis", include_minerva or launch == "minerva"
+    return tuple(enabled or launch == cluster for cluster, enabled in flags)
 
 
 def _launch_context() -> int:
@@ -530,7 +604,8 @@ def _ensure_launch_model(mapping: dict, src: str, cluster: str) -> str:
     return "fallback-injected"
 
 
-def build_block(include_metis: bool = True, include_minerva: bool = True) -> str:
+def build_block(include_metis: bool = True, include_minerva: bool = True,
+                include_tara: bool = True) -> str:
     try:
         token = _get_token()
     except Exception as e:  # noqa: BLE001
@@ -538,12 +613,14 @@ def build_block(include_metis: bool = True, include_minerva: bool = True) -> str
               file=sys.stderr)
         token = None
 
-    include_metis, include_minerva = _include_flags(include_metis, include_minerva)
+    include_metis, include_minerva, include_tara = _include_flags(
+        include_metis, include_minerva, include_tara)
     launch_cluster = os.environ.get("ALCF_LAUNCH_CLUSTER", "")
     launch_state = None
     lines = ["providers:"]
     for cluster, provider, base, selector, fallback in _clusters(
-            include_metis=include_metis, include_minerva=include_minerva):
+            include_metis=include_metis, include_minerva=include_minerva,
+            include_tara=include_tara):
         if token:
             mapping, src = _resolve_cluster(cluster, token, selector, fallback)
         else:
@@ -661,14 +738,17 @@ def status_report() -> int:
               file=sys.stderr)
         return 0
 
-    include_metis, include_minerva = _include_flags(
+    include_metis, include_minerva, include_tara = _include_flags(
         os.environ.get("ALCF_ENABLE_METIS", "1") != "0",
-        os.environ.get("ALCF_ENABLE_MINERVA", "1") != "0")
+        os.environ.get("ALCF_ENABLE_MINERVA", "1") != "0",
+        os.environ.get("ALCF_ENABLE_TARA", "1") != "0")
 
     lines = ["Model availability (context window shown per model):"]
     any_live = False
+    any_known = False
     for cluster, _provider, _base, selector, fallback in _clusters(
-            include_metis=include_metis, include_minerva=include_minerva):
+            include_metis=include_metis, include_minerva=include_minerva,
+            include_tara=include_tara):
         offered, _src = _resolve_cluster(cluster, token, selector, fallback)
         try:
             live, queued = _fetch_job_states(cluster, token)
@@ -687,6 +767,7 @@ def status_report() -> int:
         queued_ids = sorted(m for m in offered if m not in live and m in queued)
         offline_ids = sorted(m for m in offered
                              if m not in live and m not in queued)
+        any_known = True
         any_live = any_live or bool(live_ids)
 
         if live_ids:
@@ -719,7 +800,12 @@ def status_report() -> int:
     lines.append("  Note: a LIVE model answers immediately. Selecting an OFFLINE or")
     lines.append("  QUEUED model returns HTTP 503 until ALCF loads it — a warm-up is")
     lines.append("  ~10-15 min, but a queued job may wait HOURS for free nodes.")
-    if not any_live:
+    if include_tara:
+        lines.append("  Tara models are not kept always hot: the first request to one")
+        lines.append("  may wait for a cold start.")
+    # Only a cluster whose /jobs was read can say "nothing live"; when every
+    # status is unknown the per-cluster lines already say so.
+    if any_known and not any_live:
         lines.append("  WARNING: no model is LIVE on any cluster right now.")
     # Emit to stdout so the entrypoint can `log` it line-by-line.
     sys.stdout.write("\n".join(lines) + "\n")
@@ -888,6 +974,8 @@ def main() -> int:
                     help="omit the Metis provider")
     ap.add_argument("--no-minerva", action="store_true",
                     help="omit the Minerva provider")
+    ap.add_argument("--no-tara", action="store_true",
+                    help="omit the Tara provider")
     ap.add_argument("--status-report", "--hot-report", dest="status_report",
                     action="store_true",
                     help="print a per-cluster LIVE/QUEUED/OFFLINE availability "
@@ -943,7 +1031,9 @@ def main() -> int:
     include_metis = not args.no_metis and os.environ.get("ALCF_ENABLE_METIS", "1") != "0"
     include_minerva = (not args.no_minerva
                        and os.environ.get("ALCF_ENABLE_MINERVA", "1") != "0")
-    block = build_block(include_metis=include_metis, include_minerva=include_minerva)
+    include_tara = not args.no_tara and os.environ.get("ALCF_ENABLE_TARA", "1") != "0"
+    block = build_block(include_metis=include_metis, include_minerva=include_minerva,
+                        include_tara=include_tara)
     sys.stdout.write(block)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:

@@ -87,6 +87,16 @@ Model ids are **HuggingFace-style**: `openai/gpt-oss-120b`, `openai/gpt-oss-20b`
 `google/gemma-4-31B-it`, `meta-llama/Meta-Llama-3.1-8B-Instruct`, `argonne/AuroraGPT-*`,
 embeddings `Salesforce/SFR-Embedding-Mistral`. Discover the live set via `list-endpoints`.
 
+Other clusters use `.../resource_server/<cluster>/api/v1/chat/completions` (metis,
+minerva, tara), and their model ids are NOT always HuggingFace-style: Metis serves
+`gemma-4-31B-it` (no `google/` prefix); **Minerva** serves `muse-spark-bf16`,
+`mistral-large-4-nvfp4` and `inkling-2-small`. **Tara** (`/resource_server/tara/api/v1`) hosts this agent's default
+model `muse-spark-bf16` (1M context, reasoning), plus `mistral-large-4`,
+`nemotron-3-ultra`, `inkling-bf16`, `inkling-2-small`, `openai/gpt-oss-120b` and others.
+`muse-spark-bf16` is on both Minerva and Tara, so always name the cluster endpoint. Tara models
+are **not always hot**: the first request after a quiet period may get HTTP 503
+while the model loads — wait and retry rather than switching models.
+
 ## PITFALL: gpt-oss reasoning models eat the max_tokens budget
 
 `openai/gpt-oss-120b` / `gpt-oss-20b` are **reasoning models**. The visible answer is in
@@ -116,8 +126,11 @@ container does exactly this — it splits each cluster into a baseline provider
       api_key: <globus access token>     # NOT static — 48h rotating; refresh via alcf-tokens
       model: openai/gpt-oss-120b
 
-The rotating token means `api_key` can't be a durable literal — a wrapper/entrypoint must
-fetch a fresh token (`get_access_token`) and inject it before/at session start.
+The rotating token means `api_key` can't be a durable literal. Agent in a Box instead
+gives each provider `key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"`
+(no `api_key`): Hermes runs it per request and re-mints at most every 15 minutes.
+It cannot renew an expired login (30 days, or a high-assurance timeout) — that needs
+`alcf-tokens login` again.
 
 ## Pitfalls
 

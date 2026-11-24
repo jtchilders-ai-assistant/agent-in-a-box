@@ -1,8 +1,12 @@
 # ALCF Agent — Hermes config template
 #
 # Rendered into the live config at container start by scripts/entrypoint.sh,
-# which substitutes ${...} placeholders from environment variables and injects
-# the freshly-minted Globus access token as the api_key.
+# which substitutes ${...} placeholders from environment variables. In ALCF
+# mode NO token is written: every ALCF provider declares
+#   key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
+# which Hermes runs per request (token cached, re-minted at most every 15 min),
+# and model.api_key renders empty so it cannot shadow the provider's key_cmd.
+# Generic mode (INFERENCE_URL) substitutes its static token into model.api_key.
 #
 # IMPORTANT: keep this MINIMAL. Do not add personal fallback providers, stray
 # base_urls, or secrets. The packaged agent must have exactly ONE inference
@@ -25,14 +29,14 @@ model:
   #
   # provider is set by the entrypoint to the ONE named provider in the
   # generated `providers:` block that lists the launch model on this endpoint
-  # (e.g. custom:alcf-sophia-reasoning); it refuses to start if there is none or
+  # (default: custom:alcf-tara-reasoning); it refuses to start if there is none or
   # more than one. The launch turn then gets that provider's output cap (its
   # extra_body.max_tokens), the same cap a later /model switch to the model
   # gets. We deliberately DO NOT set model.max_tokens here (see below).
   provider: "${ALCF_LAUNCH_PROVIDER}"
-  base_url: "${ALCF_BASE_URL}"        # e.g. https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1
-  api_key: "${ALCF_ACCESS_TOKEN}"     # Globus access token, injected + refreshed by entrypoint
-  model: "${ALCF_MODEL}"              # e.g. google/gemma-4-31B-it
+  base_url: "${ALCF_BASE_URL}"        # default https://inference-api.alcf.anl.gov/resource_server/tara/api/v1
+  api_key: "${ALCF_ACCESS_TOKEN}"     # ALCF mode: empty (providers use key_cmd); generic mode: INFERENCE_TOKEN
+  model: "${ALCF_MODEL}"              # default depends on ALCF_CLUSTER (tara: muse-spark-bf16)
   default: "${ALCF_MODEL}"
 
   # NOTE: model.max_tokens is intentionally NOT set here.
@@ -117,9 +121,10 @@ dashboard:
 #   - alcf-sophia   (vLLM,   full OpenAI-compat)   .../sophia/vllm/v1
 #   - alcf-metis    (SambaNova, chat-only)         .../metis/api/v1
 #   - alcf-minerva  (api framework)                .../minerva/api/v1
+#   - alcf-tara     (api framework)                .../tara/api/v1
 #
-# (`tara` is registered upstream but serves no models yet, so it gets no
-# provider; the startup status banner reports it as provisioning.)
+# Tara serves the default launch model (muse-spark-bf16). Tara models are not
+# kept always hot, so a first request may wait for a cold start.
 #
 # It filters the catalog to CHAT models (dropping embeddings, vision, and science
 # models like GenSLM/dinov3/sam3) and gives each its REAL serving context window.
@@ -156,7 +161,7 @@ providers:
   alcf-sophia:
     name: alcf-sophia
     api: "https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 2048
@@ -171,7 +176,7 @@ providers:
   alcf-sophia-reasoning:
     name: alcf-sophia-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 12288
@@ -191,7 +196,7 @@ providers:
   alcf-metis-reasoning:
     name: alcf-metis-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/metis/api/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 12288
@@ -207,20 +212,51 @@ providers:
   alcf-minerva-reasoning:
     name: alcf-minerva-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 12288
-    # Minerva publishes a structured `capabilities` object, so these windows and
-    # the reasoning class are read straight from the catalog rather than guessed
-    # (verified live 2026-08-24). All three advertise reasoning.supported=true —
-    # note inkling-bf16 and nemotron-3-ultra match no reasoning ID heuristic, so
-    # the capabilities read is what keeps them out of the 2048-token baseline
-    # (starved of budget they return empty content).
+    # Minerva publishes a structured `capabilities` object, so live windows and
+    # the reasoning class are read straight from the catalog rather than guessed.
+    # This static list is the Minerva table of the ALCF models doc as of
+    # 2026-11-23 (all reasoning). None of these ids matches a reasoning ID
+    # heuristic, so the capabilities read is what keeps them out of the
+    # 2048-token baseline (starved of budget they return empty content).
     models:
-      gpt-oss-120b:
-        context_length: 131072
+      muse-spark-bf16:
+        context_length: 1048576
+      mistral-large-4-nvfp4:
+        context_length: 1048576
+      inkling-2-small:
+        context_length: 1048576
+  alcf-tara-reasoning:
+    name: alcf-tara-reasoning
+    api: "https://inference-api.alcf.anl.gov/resource_server/tara/api/v1"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
+    discover_models: false
+    extra_body:
+      max_tokens: 12288
+    # From the Tara table of the ALCF models doc (2026-11-23): every model is
+    # marked reasoning, so there is no baseline alcf-tara block. None is marked
+    # always hot; a first request may wait for a cold start.
+    models:
+      beam-1.0-fp8:
+        context_length: 1048576
+      google/gemma-4-31B-it-262k:
+        context_length: 262144
+      inkling-2-small:
+        context_length: 1048576
       inkling-bf16:
-        context_length: 262144
+        context_length: 1048576
+      mistral-large-4:
+        context_length: 1048576
+      muse-spark-bf16:
+        context_length: 1048576
       nemotron-3-ultra:
-        context_length: 262144
+        context_length: 1048576
+      nemotron-35-super-vl:
+        context_length: 1048576
+      openai/gpt-oss-120b:
+        context_length: 131072
+      openai/gpt-oss-20b:
+        context_length: 65536
