@@ -11,8 +11,10 @@ Two steps:
    stderr, exit 1, no traceback) -- that is `auth`. A refresh that cannot reach
    Globus (requests/globus_sdk connection errors, Globus 5xx/429) escapes as
    an uncaught traceback, also exit 1 -- that is `unavailable`, NOT `auth`.
-   A rejected refresh token (Globus 400 invalid_grant) is `auth`; any other
-   traceback is `unknown`.
+   A Globus API error is classified by its HTTP status: 401/403 and a
+   rejected refresh token (400 invalid_grant) are `auth`, other 4xx `unknown`.
+   Any other traceback, and any non-traceback failure without the real
+   AuthError text (e.g. "Unknown token name"), is `unknown`.
 2. get-token exits 0 with a locally cached/refreshed token even when ALCF
    REJECTS it (e.g. a high-assurance timeout), so it cannot gate startup on
    its own: `alcf-tokens test-token inference` (a GET of the gateway's
@@ -57,9 +59,17 @@ NETWORK_MARKERS = (
     "Name or service not known", "Temporary failure in name resolution",
 )
 UNAVAILABLE_HTTP = {408, 429}
-# A globus_sdk API error (or requests HTTPError) for a Globus 5xx/429, e.g.
-# "AuthAPIError: ('POST', 'https://auth.globus.org/v2/oauth2/token', None, 503, ...".
-_GLOBUS_UNAVAILABLE = re.compile(r"(?:APIError|HTTPError|HTTP)\b[^\n]*?\b(5\d{2}|429)\b")
+# The HTTP status of an uncaught Globus API error. globus_sdk 4.x renders it
+# as a tuple whose 4th field is the status, with the response body on the
+# following line(s), e.g.
+#   AuthAPIError: ('POST', 'https://auth.globus.org/v2/oauth2/token', None, 400, None, None)
+#   {"error":"invalid_grant"}
+# Only the tuple's status field is read, so a "503" in the URL or body cannot
+# be mistaken for the status.
+_GLOBUS_API_STATUS = re.compile(r"APIError:\s*\(\s*'[A-Z]+',\s*'[^']*',\s*[^,]*,\s*(\d{3})\b")
+# The real alcf-tokens AuthError messages (alcf_tokens/auth.py): only these make
+# a non-traceback get-token failure `auth`.
+_AUTH_ERROR_MARKERS = ("No valid tokens found", "Please authenticate by running")
 
 _TOKENISH = (
     re.compile(r"(?i)bearer\s+\S+"),
@@ -153,17 +163,24 @@ def classify_get_token(returncode: int, stdout: str, stderr: str):
         if (stdout or "").strip():
             return None
         return "unknown", "get-token printed no token"
+    match = _GLOBUS_API_STATUS.search(stderr)
+    if match:
+        code = int(match.group(1))
+        if code in (401, 403):
+            return "auth", f"get-token inference failed: Globus HTTP {code}"
+        if code >= 500 or code in UNAVAILABLE_HTTP:
+            return "unavailable", f"get-token: Globus HTTP {code}"
+        if code == 400 and "invalid_grant" in stderr[match.end():]:
+            return "auth", "get-token inference failed: refresh token rejected (invalid_grant)"
+        return "unknown", f"get-token: Globus HTTP {code}"
     marker = _network_marker(stderr)
     if marker:
         return "unavailable", f"get-token network error: {marker}"
-    match = _GLOBUS_UNAVAILABLE.search(stderr)
-    if match:
-        return "unavailable", f"get-token: Globus HTTP {match.group(1)}"
-    if "invalid_grant" in stderr:
-        return "auth", "get-token inference failed: refresh token rejected (invalid_grant)"
     if "Traceback" in stderr:
         return "unknown", f"get-token failed unexpectedly (exit {returncode})"
-    return "auth", f"get-token inference failed: {_auth_phrase(stderr)}"
+    if any(m in stderr for m in _AUTH_ERROR_MARKERS):
+        return "auth", f"get-token inference failed: {_auth_phrase(stderr)}"
+    return "unknown", f"get-token failed with unrecognised output (exit {returncode})"
 
 
 def _run(argv: list, timeout: float):

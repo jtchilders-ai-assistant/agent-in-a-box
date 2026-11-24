@@ -62,6 +62,12 @@ def _traceback(last: str) -> str:
             f"{last}\n")
 
 
+def _globus_api_error(status: int, body: str,
+                      url: str = "https://auth.globus.org/v2/oauth2/token") -> str:
+    return _traceback(f"globus_sdk.services.auth.errors.AuthAPIError: ('POST', '{url}', "
+                      f"None, {status}, None, None)\n{body}")
+
+
 # `alcf-tokens get-token inference` failures (alcf_tokens/cli.py:94-98 catches
 # ONLY AuthError: message on stderr, exit 1; anything else from the refresh
 # (globus_sdk / requests) is an uncaught traceback, exit 1).
@@ -99,9 +105,45 @@ GET_TOKEN_CASES = {
                           "'https://auth.globus.org/v2/oauth2/token', None, 400, "
                           "'invalid_grant', 'invalid_grant')"),
         want=("auth", "get-token inference failed: refresh token rejected (invalid_grant)")),
+    # globus_sdk 4.x API errors: the tuple's 4th field is the HTTP status, and
+    # the response body follows on the next line.
+    "globus_tuple_401": dict(
+        stderr=_globus_api_error(401, '{"error":"invalid_token"}'),
+        want=("auth", "get-token inference failed: Globus HTTP 401")),
+    "globus_tuple_403": dict(
+        stderr=_globus_api_error(403, '{"error":"forbidden"}'),
+        want=("auth", "get-token inference failed: Globus HTTP 403")),
+    "globus_tuple_503": dict(
+        stderr=_globus_api_error(503, "<html>Service Unavailable</html>"),
+        want=("unavailable", "get-token: Globus HTTP 503")),
+    "globus_tuple_429": dict(
+        stderr=_globus_api_error(429, '{"error":"rate_limited"}'),
+        want=("unavailable", "get-token: Globus HTTP 429")),
+    "globus_tuple_400_invalid_grant": dict(
+        stderr=_globus_api_error(400, '{"error":"invalid_grant"}'),
+        want=("auth", "get-token inference failed: refresh token rejected (invalid_grant)")),
+    "globus_tuple_404": dict(
+        stderr=_globus_api_error(404, '{"error":"not_found"}'),
+        want=("unknown", "get-token: Globus HTTP 404")),
+    "globus_tuple_400_with_503_in_url_and_body": dict(
+        stderr=_globus_api_error(
+            400, '{"error":"invalid_request","detail":"HTTP 503 upstream","request_id":"503"}',
+            url="https://auth.globus.org/v2/oauth2/token?retry=503"),
+        want=("unknown", "get-token: Globus HTTP 400")),
     "unknown_traceback": dict(
         stderr=_traceback("KeyError: 'access_token'"),
         want=("unknown", "get-token failed unexpectedly (exit 1)")),
+    # Non-traceback failures are auth ONLY with the real AuthError text.
+    "unknown_token_name": dict(
+        stderr="Unknown token name 'inference'. Valid names: iri, compute "
+               f"(cache {FAKE_TOKEN})\n",
+        want=("unknown", "get-token failed with unrecognised output (exit 1)")),
+    "permission_denied": dict(
+        stderr=f"/bin/sh: /opt/hermes/.venv/bin/alcf-tokens: Permission denied {FAKE_TOKEN}\n",
+        rc=126, want=("unknown", "get-token failed with unrecognised output (exit 126)")),
+    "garbage": dict(
+        stderr=f"lol {FAKE_TOKEN} please login maybe\n",
+        want=("unknown", "get-token failed with unrecognised output (exit 1)")),
     "no_token_printed": dict(
         stdout="\n", stderr=f"warning: cache {FAKE_TOKEN}\n", rc=0,
         want=("unknown", "get-token printed no token")),
