@@ -457,11 +457,16 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
 
 
 def run_populate_cli(*args, stdin: str) -> subprocess.CompletedProcess:
-    """Run scripts/populate_models.py with a fake token and no caller credentials."""
+    """Run scripts/populate_models.py with no caller credentials; it mints the
+    (fake) token itself from a fake alcf-tokens CLI named by ALCF_TOKENS_BIN."""
     env = {k: v for k, v in os.environ.items() if not k.endswith(("_TOKEN", "_API_KEY"))}
-    env["ALCF_INFER_TOKEN"] = FAKE_TOKEN
-    return subprocess.run([sys.executable, str(SCRIPTS / "populate_models.py"), *args],
-                          input=stdin, text=True, capture_output=True, env=env, timeout=30)
+    with tempfile.TemporaryDirectory() as tmp:
+        cli = Path(tmp) / "alcf-tokens"
+        cli.write_text(fake_tokens_cli_script(FAKE_TOKEN), encoding="utf-8")
+        cli.chmod(0o755)
+        env["ALCF_TOKENS_BIN"] = str(cli)
+        return subprocess.run([sys.executable, str(SCRIPTS / "populate_models.py"), *args],
+                              input=stdin, text=True, capture_output=True, env=env, timeout=30)
 
 
 def fake_tokens_cli_script(token: str) -> str:
@@ -1862,9 +1867,21 @@ class EntrypointInferenceLoginContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertFalse((self.harness.home / "config.yaml").exists())
 
     def test_failing_get_token_is_auth(self):
-        res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_GET_TOKEN_RC="1")
+        """get-token AuthError (no usable stored login) -> auth -> exit 77."""
+        res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_GET_TOKEN="auth")
         self.assertEqual(res.returncode, 77, res.stderr)
-        self.assertIn("get-token inference failed", res.stderr)
+        self.assertIn("get-token inference failed: no valid stored login", res.stderr)
+        self.assertNotIn("test-token inference", self.harness.token_cli_calls())
+        self.assert_no_login()
+
+    def test_get_token_network_failure_without_tty_is_unreachable_not_77(self):
+        """A refresh that cannot reach auth.globus.org is an uncaught traceback
+        from get-token, not a rejected login: continue with UNREACHABLE."""
+        res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_GET_TOKEN="network")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.status_file().startswith("UNREACHABLE\n"), self.status_file())
+        self.assertIn("get-token network error", res.stderr)
+        self.assertNotIn("Traceback", res.stdout + res.stderr)
         self.assertNotIn("test-token inference", self.harness.token_cli_calls())
         self.assert_no_login()
 
@@ -1928,10 +1945,17 @@ class EntrypointInferenceLoginContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assert_no_login()
 
     def test_tick_failing_get_token_writes_expired(self):
-        res = self.tick("export FAKE_GET_TOKEN_RC=1")
+        res = self.tick(f"printf auth > '{self.harness.get_token_mode}'")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(self.status_file().startswith("EXPIRED\n"), self.status_file())
         self.assertIn(EXPIRY_WORDING, self.status_file())
+
+    def test_tick_get_token_network_failure_is_unreachable_not_expired(self):
+        res = self.tick(f"printf network > '{self.harness.get_token_mode}'")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.status_file().startswith("UNREACHABLE\n"), self.status_file())
+        self.assertNotIn("EXPIRED", res.stderr + self.status_file())
+        self.assert_no_login()
 
     def test_tick_unreachable_is_not_expired(self):
         res = self.tick(f"printf unavailable > '{self.harness.token_mode}'")
@@ -1954,6 +1978,112 @@ class EntrypointInferenceLoginContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertEqual(self.status_file(), "")
         self.assertNotIn(ALCF_TOKEN_IN_HARNESS,
                          (self.harness.home / "config.yaml").read_text(encoding="utf-8"))
+
+
+# Recording stand-ins for the two token-consuming helpers: each records whether
+# the entrypoint put the inference token in its environment, then mints the
+# token the way the real helper does (the real module's _get_token, i.e. the
+# alcf-tokens CLI) and records whether that produced the harness's fake token.
+_HELPER_RECORD_PRELUDE = textwrap.dedent('''\
+    import importlib.util, json, os, sys
+    def record(helper, got):
+        leaked = sorted(k for k, v in os.environ.items() if {fake!r} in v)
+        with open({record!r}, "a", encoding="utf-8") as f:
+            f.write(json.dumps({{"helper": helper, "leaked": leaked, "got_fake": got,
+                                 "env_names": sorted(k for k in os.environ
+                                                     if k in ("ALCF_INFER_TOKEN",
+                                                              "ALCF_ACCESS_TOKEN"))}}) + "\\n")
+    def load(path, name):
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    ''')
+RECORDING_POPULATE = _HELPER_RECORD_PRELUDE + textwrap.dedent('''\
+    pm = load({real!r}, "populate_models_real")
+    def _fetch(_cluster, token):
+        record("populate_models", token == {fake!r})
+        raise RuntimeError("offline contract test")
+    pm._fetch_models = _fetch
+    sys.exit(pm.main())
+    ''')
+RECORDING_CTXLEN = _HELPER_RECORD_PRELUDE + textwrap.dedent('''\
+    rcl = load({real!r}, "resolve_context_length_real")
+    record("resolve_context_length", rcl._get_token() == {fake!r})
+    print(128000)
+    ''')
+
+
+class EntrypointHelperTokenContract(AlcfEntrypointMixin, unittest.TestCase):
+    """I1: in ALCF mode the entrypoint passes NO bearer token to any helper via
+    the environment; the helpers mint it themselves through the alcf-tokens CLI
+    (ALCF_TOKENS_BIN) and keep it in memory."""
+
+    def setUp(self):
+        super().setUp()
+        self.record = self.harness.runtime / "helper-env.jsonl"
+        alcf = self.harness.alcf_dir
+        fmt = dict(fake=ALCF_TOKEN_IN_HARNESS, record=str(self.record))
+        (alcf / "populate_models.py").write_text(
+            RECORDING_POPULATE.format(real=str(SCRIPTS / "populate_models.py"), **fmt),
+            encoding="utf-8")
+        (alcf / "resolve_context_length.py").write_text(
+            RECORDING_CTXLEN.format(real=str(SCRIPTS / "resolve_context_length.py"), **fmt),
+            encoding="utf-8")
+
+    def test_helpers_get_no_token_env_but_mint_the_token_via_the_cli(self):
+        res = self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rows = [json.loads(ln) for ln in self.record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual({r["helper"] for r in rows}, {"populate_models", "resolve_context_length"},
+                         rows)
+        for row in rows:
+            with self.subTest(helper=row["helper"]):
+                self.assertEqual(row["leaked"], [], "a helper env carried the inference token")
+                self.assertEqual(row["env_names"], [])
+                self.assertTrue(row["got_fake"], "the helper did not obtain the token via the CLI")
+        self.assertIn("get-token inference", self.harness.token_cli_calls())
+
+    def test_no_token_env_override_remains(self):
+        for name in ("entrypoint.sh", "populate_models.py", "resolve_context_length.py"):
+            with self.subTest(file=name):
+                self.assertNotIn("ALCF_INFER_TOKEN",
+                                 (SCRIPTS / name).read_text(encoding="utf-8"))
+
+
+class HelperGetTokenContract(unittest.TestCase):
+    """The helpers' _get_token runs ALCF_TOKENS_BIN and ignores any token env."""
+
+    def _cli(self, tmp: str, body: str) -> str:
+        cli = Path(tmp) / "alcf-tokens"
+        cli.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        cli.chmod(0o755)
+        return str(cli)
+
+    def _modules(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        import resolve_context_length as rcl
+        return (("populate_models", pm), ("resolve_context_length", rcl))
+
+    def test_cli_token_is_returned_and_env_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli = self._cli(tmp, '[ "$1 $2" = "get-token inference" ] || exit 2\n'
+                                 f"printf '%s\\n' '{FAKE_TOKEN}'\n")
+            for name, mod in self._modules():
+                with self.subTest(helper=name), mock.patch.dict(
+                        os.environ, {"ALCF_TOKENS_BIN": cli, "ALCF_INFER_TOKEN": "env-token"}):
+                    self.assertEqual(mod._get_token(), FAKE_TOKEN)
+
+    def test_cli_failure_raises_without_echoing_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli = self._cli(tmp, f"printf '%s\\n' '{FAKE_TOKEN}'\n"
+                                 f"printf '%s\\n' 'refresh {FAKE_TOKEN}' >&2\nexit 1\n")
+            for name, mod in self._modules():
+                with self.subTest(helper=name), mock.patch.dict(os.environ, {"ALCF_TOKENS_BIN": cli}):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        mod._get_token()
+                    self.assertNotIn(FAKE_TOKEN, str(ctx.exception))
 
 
 class EntrypointLaunchSourceValidationContract(AlcfEntrypointMixin, unittest.TestCase):

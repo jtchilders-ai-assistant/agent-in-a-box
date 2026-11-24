@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -37,6 +38,8 @@ import urllib.request
 from alcf_tokens.auth import get_access_token
 
 DEFAULT_CONTEXT = 128000
+# Same default as populate_models.DEFAULT_ALCF_TOKENS_BIN (the image's CLI).
+DEFAULT_ALCF_TOKENS_BIN = "/opt/hermes/.venv/bin/alcf-tokens"
 
 
 def _exc_summary(e: BaseException) -> str:
@@ -68,11 +71,20 @@ def _models_url(vllm_base_url: str) -> str:
 
 
 def _get_token() -> str:
-    # Support passing a pre-fetched token via env to avoid extra alcf-tokens calls.
-    pre = os.environ.get("ALCF_INFER_TOKEN", "").strip()
-    if pre:
-        return pre
-    return get_access_token("inference")
+    """The inference token, minted by the alcf-tokens CLI (ALCF_TOKENS_BIN) and
+    kept in this process's memory: the entrypoint passes no token through the
+    environment. Falls back to the official Python API only when the CLI is not
+    installed (outside the image). Never puts the CLI's output in an exception."""
+    binary = os.environ.get("ALCF_TOKENS_BIN") or DEFAULT_ALCF_TOKENS_BIN
+    try:
+        proc = subprocess.run([binary, "get-token", "inference"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, check=False)
+    except FileNotFoundError:
+        return get_access_token("inference")
+    token = proc.stdout.strip()
+    if proc.returncode != 0 or not token or "\n" in token:
+        raise RuntimeError(f"alcf-tokens get-token inference failed (exit {proc.returncode})")
+    return token
 
 
 def _fetch_max_lens(vllm_base_url: str) -> dict:

@@ -94,7 +94,13 @@ Consequences baked into the design:
   and re-checks (exit 1 unless ok); `auth` with no TTY **exits 77** with the
   reason and the `docker run -it` / `docker exec -it ... alcf-tokens login`
   fix, and never starts a login. `unavailable` / `unknown` warn, write the
-  status file and continue. A failing `get-token` counts as `auth`.
+  status file and continue. The checker runs `get-token` first (its stdout,
+  the token, is discarded): an `AuthError` message or a Globus `invalid_grant`
+  counts as `auth`; a refresh that cannot reach Globus (connection error,
+  Globus 5xx/429, timeout) is `unavailable`, never `auth` / `EXPIRED`; any
+  other traceback is `unknown`. The ALCF helpers (`populate_models.py`,
+  `resolve_context_length.py`) mint their token through `ALCF_TOKENS_BIN`
+  themselves; no token is passed through a child environment.
   `ALCF_TOKEN_CHECK=0` restores the old local-`get-token` gate. Generic mode
   keeps the local gate.
 - The entrypoint runs a **login-check loop** (every `ALCF_TOKEN_CHECK_INTERVAL`

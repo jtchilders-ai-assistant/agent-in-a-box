@@ -184,10 +184,14 @@ fi
 # `get-token inference` only proves a token can be produced LOCALLY: it exits 0
 # with a cached/refreshed token even when ALCF rejects it (e.g. after a
 # high-assurance timeout). So in ALCF mode the gate is a LIVE check:
-# inference_token_check.py runs `alcf-tokens test-token inference` (GET whoami)
-# and prints one `STATUS<TAB>reason` line, STATUS one of
-#   ok | auth (missing/rejected login) | unavailable (gateway/network) | unknown.
-# The reason is a short sanitized phrase, never a response body or a token.
+# inference_token_check.py runs `alcf-tokens get-token inference` (discarding
+# the token) and then `alcf-tokens test-token inference` (GET whoami), and
+# prints one `STATUS<TAB>reason` line, STATUS one of
+#   ok | auth (missing/rejected login) | unavailable (gateway/Globus/network) | unknown.
+# A get-token that fails because Globus is unreachable is `unavailable`, not
+# `auth`: only alcf-tokens' AuthError (or a rejected refresh token) means the
+# login itself is bad. The reason is a short sanitized phrase, never a
+# response body or a token.
 # ALCF_TOKEN_CHECK=0 skips the live check and keeps the local get-token gate.
 # GENERIC MODE keeps the local gate: its LLM token is INFERENCE_TOKEN, and the
 # Globus login is only needed for IRI / Globus Compute / Transfer.
@@ -206,14 +210,14 @@ TOKEN_CHECK_STATUS=""
 TOKEN_CHECK_REASON=""
 check_inference_login() {  # sets TOKEN_CHECK_STATUS / TOKEN_CHECK_REASON
   local line
-  if ! authed_inference; then
-    TOKEN_CHECK_STATUS=auth
-    TOKEN_CHECK_REASON="no usable stored login (get-token inference failed)"
-    return 0
-  fi
   if [[ "${ALCF_TOKEN_CHECK:-1}" == "0" ]]; then
-    TOKEN_CHECK_STATUS=ok
-    TOKEN_CHECK_REASON="live check skipped (ALCF_TOKEN_CHECK=0)"
+    if authed_inference; then
+      TOKEN_CHECK_STATUS=ok
+      TOKEN_CHECK_REASON="live check skipped (ALCF_TOKEN_CHECK=0)"
+    else
+      TOKEN_CHECK_STATUS=auth
+      TOKEN_CHECK_REASON="no usable stored login (get-token inference failed)"
+    fi
     return 0
   fi
   line="$("$PY" "$ALCF_DIR/inference_token_check.py" "$ALCF_TOKENS" 2>/dev/null || true)"
@@ -403,12 +407,14 @@ GPYEOF
     esac
     block_for_scan="$providers_block"
   else
-  token="$("$ALCF_TOKENS" get-token inference)"
+  # The ALCF helpers below mint the inference token themselves by running
+  # ALCF_TOKENS_BIN (the same CLI every provider's key_cmd runs) and keep it in
+  # memory: no token is ever placed in a child environment.
   # Resolve the REAL serving context window for the LAUNCH model from the
   # server's max_model_len (ALCF caps some models below their published spec;
   # Hermes' family table would otherwise over-estimate it). Falls back to
   # $ALCF_CONTEXT_LENGTH / 128000 if the lookup fails. Never fatal.
-  ctxlen="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
+  ctxlen="$(ALCF_TOKENS_BIN="$ALCF_TOKENS" ALCF_PY="$PY" \
             "$PY" "$ALCF_DIR/resolve_context_length.py" \
             "$ALCF_BASE_URL" "$ALCF_MODEL" 2>>"$CTXLEN_LOG")"
   # Guard: if the resolver printed nothing usable, hard-default here too.
@@ -439,7 +445,7 @@ GPYEOF
         diag "$enable_var=0 ignored for the launch cluster $ALCF_CLUSTER (its providers are always generated)"
       fi ;;
   esac
-  providers_block="$(ALCF_INFER_TOKEN="$token" ALCF_PY="$PY" \
+  providers_block="$(ALCF_PY="$PY" \
             ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
             ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
             ALCF_ENABLE_TARA="${ALCF_ENABLE_TARA:-1}" \
@@ -802,7 +808,7 @@ fi
 # GENERIC MODE skips this ALCF-specific gateway banner (generic_inference.py's
 # ENABLED/DISABLED report above is the equivalent in generic mode).
 if [ "$GENERIC_MODE" == "0" ] && [ "${ALCF_SHOW_MODEL_STATUS:-1}" != "0" ]; then
-  ALCF_INFER_TOKEN="$("$ALCF_TOKENS" get-token inference 2>/dev/null || true)" ALCF_PY="$PY" \
+  ALCF_TOKENS_BIN="$ALCF_TOKENS" ALCF_PY="$PY" \
     ALCF_ENABLE_METIS="${ALCF_ENABLE_METIS:-1}" \
     ALCF_ENABLE_MINERVA="${ALCF_ENABLE_MINERVA:-1}" \
     ALCF_ENABLE_TARA="${ALCF_ENABLE_TARA:-1}" \

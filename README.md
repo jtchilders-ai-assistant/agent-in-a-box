@@ -489,8 +489,8 @@ response body; it classifies the outcome:
 | Result | Startup behavior |
 |---|---|
 | **ok** (gateway accepted the token) | Continue. |
-| **auth** (no stored login, `get-token` failed, or HTTP 401/403) | With a terminal (`docker run -it`): explain, run `alcf-tokens login`, re-check; exit 1 unless it is now ok. **Without a terminal: exit 77** with the reason and the fix (`docker run -it ...`, or `docker exec -it <container> /opt/hermes/.venv/bin/alcf-tokens login`). A login is never attempted without a terminal. |
-| **unavailable** (HTTP 5xx/429/408, network error, timeout) | Warn and continue; status file `UNREACHABLE`. The login may be fine. |
+| **auth** (no stored login — `get-token` reported an auth error or Globus rejected the refresh token — or HTTP 401/403) | With a terminal (`docker run -it`): explain, run `alcf-tokens login`, re-check; exit 1 unless it is now ok. **Without a terminal: exit 77** with the reason and the fix (`docker run -it ...`, or `docker exec -it <container> /opt/hermes/.venv/bin/alcf-tokens login`). A login is never attempted without a terminal. |
+| **unavailable** (HTTP 5xx/429/408, network error, timeout — including a `get-token` refresh that cannot reach Globus) | Warn and continue; status file `UNREACHABLE`. The login may be fine. |
 | **unknown** (anything else) | Warn and continue; status file `UNKNOWN`. |
 
 The check times out after `ALCF_TOKEN_CHECK_TIMEOUT` seconds (default 20).
@@ -503,6 +503,9 @@ ALCF provider's `key_cmd` runs `alcf-tokens get-token inference`, and Hermes
 calls it per request, caching the result and re-minting **at most every 15
 minutes** (Hermes' `key_cmd` window). A token that `alcf-tokens` refreshed on
 disk therefore reaches the running agent without a re-render or restart.
+The startup helpers (catalog discovery, context-window lookup, model status
+banner) mint their own token through the same CLI and keep it in memory; the
+entrypoint never places an ALCF token in a child process environment.
 
 **Status file.** `$HERMES_HOME/.inference_token_status` (`/opt/data/...`) is
 empty when healthy. Otherwise its first line is `EXPIRED`, `UNREACHABLE` or

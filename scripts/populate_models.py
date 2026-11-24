@@ -76,7 +76,8 @@ Prints the YAML block to stdout (and to --out if given). --launch-provider and
 --list-models read an already-generated block (or a whole config) on stdin,
 parse it with ruamel.yaml (the Hermes runtime venv's parser) or PyYAML, exit 1
 if it cannot be parsed, and never touch the network. Reads:
-    ALCF_INFER_TOKEN    optional pre-fetched inference token
+    ALCF_TOKENS_BIN     alcf-tokens CLI that mints the inference token (and the
+                        key_cmd every provider runs); default /opt/hermes/.venv/bin/alcf-tokens
     ALCF_PY             python used to run the auth helper (default: this python)
     ALCF_ENABLE_METIS   include the Metis provider?   "1" (default) / "0"
     ALCF_ENABLE_MINERVA include the Minerva provider? "1" (default) / "0"
@@ -95,6 +96,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import textwrap
 import urllib.error
@@ -290,12 +292,21 @@ def _exc_summary(e: BaseException) -> str:
 
 
 def _get_token() -> str:
-    # Support passing a pre-fetched token via env (set by entrypoint to avoid
-    # extra alcf-tokens calls during the same render_config invocation).
-    pre = os.environ.get("ALCF_INFER_TOKEN", "").strip()
-    if pre:
-        return pre
-    return get_access_token("inference")
+    """The inference token, minted by the alcf-tokens CLI (ALCF_TOKENS_BIN, the
+    same binary every provider's key_cmd runs) and kept in this process's memory:
+    the entrypoint passes no token through the environment. Falls back to the
+    official Python API only when the CLI is not installed (outside the image).
+    Never puts the CLI's output in an exception: it is the token."""
+    binary = os.environ.get("ALCF_TOKENS_BIN") or DEFAULT_ALCF_TOKENS_BIN
+    try:
+        proc = subprocess.run([binary, "get-token", "inference"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, check=False)
+    except FileNotFoundError:
+        return get_access_token("inference")
+    token = proc.stdout.strip()
+    if proc.returncode != 0 or not token or "\n" in token:
+        raise RuntimeError(f"alcf-tokens get-token inference failed (exit {proc.returncode})")
+    return token
 
 
 def _fetch_models(cluster: str, token: str) -> list:

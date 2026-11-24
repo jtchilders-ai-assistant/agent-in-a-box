@@ -329,18 +329,29 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         # Fake alcf-tokens: records each invocation's args in self.token_calls.
         # `test-token` answers per self.token_mode (if written) or
         # FAKE_TEST_TOKEN: ok | auth | unavailable | garbage; the auth body
-        # carries the token to prove it is never echoed. FAKE_GET_TOKEN_RC
-        # makes get-token fail.
+        # carries the token to prove it is never echoed. `get-token` answers
+        # per self.get_token_mode (if written) or FAKE_GET_TOKEN: ok | auth
+        # (AuthError message, exit 1) | network (uncaught requests traceback
+        # carrying the token, exit 1), as alcf_tokens/cli.py does.
         self.token_calls = self.runtime / "alcf-tokens.calls"
         self.token_mode = self.runtime / "alcf-tokens.mode"
+        self.get_token_mode = self.runtime / "alcf-tokens.get-token-mode"
         token_cli = self.venv_bin / "alcf-tokens"
         token_cli.write_text(
             "#!/usr/bin/env bash\n"
             f"printf '%s\\n' \"$*\" >> '{self.token_calls}'\n"
             f"mode=$(cat '{self.token_mode}' 2>/dev/null || printf '%s' \"${{FAKE_TEST_TOKEN:-ok}}\")\n"
+            f"gmode=$(cat '{self.get_token_mode}' 2>/dev/null || printf '%s' \"${{FAKE_GET_TOKEN:-ok}}\")\n"
             "case ${1:-} in\n"
             "  get-token)\n"
-            "    [[ ${FAKE_GET_TOKEN_RC:-0} == 0 ]] || exit \"$FAKE_GET_TOKEN_RC\"\n"
+            "    case $gmode in\n"
+            "      auth) printf '%s\\n' \"No valid tokens found for 'inference' (expired). "
+            "Please authenticate by running \\\"alcf-tokens login\\\".\" >&2; exit 1 ;;\n"
+            "      network) printf '%s\\n' 'Traceback (most recent call last):' "
+            "'    refresh_token=test-alcf-token' "
+            "\"requests.exceptions.ConnectionError: HTTPSConnectionPool(host='auth.globus.org', "
+            "port=443): Max retries exceeded\" >&2; exit 1 ;;\n"
+            "    esac\n"
             "    printf '%s\\n' test-alcf-token ;;\n"
             "  test-token)\n"
             "    case $mode in\n"

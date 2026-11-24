@@ -3,26 +3,36 @@
 
     inference_token_check.py <path-to-alcf-tokens>
 
-`alcf-tokens get-token inference` exits 0 with a locally cached/refreshed token
-even when ALCF REJECTS it (e.g. a high-assurance timeout), so it cannot gate
-startup. This runs `alcf-tokens test-token inference` (a GET of the gateway's
-/resource_server/whoami with the stored token) and classifies the outcome.
+Two steps:
+
+1. `alcf-tokens get-token inference` (mint/refresh the stored login). Its
+   stdout IS the token: it is captured and discarded, never logged or
+   returned. alcf_tokens/cli.py catches only AuthError here (message on
+   stderr, exit 1, no traceback) -- that is `auth`. A refresh that cannot reach
+   Globus (requests/globus_sdk connection errors, Globus 5xx/429) escapes as
+   an uncaught traceback, also exit 1 -- that is `unavailable`, NOT `auth`.
+   A rejected refresh token (Globus 400 invalid_grant) is `auth`; any other
+   traceback is `unknown`.
+2. get-token exits 0 with a locally cached/refreshed token even when ALCF
+   REJECTS it (e.g. a high-assurance timeout), so it cannot gate startup on
+   its own: `alcf-tokens test-token inference` (a GET of the gateway's
+   /resource_server/whoami with the stored token) is classified next.
 
 Prints EXACTLY one line `STATUS<TAB>reason` and exits 0 for every
 classification -- the classification is the API, not the exit code:
 
     ok           the gateway accepted the token
     auth         no usable stored login, or the gateway said 401/403
-    unavailable  gateway 5xx/429/408, our timeout, or a network error
+    unavailable  gateway/Globus 5xx/429/408, our timeout, or a network error
     unknown      anything else
 
 SECURITY: `reason` is built from fixed phrases (plus an HTTP status code or an
-httpx exception class name). The response body, stdout and stderr of
-alcf-tokens are NEVER echoed: they can carry a token. The reason is still
-sanitized (token-like strings redacted, control characters dropped) and
-truncated to 120 characters as defence in depth.
+exception class name). The response body, stdout and stderr of alcf-tokens
+are NEVER echoed: they can carry a token. The reason is still sanitized
+(token-like strings redacted, control characters dropped) and truncated to
+120 characters as defence in depth.
 
-Stdlib only. Timeout: ALCF_TOKEN_CHECK_TIMEOUT seconds (default 20).
+Stdlib only. Timeout: ALCF_TOKEN_CHECK_TIMEOUT seconds per step (default 20).
 """
 from __future__ import annotations
 
@@ -36,14 +46,20 @@ import sys
 DEFAULT_TIMEOUT = 20.0
 MAX_REASON = 120
 
-# httpx exception class names / resolver errors that mean "could not reach the
-# gateway" (alcf-tokens does not catch these: traceback on stderr, no JSON).
+# Exception class names / resolver errors that mean "could not reach the
+# gateway or Globus" (alcf-tokens does not catch these: traceback on stderr, no
+# JSON). httpx (test-token) and requests/urllib3/globus_sdk (get-token's
+# refresh). Most specific first: the first match names the reason.
 NETWORK_MARKERS = (
+    "GlobusConnectionError", "GlobusTimeoutError", "NameResolutionError",
     "ConnectError", "ConnectTimeout", "ReadTimeout", "TimeoutException",
-    "NetworkError", "RemoteProtocolError",
+    "NetworkError", "RemoteProtocolError", "Max retries exceeded", "ConnectionError",
     "Name or service not known", "Temporary failure in name resolution",
 )
 UNAVAILABLE_HTTP = {408, 429}
+# A globus_sdk API error (or requests HTTPError) for a Globus 5xx/429, e.g.
+# "AuthAPIError: ('POST', 'https://auth.globus.org/v2/oauth2/token', None, 503, ...".
+_GLOBUS_UNAVAILABLE = re.compile(r"(?:APIError|HTTPError|HTTP)\b[^\n]*?\b(5\d{2}|429)\b")
 
 _TOKENISH = (
     re.compile(r"(?i)bearer\s+\S+"),
@@ -115,20 +131,46 @@ def classify(returncode: int, stdout: str, stderr: str) -> tuple:
                 return "unavailable", f"HTTP {code}"
             return "unknown", f"HTTP {code}"
         return "auth", _auth_phrase(error)
-    for marker in NETWORK_MARKERS:
-        if marker in (stderr or ""):
-            return "unavailable", f"network error: {marker}"
+    marker = _network_marker(stderr)
+    if marker:
+        return "unavailable", f"network error: {marker}"
     return "unknown", f"unrecognised test-token output (exit {returncode})"
 
 
-def run_check(alcf_tokens: str, timeout: float) -> tuple:
-    try:
-        proc = subprocess.Popen(
-            [alcf_tokens, "test-token", "inference"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, errors="replace", start_new_session=True)
-    except OSError:
-        return "unknown", "alcf-tokens could not be executed"
+def _network_marker(stderr: str):
+    for marker in NETWORK_MARKERS:
+        if marker in (stderr or ""):
+            return marker
+    return None
+
+
+def classify_get_token(returncode: int, stdout: str, stderr: str):
+    """(status, reason) for a FAILED `alcf-tokens get-token inference`, or None
+    when it printed a token (then test-token decides). *stdout* is only
+    checked for being non-empty: it is the token."""
+    stderr = stderr or ""
+    if returncode == 0:
+        if (stdout or "").strip():
+            return None
+        return "unknown", "get-token printed no token"
+    marker = _network_marker(stderr)
+    if marker:
+        return "unavailable", f"get-token network error: {marker}"
+    match = _GLOBUS_UNAVAILABLE.search(stderr)
+    if match:
+        return "unavailable", f"get-token: Globus HTTP {match.group(1)}"
+    if "invalid_grant" in stderr:
+        return "auth", "get-token inference failed: refresh token rejected (invalid_grant)"
+    if "Traceback" in stderr:
+        return "unknown", f"get-token failed unexpectedly (exit {returncode})"
+    return "auth", f"get-token inference failed: {_auth_phrase(stderr)}"
+
+
+def _run(argv: list, timeout: float):
+    """(returncode, stdout, stderr); raises OSError / subprocess.TimeoutExpired."""
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, errors="replace", start_new_session=True)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -139,8 +181,28 @@ def run_check(alcf_tokens: str, timeout: float) -> tuple:
         except OSError:
             proc.kill()
         proc.communicate()
+        raise
+    return proc.returncode, stdout, stderr
+
+
+def run_check(alcf_tokens: str, timeout: float) -> tuple:
+    try:
+        rc, token, stderr = _run([alcf_tokens, "get-token", "inference"], timeout)
+    except OSError:
+        return "unknown", "alcf-tokens could not be executed"
+    except subprocess.TimeoutExpired:
+        return "unavailable", f"get-token timed out after {timeout:g}s"
+    failed = classify_get_token(rc, token, stderr)
+    del token  # the minted token itself is never used, logged or returned
+    if failed is not None:
+        return failed
+    try:
+        rc, stdout, stderr = _run([alcf_tokens, "test-token", "inference"], timeout)
+    except OSError:
+        return "unknown", "alcf-tokens could not be executed"
+    except subprocess.TimeoutExpired:
         return "unavailable", f"token check timed out after {timeout:g}s"
-    return classify(proc.returncode, stdout, stderr)
+    return classify(rc, stdout, stderr)
 
 
 def main(argv: list) -> int:
