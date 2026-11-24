@@ -88,18 +88,29 @@ def _get_token() -> str:
 
 
 def _context_window(m: dict):
-    """A /models entry's serving window: ``max_model_len`` (Sophia vLLM) or,
+    """Context window only; see _context_window_with_source."""
+    return _context_window_with_source(m)[0]
+
+
+def _context_window_with_source(m: dict):
+    """(window, field name) or (None, None).
+
+    A /models entry's serving window: ``max_model_len`` (Sophia vLLM) or,
     when that is absent, ``capabilities.context_window_tokens`` (the structured
     schema Minerva and Tara publish instead) -- the fields populate_models.py's
     _select_sophia / _select_capabilities read. None if neither is a positive int."""
     mml = m.get("max_model_len")
     if isinstance(mml, int) and mml > 0:
-        return mml
+        return mml, "max_model_len"
     caps = m.get("capabilities")
     ctx = caps.get("context_window_tokens") if isinstance(caps, dict) else None
     if isinstance(ctx, int) and ctx > 0:
-        return ctx
-    return None
+        return ctx, "capabilities.context_window_tokens"
+    return None, None
+
+
+# model id -> catalog field the window was read from (filled by _fetch_max_lens)
+_SOURCES: dict = {}
 
 
 def _fetch_max_lens(vllm_base_url: str) -> dict:
@@ -116,9 +127,10 @@ def _fetch_max_lens(vllm_base_url: str) -> dict:
             if not isinstance(m, dict):
                 continue
             mid = m.get("id") or m.get("Models")
-            ctx = _context_window(m)
+            ctx, src = _context_window_with_source(m)
             if mid and ctx:
                 out[str(mid)] = ctx
+                _SOURCES[str(mid)] = src
     return out
 
 
@@ -128,7 +140,8 @@ def _mode_value(vllm_base_url: str, model_id: str) -> None:
         val = lens.get(model_id)
         if not (isinstance(val, int) and val > 0):
             raise ValueError(f"no usable context window for {model_id!r}")
-        print(f"resolved context window={val} for {model_id} from server",
+        src = _SOURCES.get(model_id, "server catalog")
+        print(f"resolved context window={val} for {model_id} from server ({src})",
               file=sys.stderr)
         print(val)
     except Exception as e:  # noqa: BLE001

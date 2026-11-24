@@ -1349,7 +1349,14 @@ OFFLINE_POPULATE = textwrap.dedent('''\
 CRASHING_POPULATE = "import sys\nsys.exit(1)\n"
 ALL_LIVE = "sophia,metis,minerva,tara"
 
-STUB_CTXLEN = 'import os\nprint(os.environ.get("TEST_CTXLEN", "128000"))\n'
+STUB_CTXLEN = ('import os, sys\n'
+               'v = os.environ.get("TEST_CTXLEN", "128000")\n'
+               'src = os.environ.get("TEST_CTXLEN_SRC")\n'
+               'if src:\n'
+               '    print(f"resolved context window={v} for m from server ({src})", file=sys.stderr)\n'
+               'else:\n'
+               '    print(f"context-length lookup failed (ValueError); using fallback {v}", file=sys.stderr)\n'
+               'print(v)\n')
 ALCF_TOKEN_IN_HARNESS = "test-alcf-token"  # what the harness's fake alcf-tokens prints
 HINT_LIST = ("openai/gpt-oss-120b, openai/gpt-oss-20b, google/gemma-4-31B-it, "
              "google/gemma-4-26B-A4B-it, nvidia/nemotron-3-super-120b, argonne/AuroraGPT-IT-v4-0125")
@@ -2151,12 +2158,50 @@ class ResolveContextLengthContract(unittest.TestCase):
         out, _ = self.run_main(self.SOPHIA_MODELS, self.SOPHIA, "both")
         self.assertEqual(out.strip(), "65536")
 
+    def test_resolver_log_names_the_source_field(self):
+        _, err = self.run_main(self.TARA_MODELS, self.TARA, "muse-spark-bf16")
+        self.assertIn("from server (capabilities.context_window_tokens)", err)
+        _, err = self.run_main(self.SOPHIA_MODELS, self.SOPHIA, "both")
+        self.assertIn("from server (max_model_len)", err)
+
     def test_neither_field_or_invalid_values_fall_back(self):
         for model in ("neither", "bad"):
             with self.subTest(model=model):
                 out, err = self.run_main(self.SOPHIA_MODELS, self.SOPHIA, model)
                 self.assertEqual(out.strip(), str(self.rcl.DEFAULT_CONTEXT))
                 self.assertIn("fallback", err)
+
+
+class EntrypointContextSourceWordingContract(AlcfEntrypointMixin, unittest.TestCase):
+    """The startup line names the real catalog field, and a fallback is never
+    presented as a server value."""
+
+    def ctx_lines(self):
+        return [ln for ln in self.startup_log().splitlines() if "Model context window:" in ln]
+
+    def test_capabilities_source_is_named(self):
+        self.run_alcf(ALCF_MODEL="muse-spark-bf16", ALCF_CLUSTER="tara", TEST_CTXLEN="1048576",
+                      TEST_CTXLEN_SRC="capabilities.context_window_tokens")
+        lines = self.ctx_lines()
+        self.assertEqual(len(lines), 1, self.startup_log())
+        self.assertIn("1048576 tokens (from server catalog: capabilities.context_window_tokens;",
+                      lines[0])
+        self.assertNotIn("FALLBACK", lines[0])
+
+    def test_max_model_len_source_is_named(self):
+        self.run_alcf(ALCF_MODEL="google/gemma-4-31B-it", ALCF_CLUSTER="sophia",
+                      TEST_CTXLEN="128000", TEST_CTXLEN_SRC="max_model_len")
+        lines = self.ctx_lines()
+        self.assertEqual(len(lines), 1, self.startup_log())
+        self.assertIn("(from server catalog: max_model_len;", lines[0])
+
+    def test_fallback_is_labelled_fallback(self):
+        self.run_alcf(ALCF_MODEL="muse-spark-bf16", ALCF_CLUSTER="tara", TEST_CTXLEN="128000")
+        lines = self.ctx_lines()
+        self.assertEqual(len(lines), 1, self.startup_log())
+        self.assertIn("128000 tokens (FALLBACK", lines[0])
+        self.assertNotIn("from server catalog", lines[0])
+        self.assertNotIn("max_model_len", lines[0])
 
 
 class EntrypointLaunchSourceValidationContract(AlcfEntrypointMixin, unittest.TestCase):

@@ -416,7 +416,8 @@ GPYEOF
   # ALCF_TOKENS_BIN (the same CLI every provider's key_cmd runs) and keep it in
   # memory: no token is ever placed in a child environment.
   # Resolve the REAL serving context window for the LAUNCH model from the
-  # server's max_model_len (ALCF caps some models below their published spec;
+  # server catalog (max_model_len, else capabilities.context_window_tokens;
+  # ALCF caps some models below their published spec;
   # Hermes' family table would otherwise over-estimate it). Falls back to
   # $ALCF_CONTEXT_LENGTH / 128000 if the lookup fails. Never fatal.
   ctxlen="$(ALCF_TOKENS_BIN="$ALCF_TOKENS" ALCF_PY="$PY" \
@@ -424,7 +425,14 @@ GPYEOF
             "$ALCF_BASE_URL" "$ALCF_MODEL" 2>>"$CTXLEN_LOG")"
   # Guard: if the resolver printed nothing usable, hard-default here too.
   case "$ctxlen" in ''|*[!0-9]*) ctxlen=128000 ;; esac
-  diag "Model context window: $ctxlen tokens (from max_model_len; see $CTXLEN_LOG)"
+  # Report where the number came from, using the resolver's own log line, so a
+  # fallback is never presented as a server value.
+  ctx_src="$(sed -n 's/^resolved context window=[0-9]* for .* from server (\(.*\))$/\1/p' "$CTXLEN_LOG" 2>/dev/null | tail -1)"
+  if [ -n "$ctx_src" ]; then
+    diag "Model context window: $ctxlen tokens (from server catalog: $ctx_src; see $CTXLEN_LOG)"
+  else
+    diag "Model context window: $ctxlen tokens (FALLBACK, server lookup did not resolve it; see $CTXLEN_LOG)"
+  fi
 
   # Generate the switchable-model `providers:` block from the LIVE ALCF
   # catalog on every serving cluster (sophia + metis + minerva + tara).
