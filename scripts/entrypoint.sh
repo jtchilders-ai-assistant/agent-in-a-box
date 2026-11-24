@@ -327,7 +327,12 @@ else
         err "ALCF inference login is missing or was rejected ($TOKEN_CHECK_REASON)."
         err "No terminal is attached, so the Globus login cannot run here. Fix it with ONE of:"
         err "  - restart interactively: docker run -it ... (your usual command, with -it)"
-        err "  - or log in inside the container: $reauth_cmd"
+        # This container is exiting, so `docker exec` into it is impossible: log
+        # in with a one-shot container on the SAME volume. The login is stored
+        # under the hermes user's home, /opt/data (~/.globus/app/...), so it
+        # persists for the next normal start.
+        err "  - or log in once with a one-shot container on the same volume, then start normally:"
+        err "      docker run -it --rm -v <your volume>:/opt/data --entrypoint $ALCF_TOKENS <image> login"
         exit 77   # EX_NOPERM: valid ALCF login required
       fi ;;
     *)

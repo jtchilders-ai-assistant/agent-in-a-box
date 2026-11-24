@@ -87,8 +87,23 @@ def _get_token() -> str:
     return token
 
 
+def _context_window(m: dict):
+    """A /models entry's serving window: ``max_model_len`` (Sophia vLLM) or,
+    when that is absent, ``capabilities.context_window_tokens`` (the structured
+    schema Minerva and Tara publish instead) -- the fields populate_models.py's
+    _select_sophia / _select_capabilities read. None if neither is a positive int."""
+    mml = m.get("max_model_len")
+    if isinstance(mml, int) and mml > 0:
+        return mml
+    caps = m.get("capabilities")
+    ctx = caps.get("context_window_tokens") if isinstance(caps, dict) else None
+    if isinstance(ctx, int) and ctx > 0:
+        return ctx
+    return None
+
+
 def _fetch_max_lens(vllm_base_url: str) -> dict:
-    """Return {model_id: max_model_len} for every model that reports one."""
+    """Return {model_id: context window} for every model that reports one."""
     url = _models_url(vllm_base_url)
     token = _get_token()
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
@@ -101,9 +116,9 @@ def _fetch_max_lens(vllm_base_url: str) -> dict:
             if not isinstance(m, dict):
                 continue
             mid = m.get("id") or m.get("Models")
-            mml = m.get("max_model_len")
-            if mid and isinstance(mml, int) and mml > 0:
-                out[str(mid)] = mml
+            ctx = _context_window(m)
+            if mid and ctx:
+                out[str(mid)] = ctx
     return out
 
 
@@ -112,8 +127,8 @@ def _mode_value(vllm_base_url: str, model_id: str) -> None:
         lens = _fetch_max_lens(vllm_base_url)
         val = lens.get(model_id)
         if not (isinstance(val, int) and val > 0):
-            raise ValueError(f"no usable max_model_len for {model_id!r}")
-        print(f"resolved max_model_len={val} for {model_id} from server",
+            raise ValueError(f"no usable context window for {model_id!r}")
+        print(f"resolved context window={val} for {model_id} from server",
               file=sys.stderr)
         print(val)
     except Exception as e:  # noqa: BLE001

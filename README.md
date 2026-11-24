@@ -489,7 +489,7 @@ response body; it classifies the outcome:
 | Result | Startup behavior |
 |---|---|
 | **ok** (gateway accepted the token) | Continue. |
-| **auth** (no stored login — `get-token` reported an auth error or Globus rejected the refresh token — or HTTP 401/403) | With a terminal (`docker run -it`): explain, run `alcf-tokens login`, re-check; exit 1 unless it is now ok. **Without a terminal: exit 77** with the reason and the fix (`docker run -it ...`, or `docker exec -it <container> /opt/hermes/.venv/bin/alcf-tokens login`). A login is never attempted without a terminal. |
+| **auth** (no stored login — `get-token` reported an auth error or Globus rejected the refresh token — or HTTP 401/403) | With a terminal (`docker run -it`): explain, run `alcf-tokens login`, re-check; exit 1 unless it is now ok. **Without a terminal: exit 77** with the reason and the fix (`docker run -it ...`, or — since the container has exited — a one-shot login on the same volume: `docker run -it --rm -v <your volume>:/opt/data --entrypoint /opt/hermes/.venv/bin/alcf-tokens <image> login`, which stores the login under `/opt/data/.globus`). A login is never attempted without a terminal. |
 | **unavailable** (HTTP 5xx/429/408, network error, timeout — including a `get-token` refresh that cannot reach Globus) | Warn and continue; status file `UNREACHABLE`. The login may be fine. |
 | **unknown** (anything else) | Warn and continue; status file `UNKNOWN`. |
 

@@ -1859,9 +1859,14 @@ class EntrypointInferenceLoginContract(AlcfEntrypointMixin, unittest.TestCase):
         res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_TEST_TOKEN="auth")
         self.assertEqual(res.returncode, 77, res.stderr)
         self.assertIn("HTTP 401", res.stderr)
-        self.assertIn("docker run -it", res.stderr)
-        self.assertIn(f"docker exec -it <container> {self.harness.venv_bin}/alcf-tokens login",
-                      res.stderr)
+        stderr = "\n".join(_ERR_PREFIX.sub("", ln) for ln in res.stderr.splitlines())
+        restart = stderr.find("restart interactively: docker run -it")
+        oneshot = stderr.find("docker run -it --rm -v <your volume>:/opt/data "
+                              f"--entrypoint {self.harness.venv_bin}/alcf-tokens <image> login")
+        self.assertGreaterEqual(restart, 0, stderr)
+        self.assertGreater(oneshot, restart, "the one-shot login line must follow the -it line")
+        # The container has exited: `docker exec` into it is impossible.
+        self.assertNotIn("docker exec", stderr)
         self.assertNotIn("bearer", res.stdout + res.stderr, "the response body was echoed")
         self.assert_no_login()
         self.assertFalse((self.harness.home / "config.yaml").exists())
@@ -2084,6 +2089,74 @@ class HelperGetTokenContract(unittest.TestCase):
                     with self.assertRaises(RuntimeError) as ctx:
                         mod._get_token()
                     self.assertNotIn(FAKE_TOKEN, str(ctx.exception))
+
+
+class ResolveContextLengthContract(unittest.TestCase):
+    """D1: the launch context window is read from max_model_len (Sophia) or,
+    when that is absent, capabilities.context_window_tokens (Minerva/Tara),
+    the same precedence populate_models.py applies per cluster."""
+
+    TARA = "https://inference-api.alcf.anl.gov/resource_server/tara/api/v1"
+    SOPHIA = "https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
+    TARA_MODELS = {"data": [
+        {"id": "muse-spark-bf16", "object": "model", "cluster": "tara", "framework": "vllm",
+         "display_name": "Muse Spark", "capabilities": {"context_window_tokens": 1048576,
+                                                       "reasoning": {"supported": True}}},
+        {"id": "mistral-large-4", "object": "model", "cluster": "tara", "framework": "vllm",
+         "display_name": "Mistral", "capabilities": {"context_window_tokens": 262144}},
+    ]}
+    SOPHIA_MODELS = {"data": [
+        {"id": "google/gemma-4-31B-it", "framework": "vllm", "max_model_len": 128000},
+        # both present: max_model_len wins
+        {"id": "both", "max_model_len": 65536, "capabilities": {"context_window_tokens": 999999}},
+        {"id": "neither", "framework": "vllm"},
+        {"id": "bad", "max_model_len": 0, "capabilities": {"context_window_tokens": "big"}},
+    ]}
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS))
+        self.addCleanup(sys.path.remove, str(SCRIPTS))
+        import resolve_context_length as rcl
+        self.rcl = rcl
+
+    def run_main(self, doc: dict, *argv: str) -> tuple:
+        body = json.dumps(doc).encode()
+        out, err = io.StringIO(), io.StringIO()
+        env = {k: v for k, v in os.environ.items() if k != "ALCF_CONTEXT_LENGTH"}
+        with mock.patch.object(self.rcl, "_get_token", return_value=FAKE_TOKEN), \
+                mock.patch.object(self.rcl.urllib.request, "urlopen",
+                                  side_effect=lambda *_a, **_k: io.BytesIO(body)), \
+                mock.patch.object(sys, "argv", ["resolve_context_length.py", *argv]), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(self.rcl.main(), 0)
+        self.assertNotIn(FAKE_TOKEN, out.getvalue() + err.getvalue())
+        return out.getvalue(), err.getvalue()
+
+    def test_tara_shaped_value_reads_capabilities_window(self):
+        out, err = self.run_main(self.TARA_MODELS, self.TARA, "muse-spark-bf16")
+        self.assertEqual(out.strip(), "1048576", err)
+        self.assertNotIn("fallback", err)
+
+    def test_tara_shaped_mapping_reads_capabilities_window(self):
+        out, _ = self.run_main(self.TARA_MODELS, self.TARA, "--mode", "mapping",
+                               "--models", "muse-spark-bf16,mistral-large-4")
+        self.assertEqual(yaml.safe_load(out), {"models": {
+            "muse-spark-bf16": {"context_length": 1048576},
+            "mistral-large-4": {"context_length": 262144}}})
+
+    def test_sophia_shaped_unchanged_and_max_model_len_preferred(self):
+        out, _ = self.run_main(self.SOPHIA_MODELS, self.SOPHIA, "google/gemma-4-31B-it")
+        self.assertEqual(out.strip(), "128000")
+        out, _ = self.run_main(self.SOPHIA_MODELS, self.SOPHIA, "both")
+        self.assertEqual(out.strip(), "65536")
+
+    def test_neither_field_or_invalid_values_fall_back(self):
+        for model in ("neither", "bad"):
+            with self.subTest(model=model):
+                out, err = self.run_main(self.SOPHIA_MODELS, self.SOPHIA, model)
+                self.assertEqual(out.strip(), str(self.rcl.DEFAULT_CONTEXT))
+                self.assertIn("fallback", err)
 
 
 class EntrypointLaunchSourceValidationContract(AlcfEntrypointMixin, unittest.TestCase):
