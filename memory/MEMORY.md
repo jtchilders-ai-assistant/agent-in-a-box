@@ -35,25 +35,38 @@ version — always read the file.
   30 days.
 
 ### Inference token lifetime & expiry (how to recognize + fix)
-Your LLM brain authenticates with a Globus **access token** that is the config
-`api_key`. Lifecycle:
-- **48-hour access token, auto-refreshed.** The container re-renders the config
-  with a fresh token every 6h using a stored refresh token, so normally you
+Your LLM brain authenticates with a Globus **access token**. The config holds
+no token: each ALCF provider has a `key_cmd`
+(`/opt/hermes/.venv/bin/alcf-tokens get-token inference`) that Hermes runs
+per request, re-minting the token at most every 15 minutes. Lifecycle:
+- **48-hour access token, auto-refreshed.** `alcf-tokens` refreshes it from a
+  stored refresh token and `key_cmd` picks the new one up, so normally you
   never notice.
-- **30-day hard re-auth.** After ~30 days the refresh token itself expires and
-  the container CANNOT refresh unattended — it needs an interactive Globus
+- **30-day hard re-auth, or sooner after a high-assurance timeout.** Then
+  ALCF rejects the login and NOTHING automatic can renew it (`key_cmd` and the
+  6-hourly check only reuse the stored login) — it needs an interactive Globus
   browser login again.
+
+At startup the container checks the login LIVE against the gateway. A
+rejected login with no terminal attached stops the container (exit 77) with
+the fix printed; an unreachable gateway only warns.
 
 **When the login has expired, your own LLM calls fail** (usually HTTP 401 from
 inference-api.alcf.anl.gov, or replies that error out / come back empty). This
 is NOT a model-cold 503 and NOT something you can fix by switching models.
 
 To recognize + handle it:
-1. On refresh failure the entrypoint writes a status file. If chat is
-   misbehaving, READ `$HERMES_HOME/.inference_token_status` (a.k.a.
-   `/opt/data/.inference_token_status`). Empty = healthy. First line `EXPIRED`
-   = the inference login expired; the second line is the exact fix to relay.
-2. Tell the user to run this ONCE on their host, then chat works again:
+1. If chat is misbehaving, READ `$HERMES_HOME/.inference_token_status`
+   (a.k.a. `/opt/data/.inference_token_status`; re-checked every 6h).
+   Empty = healthy. Otherwise the first line is the status and the second
+   line the explanation / exact fix to relay:
+   - `EXPIRED` = ALCF rejected the login (expired or high-assurance timeout).
+     The user must log in again (step 2).
+   - `UNREACHABLE` = the inference gateway could not be reached; the login
+     may be fine. Say so, and suggest retrying later — do NOT ask for a login.
+   - `UNKNOWN` = the check gave an unexpected result. Only if your LLM calls
+     fail with HTTP 401/403, relay the login command.
+2. For `EXPIRED`, tell the user to run this ONCE on their host, then chat works again:
 
        docker exec -it <container> \
          /opt/hermes/.venv/bin/alcf-tokens login

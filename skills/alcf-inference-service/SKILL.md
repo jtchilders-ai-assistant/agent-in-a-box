@@ -126,8 +126,11 @@ container does exactly this — it splits each cluster into a baseline provider
       api_key: <globus access token>     # NOT static — 48h rotating; refresh via alcf-tokens
       model: openai/gpt-oss-120b
 
-The rotating token means `api_key` can't be a durable literal — a wrapper/entrypoint must
-fetch a fresh token (`get_access_token`) and inject it before/at session start.
+The rotating token means `api_key` can't be a durable literal. Agent in a Box instead
+gives each provider `key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"`
+(no `api_key`): Hermes runs it per request and re-mints at most every 15 minutes.
+It cannot renew an expired login (30 days, or a high-assurance timeout) — that needs
+`alcf-tokens login` again.
 
 ## Pitfalls
 

@@ -202,11 +202,12 @@ def entrypoint_render_program() -> str:
 
 
 def render_alcf_config(providers_block: str, *, launch_provider: str, model: str) -> str:
-    """Render the template exactly as entrypoint.sh does (splice + substitute)."""
+    """Render the template exactly as entrypoint.sh does (splice + substitute).
+    ALCF mode renders model.api_key EMPTY: providers mint their token via key_cmd."""
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "config.yaml"
         env = dict(os.environ,
-                   ALCF_ACCESS_TOKEN=FAKE_TOKEN,
+                   ALCF_ACCESS_TOKEN="",
                    ALCF_BASE_URL="https://h/v1",
                    ALCF_MODEL=model,
                    ALCF_LAUNCH_PROVIDER=launch_provider,
@@ -229,10 +230,13 @@ TEST_CLUSTER = [("x", "alcf-x", "https://h/v1", None,
 
 
 def build_test_block() -> str:
-    """populate_models.build_block for one known cluster, fully offline."""
-    with mock.patch.object(pm, "_get_token", side_effect=RuntimeError("offline test")), \
+    """populate_models.build_block for one known cluster, fully offline, with
+    the default key_cmd binary."""
+    with mock.patch.dict(os.environ), \
+            mock.patch.object(pm, "_get_token", side_effect=RuntimeError("offline test")), \
             mock.patch.object(pm, "_clusters", return_value=TEST_CLUSTER), \
             contextlib.redirect_stderr(io.StringIO()):
+        os.environ.pop("ALCF_TOKENS_BIN", None)
         return pm.build_block()
 
 
@@ -311,6 +315,20 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
     transport = ChatCompletionsTransport()
     seen = []
 
+    # A key_cmd provider resolves to a CALLABLE api_key (CommandTokenSource)
+    # that both wire clients invoke per request. Call it the way they do and
+    # compare the minted value; record whether it was callable. Mint errors are
+    # reduced to their class name (never a token).
+    def _credential(out, value, fake_token):
+        out["api_key_callable"] = callable(value)
+        if callable(value):
+            try:
+                value = value()
+            except Exception as e:
+                out["api_key_mint_error"] = type(e).__name__
+                value = None
+        out["api_key_is_fake"] = value == fake_token
+
     def _handler(request):
         seen.append(json.loads(request.content or b"{}"))
         return httpx.Response(200, json={
@@ -385,7 +403,7 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
         out["provider"] = rt.get("provider")
         out["api_mode"] = rt.get("api_mode")
         out["base_url"] = rt.get("base_url")
-        out["api_key_is_fake"] = rt.get("api_key") == check.get("fake_token")
+        _credential(out, rt.get("api_key"), check.get("fake_token"))
         out["request_overrides"] = rt.get("request_overrides")
         _wire(out, model, rt.get("base_url"), rt.get("provider"),
               rt.get("request_overrides"), f"build_request[{name}]")
@@ -421,7 +439,7 @@ UPSTREAM_HARNESS = textwrap.dedent(r'''
         out["provider_changed"] = res.provider_changed
         out["base_url"] = res.base_url
         out["api_mode"] = res.api_mode
-        out["api_key_is_fake"] = res.api_key == sw["fake_token"]
+        _credential(out, res.api_key, sw["fake_token"])
         out["request_overrides"] = res.request_overrides
         if res.success:
             _wire(out, res.new_model, res.base_url, res.target_provider,
@@ -444,6 +462,13 @@ def run_populate_cli(*args, stdin: str) -> subprocess.CompletedProcess:
     env["ALCF_INFER_TOKEN"] = FAKE_TOKEN
     return subprocess.run([sys.executable, str(SCRIPTS / "populate_models.py"), *args],
                           input=stdin, text=True, capture_output=True, env=env, timeout=30)
+
+
+def fake_tokens_cli_script(token: str) -> str:
+    """A fake alcf-tokens whose `get-token inference` prints *token*."""
+    return ("#!/bin/sh\n"
+            '[ "$1" = get-token ] || exit 2\n'
+            f"printf '%s\\n' '{token}'\n")
 
 
 UPSTREAM_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TMPDIR")
@@ -483,6 +508,14 @@ class UpstreamHarnessMixin:
             # Upstream's load_config() (used by the switch pipeline) reads
             # $HERMES_HOME/config.yaml, so the rendered config lives there.
             cfg = hermes_home / "config.yaml"
+            # ALCF providers mint their token through key_cmd
+            # (`/opt/hermes/.venv/bin/alcf-tokens get-token inference`); point
+            # that at a fake CLI here that prints FAKE_TOKEN.
+            fake_cli = Path(tmp) / "bin" / "alcf-tokens"
+            fake_cli.parent.mkdir()
+            fake_cli.write_text(fake_tokens_cli_script(FAKE_TOKEN), encoding="utf-8")
+            fake_cli.chmod(0o755)
+            config_text = config_text.replace(pm.DEFAULT_ALCF_TOKENS_BIN, str(fake_cli))
             cfg.write_text(config_text, encoding="utf-8")
             env = upstream_subprocess_env(root, home=home, hermes_home=hermes_home)
             proc = subprocess.run(
@@ -522,7 +555,12 @@ class UpstreamHarnessMixin:
                 self.assertEqual(out["provider"], "custom")
                 self.assertEqual(out["api_mode"], "chat_completions")
                 self.assertEqual(out["base_url"], check["base_url"])
-                self.assertTrue(out["api_key_is_fake"], "resolved api_key is not the rendered token")
+                if check.get("key_cmd"):
+                    self.assertTrue(out["api_key_callable"],
+                                    "ALCF provider credential is not the per-request key_cmd callable")
+                self.assertNotIn("api_key_mint_error", out)
+                self.assertTrue(out["api_key_is_fake"],
+                                "resolved credential does not yield the fake token")
                 overrides = out["request_overrides"] or {}
                 self.assertEqual((overrides.get("extra_body") or {}).get("max_tokens"),
                                  check["max_tokens"],
@@ -548,7 +586,12 @@ class UpstreamHarnessMixin:
                 self.assertTrue(out["provider_changed"])
                 self.assertEqual(out["base_url"], sw["from_base_url"])
                 self.assertEqual(out["api_mode"], "chat_completions")
-                self.assertTrue(out["api_key_is_fake"], "switched api_key is not the rendered token")
+                if sw.get("key_cmd"):
+                    self.assertTrue(out["api_key_callable"],
+                                    "switched ALCF credential is not the per-request key_cmd callable")
+                self.assertNotIn("api_key_mint_error", out)
+                self.assertTrue(out["api_key_is_fake"],
+                                "switched credential does not yield the fake token")
                 self.assertEqual(((out["request_overrides"] or {}).get("extra_body") or {})
                                  .get("max_tokens"), sw["max_tokens"],
                                  "switch result request_overrides lacks the target provider's cap")
@@ -556,11 +599,13 @@ class UpstreamHarnessMixin:
                                  "outgoing body after the switch does not carry the target cap")
 
 
+# "key_cmd": the credential must be the per-request callable (run_upstream
+# points the rendered key_cmd at a fake CLI printing FAKE_TOKEN).
 ALCF_CHECKS = [
     {"provider": "custom:alcf-x", "model": "chatty", "base_url": "https://h/v1",
-     "max_tokens": pm.BASELINE_MAX_TOKENS, "fake_token": FAKE_TOKEN},
+     "max_tokens": pm.BASELINE_MAX_TOKENS, "fake_token": FAKE_TOKEN, "key_cmd": True},
     {"provider": "custom:alcf-x-reasoning", "model": "thinky", "base_url": "https://h/v1",
-     "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN},
+     "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN, "key_cmd": True},
 ]
 
 # Launch on the plain model, then /model-switch to the reasoning one: the turn
@@ -568,9 +613,11 @@ ALCF_CHECKS = [
 ALCF_SWITCHES = [
     {"from_provider": "custom:alcf-x", "from_model": "chatty", "from_base_url": "https://h/v1",
      "to_model": "thinky", "expect_provider": "custom:alcf-x-reasoning",
-     "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN},
+     "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN, "key_cmd": True},
 ]
 
+# Hand-written in the shipped credential shape (key_cmd, no api_key);
+# run_upstream rewrites the alcf-tokens path to its FAKE_TOKEN CLI.
 POSITIVE_CONTROL_CONFIG = f"""\
 model:
   provider: "custom:alcf-x"
@@ -581,7 +628,7 @@ providers:
   alcf-x:
     name: alcf-x
     api: "https://h/v1"
-    api_key: "{FAKE_TOKEN}"
+    key_cmd: "{pm.DEFAULT_ALCF_TOKENS_BIN} get-token inference"
     discover_models: false
     extra_body:
       max_tokens: {pm.BASELINE_MAX_TOKENS}
@@ -591,7 +638,7 @@ providers:
   alcf-x-reasoning:
     name: alcf-x-reasoning
     api: "https://h/v1"
-    api_key: "{FAKE_TOKEN}"
+    key_cmd: "{pm.DEFAULT_ALCF_TOKENS_BIN} get-token inference"
     discover_models: false
     extra_body:
       max_tokens: {pm.REASONING_MAX_TOKENS}
@@ -835,7 +882,9 @@ class TemplateFallbackContract(unittest.TestCase):
                                            where="config.template.yaml fallback")
         assert_cap_split(self, providers, where="config.template.yaml fallback")
         for entry in providers.values():
-            self.assertEqual(entry["api_key"], "${ALCF_ACCESS_TOKEN}")
+            # The credential is the per-request key_cmd, never a token literal.
+            self.assertNotIn("api_key", entry)
+            self.assertEqual(entry["key_cmd"], "/opt/hermes/.venv/bin/alcf-tokens get-token inference")
             for mid, meta in entry["models"].items():
                 self.assertGreaterEqual(meta["context_length"], pm.MIN_CONTEXT, mid)
 
@@ -845,6 +894,16 @@ class TemplateFallbackContract(unittest.TestCase):
         got = {k: {m: v["context_length"] for m, v in e["models"].items()}
                for k, e in providers.items()}
         self.assertEqual(got, fallback_as_providers(pm._clusters()))
+
+    def test_template_and_populate_models_key_cmd_agree(self):
+        """One alcf-tokens path: the template fallback's key_cmd is the one
+        populate_models emits by default."""
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ALCF_TOKENS_BIN", None)
+            default_cmd = pm.alcf_key_cmd()
+        self.assertEqual(default_cmd, f"{pm.DEFAULT_ALCF_TOKENS_BIN} get-token inference")
+        for entry in template_fallback_doc()["providers"].values():
+            self.assertEqual(entry["key_cmd"], default_cmd)
 
     def test_whole_template_parses_with_providers_mapping(self):
         doc = yaml.safe_load((ROOT / "config" / "config.template.yaml").read_text(encoding="utf-8"))
@@ -1763,6 +1822,140 @@ class EntrypointRunDirContract(AlcfEntrypointMixin, unittest.TestCase):
         self.assertIn("alcf-shadow-reasoning", res.stderr)
 
 
+EXPIRY_WORDING = ("access tokens auto-refresh for up to 30 days, after which, or after a "
+                  "high-assurance timeout, a new login is required")
+
+
+class EntrypointInferenceLoginContract(AlcfEntrypointMixin, unittest.TestCase):
+    """ALCF mode gates startup on a LIVE `alcf-tokens test-token inference`
+    (via inference_token_check.py), never starts a login without a TTY, and
+    keeps $HERMES_HOME/.inference_token_status honest."""
+
+    MODEL = "google/gemma-4-31B-it"
+
+    def status_file(self) -> str:
+        path = self.harness.home / ".inference_token_status"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def assert_no_login(self):
+        calls = self.harness.token_cli_calls()
+        self.assertFalse([c for c in calls if c.split()[:1] == ["login"]],
+                         f"alcf-tokens login was invoked: {calls}")
+
+    def test_ok_starts_after_live_check(self):
+        res = self.run_alcf(ALCF_MODEL=self.MODEL)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("ALCF inference login verified live (whoami OK)", self.startup_log())
+        self.assertIn("test-token inference", self.harness.token_cli_calls())
+        self.assertEqual(self.status_file(), "")
+        self.assert_no_login()
+
+    def test_rejected_login_without_tty_exits_77_without_login(self):
+        res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_TEST_TOKEN="auth")
+        self.assertEqual(res.returncode, 77, res.stderr)
+        self.assertIn("HTTP 401", res.stderr)
+        self.assertIn("docker run -it", res.stderr)
+        self.assertIn(f"docker exec -it <container> {self.harness.venv_bin}/alcf-tokens login",
+                      res.stderr)
+        self.assertNotIn("bearer", res.stdout + res.stderr, "the response body was echoed")
+        self.assert_no_login()
+        self.assertFalse((self.harness.home / "config.yaml").exists())
+
+    def test_failing_get_token_is_auth(self):
+        res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_GET_TOKEN_RC="1")
+        self.assertEqual(res.returncode, 77, res.stderr)
+        self.assertIn("get-token inference failed", res.stderr)
+        self.assertNotIn("test-token inference", self.harness.token_cli_calls())
+        self.assert_no_login()
+
+    def test_unreachable_gateway_continues_with_status(self):
+        res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_TEST_TOKEN="unavailable")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue((self.harness.home / "config.yaml").exists())
+        self.assertIn("gateway is unreachable (HTTP 503)", res.stderr)
+        self.assertTrue(self.status_file().startswith("UNREACHABLE\n"), self.status_file())
+        self.assert_no_login()
+
+    def test_unrecognised_check_output_continues_as_unknown(self):
+        res = self.run_alcf(ALCF_MODEL=self.MODEL, FAKE_TEST_TOKEN="garbage")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.status_file().startswith("UNKNOWN\n"), self.status_file())
+        self.assertNotIn("not json at all", res.stdout + res.stderr + self.status_file())
+
+    def test_token_check_0_uses_legacy_local_gate(self):
+        res = self.run_alcf(ALCF_MODEL=self.MODEL, ALCF_TOKEN_CHECK="0", FAKE_TEST_TOKEN="auth")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("ALCF_TOKEN_CHECK=0", self.startup_log())
+        calls = self.harness.token_cli_calls()
+        self.assertIn("get-token inference", calls)
+        self.assertNotIn("test-token inference", calls)
+        self.assertEqual(self.status_file(), "")
+
+    def test_generic_mode_never_runs_the_live_check(self):
+        tgi._CatalogHandler.payload = {"data": [{"id": "selected/model", "context_length": 131072}]}
+        res = self.harness.run_entrypoint(
+            INFERENCE_URL=self.harness.base_url, INFERENCE_TOKEN=tgi.SECRET,
+            INFERENCE_MODEL="selected/model", FAKE_TEST_TOKEN="auth")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("test-token inference", self.harness.token_cli_calls())
+
+    def test_rendered_config_holds_no_token(self):
+        res = self.run_alcf(ALCF_MODEL=self.MODEL)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        text = (self.harness.home / "config.yaml").read_text(encoding="utf-8")
+        self.assertNotIn(ALCF_TOKEN_IN_HARNESS, text)
+        cfg = yaml.safe_load(text)
+        self.assertEqual(cfg["model"]["api_key"], "")
+        key_cmd = f"{self.harness.venv_bin}/alcf-tokens get-token inference"
+        for name, entry in cfg["providers"].items():
+            with self.subTest(provider=name):
+                self.assertNotIn("api_key", entry)
+                self.assertEqual(entry["key_cmd"], key_cmd)
+
+    # --- the background refresh tick (step 6 runs token_refresh_tick) --------
+
+    def tick(self, before: str, **env):
+        self.harness.stop_with(f"{before}\ntoken_refresh_tick")
+        return self.run_alcf(ALCF_MODEL=self.MODEL, **env)
+
+    def test_tick_rejected_login_writes_expired(self):
+        res = self.tick(f"printf auth > '{self.harness.token_mode}'")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        status = self.status_file()
+        self.assertTrue(status.startswith("EXPIRED\n"), status)
+        self.assertIn(f"ALCF login expired or rejected (HTTP 401); {EXPIRY_WORDING}", status)
+        self.assertIn("ALCF INFERENCE LOGIN EXPIRED OR REJECTED", res.stderr)
+        self.assert_no_login()
+
+    def test_tick_failing_get_token_writes_expired(self):
+        res = self.tick("export FAKE_GET_TOKEN_RC=1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.status_file().startswith("EXPIRED\n"), self.status_file())
+        self.assertIn(EXPIRY_WORDING, self.status_file())
+
+    def test_tick_unreachable_is_not_expired(self):
+        res = self.tick(f"printf unavailable > '{self.harness.token_mode}'")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.status_file().startswith("UNREACHABLE\n"), self.status_file())
+        self.assertNotIn("EXPIRED", res.stderr + self.status_file())
+
+    def test_tick_unknown_is_not_expired(self):
+        res = self.tick(f"printf garbage > '{self.harness.token_mode}'")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(self.status_file().startswith("UNKNOWN\n"), self.status_file())
+        self.assertNotIn("EXPIRED", res.stderr + self.status_file())
+
+    def test_tick_ok_rerenders_and_clears_status(self):
+        # Start degraded (UNREACHABLE), then the gateway recovers.
+        res = self.tick(f"printf ok > '{self.harness.token_mode}'",
+                        FAKE_TEST_TOKEN="unavailable")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Inference login verified; config re-rendered.", self.startup_log())
+        self.assertEqual(self.status_file(), "")
+        self.assertNotIn(ALCF_TOKEN_IN_HARNESS,
+                         (self.harness.home / "config.yaml").read_text(encoding="utf-8"))
+
+
 class EntrypointLaunchSourceValidationContract(AlcfEntrypointMixin, unittest.TestCase):
     """B7c-R3: the launch-cluster state file must hold one of the values
     populate_models writes; anything else is a fixed refusal (exit 78)."""
@@ -2045,6 +2238,12 @@ class UpstreamRuntimeContract(UpstreamHarnessMixin, unittest.TestCase):
         config = render_alcf_config(build_test_block(), launch_provider="custom:alcf-x",
                                     model="chatty")
         self.assertNotIn("${ALCF_ACCESS_TOKEN}", config)
+        self.assertNotIn(FAKE_TOKEN, config)
+        doc = yaml.safe_load(config)
+        self.assertEqual(doc["model"]["api_key"], "")
+        for entry in doc["providers"].values():
+            self.assertNotIn("api_key", entry)
+            self.assertEqual(entry["key_cmd"], f"{pm.DEFAULT_ALCF_TOKENS_BIN} get-token inference")
         ev = self.run_upstream(config, ALCF_CHECKS)
         self.assert_runtime_contract(ev, ALCF_CHECKS)
         self.assert_config_version_current(ev)
@@ -2085,7 +2284,8 @@ class UpstreamRuntimeContract(UpstreamHarnessMixin, unittest.TestCase):
                                     model="google/gemma-4-31B-it")
         checks = [{"provider": "custom:alcf-sophia-reasoning", "model": "google/gemma-4-31B-it",
                    "base_url": f"{pm.INFER_HOST}/sophia/vllm/v1",
-                   "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN}]
+                   "max_tokens": pm.REASONING_MAX_TOKENS, "fake_token": FAKE_TOKEN,
+                   "key_cmd": True}]
         ev = self.run_upstream(config, checks)
         self.assert_runtime_contract(ev, checks)
         self.assert_config_version_current(ev)
@@ -2114,9 +2314,12 @@ class UpstreamTaraDefaultRuntimeContract(UpstreamHarnessMixin, AlcfEntrypointMix
         res = self.run_alcf(ALCF_CLUSTER="", ALCF_MODEL="")
         self.assertEqual(res.returncode, 0, res.stderr)
         config = (self.harness.home / "config.yaml").read_text(encoding="utf-8")
+        # No token in the rendered config: the entrypoint's key_cmd points at
+        # the harness's fake alcf-tokens, which mints ALCF_TOKEN_IN_HARNESS.
+        self.assertNotIn(ALCF_TOKEN_IN_HARNESS, config)
         checks = [{"provider": "custom:alcf-tara-reasoning", "model": "muse-spark-bf16",
                    "base_url": pm.TARA_BASE, "max_tokens": pm.REASONING_MAX_TOKENS,
-                   "fake_token": ALCF_TOKEN_IN_HARNESS, "agent_path": True}]
+                   "fake_token": ALCF_TOKEN_IN_HARNESS, "agent_path": True, "key_cmd": True}]
         ev = self.run_upstream(config, checks)
         self.assert_runtime_contract(ev, checks)
         agent = ev["providers"]["custom:alcf-tara-reasoning"]["agent_path"]
@@ -2137,6 +2340,90 @@ class UpstreamGenericRuntimeContract(UpstreamHarnessMixin, GenericRenderMixin, u
         ev = self.run_upstream(config, checks)
         self.assert_runtime_contract(ev, checks)
         self.assert_config_version_current(ev)
+
+
+# Resolves a key_cmd provider, mints, rotates the token file, forces the
+# CommandTokenSource cache past its window and mints again. Prints booleans
+# only (never a token).
+KEY_CMD_LIFECYCLE_HARNESS = textwrap.dedent(r'''
+    import json, socket, sys, time
+    from unittest import mock
+
+    def _no_network(*_a, **_k):
+        raise OSError("network disabled in contract harness")
+    socket.socket.connect = _no_network
+    socket.create_connection = _no_network
+    socket.getaddrinfo = _no_network
+
+    config_path, token_file, old, new = sys.argv[1:5]
+    import hermes_yaml
+    import agent.command_token_source as cts
+    from hermes_cli.runtime_provider import frozen_runtime_config, resolve_runtime_provider
+
+    with open(config_path, encoding="utf-8") as fh:
+        cfg = hermes_yaml.safe_load(fh)
+    ev = {}
+    with frozen_runtime_config(cfg):
+        named = resolve_runtime_provider(requested="custom:alcf-x", target_model="chatty")
+        launch = resolve_runtime_provider(requested=None)
+    key, launch_key = named.get("api_key"), launch.get("api_key")
+    ev["named_callable"] = callable(key)
+    ev["launch_callable"] = callable(launch_key)
+    ev["launch_base_url"] = launch.get("base_url")
+    ev["first_is_old"] = key() == old
+    with open(token_file, "w", encoding="utf-8") as fh:
+        fh.write(new + "\n")
+    ev["cached_is_old"] = key() == old
+    real = time.monotonic()
+    with mock.patch.object(cts.time, "monotonic",
+                           return_value=real + cts._NO_TTL_REFRESH_SECONDS + 1):
+        ev["after_expiry_is_new"] = key() == new
+    ev["launch_mints_new"] = launch_key() == new
+    print(json.dumps(ev))
+''')
+
+
+class UpstreamKeyCmdLifecycleContract(UpstreamHarnessMixin, unittest.TestCase):
+    """The rendered key_cmd credential is re-minted by upstream: a token
+    rotated on disk (what `alcf-tokens` does when it refreshes) is picked up
+    once the CommandTokenSource cache window lapses, with no re-render."""
+
+    OLD, NEW = "fake-alcf-old-token", "fake-alcf-new-token"
+
+    def test_rotated_token_is_reminted_after_cache_window(self):
+        root = self.upstream()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            hermes_home = home / ".hermes"
+            hermes_home.mkdir(parents=True)
+            token_file = Path(tmp) / "token"
+            token_file.write_text(self.OLD + "\n", encoding="utf-8")
+            fake_cli = Path(tmp) / "alcf-tokens"
+            fake_cli.write_text(
+                '#!/bin/sh\n[ "$1" = get-token ] || exit 2\n'
+                f"cat '{token_file}'\n", encoding="utf-8")
+            fake_cli.chmod(0o755)
+            config = render_alcf_config(build_test_block(), launch_provider="custom:alcf-x",
+                                        model="chatty")
+            self.assertEqual(yaml.safe_load(config)["model"]["api_key"], "")
+            config = config.replace(pm.DEFAULT_ALCF_TOKENS_BIN, str(fake_cli))
+            cfg = hermes_home / "config.yaml"
+            cfg.write_text(config, encoding="utf-8")
+            proc = subprocess.run(
+                [str(root / ".venv" / "bin" / "python"), "-c", KEY_CMD_LIFECYCLE_HARNESS,
+                 str(cfg), str(token_file), self.OLD, self.NEW],
+                cwd=str(root), env=upstream_subprocess_env(root, home=home, hermes_home=hermes_home),
+                text=True, capture_output=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, f"lifecycle harness crashed:\n{proc.stderr[-4000:]}")
+        for tok in (self.OLD, self.NEW):
+            self.assertNotIn(tok, proc.stdout + proc.stderr)
+        ev = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(ev, {
+            "named_callable": True, "launch_callable": True,
+            "launch_base_url": "https://h/v1",
+            "first_is_old": True, "cached_is_old": True,
+            "after_expiry_is_new": True, "launch_mints_new": True,
+        })
 
 
 if __name__ == "__main__":

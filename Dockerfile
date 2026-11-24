@@ -15,9 +15,10 @@
 #   3. ALCF content baked as image defaults: skills, curated MEMORY.md, a docs
 #      snapshot, the config template, SOUL.md, the runtime helper scripts
 #      (Globus/IRI facility helpers, remote bash + its MCP server, context-window
-#      and model-catalog resolvers, generic-inference validator) and our
-#      entrypoint, which does first-run Globus auth, renders the config with a
-#      fresh token, and launches the dashboard.
+#      and model-catalog resolvers, generic-inference validator, live
+#      inference-token check) and our entrypoint, which does first-run Globus
+#      auth, renders the config (ALCF providers mint their token per request
+#      via key_cmd), and launches the dashboard.
 #   4. The ALCF-agent-box git revision + build date (/opt/alcf/.alcf_version).
 #   5. ALCF_* ENV defaults, a healthcheck through Caddy, and the entrypoint,
 #      run as the non-root hermes user.
@@ -130,11 +131,12 @@ COPY scripts/alcf_bash_mcp.py /opt/alcf/alcf_bash_mcp.py
 COPY scripts/resolve_context_length.py /opt/alcf/resolve_context_length.py
 COPY scripts/populate_models.py /opt/alcf/populate_models.py
 COPY scripts/generic_inference.py /opt/alcf/generic_inference.py
+COPY scripts/inference_token_check.py /opt/alcf/inference_token_check.py
 RUN chmod +x /opt/alcf/entrypoint.sh /opt/alcf/iri_hello_world.py \
              /opt/alcf/alcf_facility.py /opt/alcf/alcf_remote_bash.py \
              /opt/alcf/alcf_bash_mcp.py \
              /opt/alcf/resolve_context_length.py /opt/alcf/populate_models.py \
-             /opt/alcf/generic_inference.py \
+             /opt/alcf/generic_inference.py /opt/alcf/inference_token_check.py \
     && chown -R hermes:hermes /opt/alcf
 
 # Bake the ALCF-agent-box git revision + build date so the container can print

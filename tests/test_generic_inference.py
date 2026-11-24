@@ -322,11 +322,33 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         )
         python_wrapper.chmod(0o755)
 
+        (self.alcf_dir / "inference_token_check.py").write_bytes(
+            (ROOT / "scripts" / "inference_token_check.py").read_bytes()
+        )
+
+        # Fake alcf-tokens: records each invocation's args in self.token_calls.
+        # `test-token` answers per self.token_mode (if written) or
+        # FAKE_TEST_TOKEN: ok | auth | unavailable | garbage; the auth body
+        # carries the token to prove it is never echoed. FAKE_GET_TOKEN_RC
+        # makes get-token fail.
+        self.token_calls = self.runtime / "alcf-tokens.calls"
+        self.token_mode = self.runtime / "alcf-tokens.mode"
         token_cli = self.venv_bin / "alcf-tokens"
         token_cli.write_text(
             "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> '{self.token_calls}'\n"
+            f"mode=$(cat '{self.token_mode}' 2>/dev/null || printf '%s' \"${{FAKE_TEST_TOKEN:-ok}}\")\n"
             "case ${1:-} in\n"
-            "  get-token) printf '%s\\n' test-alcf-token ;;\n"
+            "  get-token)\n"
+            "    [[ ${FAKE_GET_TOKEN_RC:-0} == 0 ]] || exit \"$FAKE_GET_TOKEN_RC\"\n"
+            "    printf '%s\\n' test-alcf-token ;;\n"
+            "  test-token)\n"
+            "    case $mode in\n"
+            "      ok) printf '%s\\n' '{\"ready\": true, \"error\": null}' ;;\n"
+            "      auth) printf '%s\\n' '{\"ready\": false, \"error\": \"HTTP 401: bearer test-alcf-token rejected\"}'; exit 1 ;;\n"
+            "      unavailable) printf '%s\\n' '{\"ready\": false, \"error\": \"HTTP 503: upstream down\"}'; exit 1 ;;\n"
+            "      *) printf '%s\\n' 'not json at all'; exit 1 ;;\n"
+            "    esac ;;\n"
             "  login) exit 0 ;;\n"
             "  *) exit 2 ;;\n"
             "esac\n",
@@ -340,10 +362,22 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         body = body.replace("/opt/hermes/agent", str(self.hermes_agent))
         stop_marker = "# --- 4b. Model availability status banner"
         self.assertIn(stop_marker, body)
-        body = body.replace(stop_marker, "exit 0\n" + stop_marker, 1)
+        self._bounded_body = body
         self.entrypoint = self.runtime / "entrypoint-under-test.sh"
+        self.stop_with("")
+
+    def stop_with(self, snippet: str) -> None:
+        """Re-write the bounded entrypoint to run *snippet* (shell, with every
+        step-2 helper in scope) just before its early `exit 0`."""
+        stop_marker = "# --- 4b. Model availability status banner"
+        body = self._bounded_body.replace(stop_marker, f"{snippet}\nexit 0\n{stop_marker}", 1)
         self.entrypoint.write_text(body, encoding="utf-8")
         self.entrypoint.chmod(0o755)
+
+    def token_cli_calls(self) -> list:
+        if not self.token_calls.exists():
+            return []
+        return self.token_calls.read_text(encoding="utf-8").splitlines()
 
     def run_entrypoint(self, **overrides):
         env = os.environ.copy()
@@ -364,6 +398,7 @@ class EntrypointAndWorkflowContractTests(unittest.TestCase):
         return subprocess.run(
             ["bash", str(self.entrypoint)],
             text=True,
+            stdin=subprocess.DEVNULL,  # no TTY: the entrypoint must never start a login
             capture_output=True,
             env=env,
             timeout=15,

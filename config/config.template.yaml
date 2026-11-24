@@ -1,8 +1,12 @@
 # ALCF Agent — Hermes config template
 #
 # Rendered into the live config at container start by scripts/entrypoint.sh,
-# which substitutes ${...} placeholders from environment variables and injects
-# the freshly-minted Globus access token as the api_key.
+# which substitutes ${...} placeholders from environment variables. In ALCF
+# mode NO token is written: every ALCF provider declares
+#   key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
+# which Hermes runs per request (token cached, re-minted at most every 15 min),
+# and model.api_key renders empty so it cannot shadow the provider's key_cmd.
+# Generic mode (INFERENCE_URL) substitutes its static token into model.api_key.
 #
 # IMPORTANT: keep this MINIMAL. Do not add personal fallback providers, stray
 # base_urls, or secrets. The packaged agent must have exactly ONE inference
@@ -31,7 +35,7 @@ model:
   # gets. We deliberately DO NOT set model.max_tokens here (see below).
   provider: "${ALCF_LAUNCH_PROVIDER}"
   base_url: "${ALCF_BASE_URL}"        # default https://inference-api.alcf.anl.gov/resource_server/tara/api/v1
-  api_key: "${ALCF_ACCESS_TOKEN}"     # Globus access token, injected + refreshed by entrypoint
+  api_key: "${ALCF_ACCESS_TOKEN}"     # ALCF mode: empty (providers use key_cmd); generic mode: INFERENCE_TOKEN
   model: "${ALCF_MODEL}"              # default depends on ALCF_CLUSTER (tara: muse-spark-bf16)
   default: "${ALCF_MODEL}"
 
@@ -157,7 +161,7 @@ providers:
   alcf-sophia:
     name: alcf-sophia
     api: "https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 2048
@@ -172,7 +176,7 @@ providers:
   alcf-sophia-reasoning:
     name: alcf-sophia-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 12288
@@ -192,7 +196,7 @@ providers:
   alcf-metis-reasoning:
     name: alcf-metis-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/metis/api/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 12288
@@ -208,7 +212,7 @@ providers:
   alcf-minerva-reasoning:
     name: alcf-minerva-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 12288
@@ -228,7 +232,7 @@ providers:
   alcf-tara-reasoning:
     name: alcf-tara-reasoning
     api: "https://inference-api.alcf.anl.gov/resource_server/tara/api/v1"
-    api_key: "${ALCF_ACCESS_TOKEN}"
+    key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"
     discover_models: false
     extra_body:
       max_tokens: 12288

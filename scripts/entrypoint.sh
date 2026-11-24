@@ -8,9 +8,14 @@
 #      default login always requests all four services; feature flags
 #      (ALCF_ENABLE_IRI, ALCF_ENABLE_GLOBUS_COMPUTE) gate RUNTIME exposure
 #      but do not narrow the consent.
-#   3. Render the Hermes config with a fresh inference access token.
+#      In ALCF mode the stored login is then checked LIVE against the gateway
+#      (inference_token_check.py); a rejected login without a terminal exits 77.
+#   3. Render the Hermes config. ALCF providers carry no token: Hermes mints one
+#      per request through key_cmd (`alcf-tokens get-token inference`).
 #   4. Seed skills + curated MEMORY.md into $HERMES_HOME (idempotent).
-#   5. Background token-refresh loop (tokens last 48h; refresh every 6h).
+#   5. Background login check every 6h (ALCF_TOKEN_CHECK_INTERVAL) that keeps
+#      $HERMES_HOME/.inference_token_status honest (empty / EXPIRED /
+#      UNREACHABLE / UNKNOWN).
 #   6. Launch the Hermes web dashboard (the local web chat).
 #
 # $HERMES_HOME (/opt/data) and ~/.globus persist across restarts, so step 2
@@ -46,6 +51,7 @@ diag() {
   fi
 }
 err() { printf '\033[31m[agent-in-a-box]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m[agent-in-a-box]\033[0m %s\n' "$*" >&2; }
 log() { milestone "$*"; }
 
 # --- 0. Version banner ------------------------------------------------------
@@ -174,21 +180,155 @@ fi
 # ALCF_ENABLE_GLOBUS_COMPUTE) gate RUNTIME feature exposure but do NOT alter
 # the consent scope — one fresh login is all that is needed on upgrade.
 # Note: alcf-tokens login has no --force flag; re-run to trigger a new login.
+#
+# `get-token inference` only proves a token can be produced LOCALLY: it exits 0
+# with a cached/refreshed token even when ALCF rejects it (e.g. after a
+# high-assurance timeout). So in ALCF mode the gate is a LIVE check:
+# inference_token_check.py runs `alcf-tokens test-token inference` (GET whoami)
+# and prints one `STATUS<TAB>reason` line, STATUS one of
+#   ok | auth (missing/rejected login) | unavailable (gateway/network) | unknown.
+# The reason is a short sanitized phrase, never a response body or a token.
+# ALCF_TOKEN_CHECK=0 skips the live check and keeps the local get-token gate.
+# GENERIC MODE keeps the local gate: its LLM token is INFERENCE_TOKEN, and the
+# Globus login is only needed for IRI / Globus Compute / Transfer.
 authed_inference() { "$ALCF_TOKENS" get-token inference >/dev/null 2>&1; }
 
-if ! authed_inference; then
-  log "First-time setup: ONE Globus login for all ALCF services"
-  log "(Inference + IRI + Globus Compute + Transfer — ALCF policy default)"
-  log "A single URL will be printed — open it, log in with your ALCF/Globus"
-  log "account, and paste the ONE authorization code back here."
-  echo
-  "$ALCF_TOKENS" login
-  echo
+# The agent reads this file and explains a broken login IN CHAT (a chat-only
+# user never sees the container log; see memory/MEMORY.md -> "Inference token
+# lifetime & expiry"). Empty = healthy; otherwise the first line is EXPIRED,
+# UNREACHABLE or UNKNOWN and the second a human explanation. Cleared once per
+# start, BEFORE the startup check, which may write it.
+TOKEN_STATUS="$HERMES_HOME/.inference_token_status"
+: > "$TOKEN_STATUS" 2>/dev/null || true
+reauth_cmd="docker exec -it <container> $ALCF_TOKENS login"
+
+TOKEN_CHECK_STATUS=""
+TOKEN_CHECK_REASON=""
+check_inference_login() {  # sets TOKEN_CHECK_STATUS / TOKEN_CHECK_REASON
+  local line
   if ! authed_inference; then
-    err "ALCF authentication failed. Re-run the container to try again."
-    exit 1
+    TOKEN_CHECK_STATUS=auth
+    TOKEN_CHECK_REASON="no usable stored login (get-token inference failed)"
+    return 0
   fi
-  log "ALCF authentication OK (single login covered all services)."
+  if [[ "${ALCF_TOKEN_CHECK:-1}" == "0" ]]; then
+    TOKEN_CHECK_STATUS=ok
+    TOKEN_CHECK_REASON="live check skipped (ALCF_TOKEN_CHECK=0)"
+    return 0
+  fi
+  line="$("$PY" "$ALCF_DIR/inference_token_check.py" "$ALCF_TOKENS" 2>/dev/null || true)"
+  line="${line%%$'\n'*}"
+  TOKEN_CHECK_STATUS="${line%%$'\t'*}"
+  TOKEN_CHECK_REASON="${line#*$'\t'}"
+  case "$TOKEN_CHECK_STATUS" in
+    ok|auth|unavailable|unknown)
+      [[ "$line" == *$'\t'* ]] || TOKEN_CHECK_REASON="no detail" ;;
+    *) TOKEN_CHECK_STATUS=unknown
+       TOKEN_CHECK_REASON="token check produced no classification" ;;
+  esac
+}
+
+write_token_status() {  # $1=EXPIRED|UNREACHABLE|UNKNOWN  $2=explanation
+  printf '%s\n%s\n' "$1" "$2" > "$TOKEN_STATUS" 2>/dev/null || true
+}
+
+# Non-fatal degraded states (startup and refresh): loud warning + status file.
+report_degraded_login() {
+  local reason="$TOKEN_CHECK_REASON"
+  if [[ "$TOKEN_CHECK_STATUS" == "unavailable" ]]; then
+    warn "Could not verify the ALCF inference login: the gateway is unreachable ($reason)."
+    warn "Continuing; LLM calls will fail until the ALCF Inference Service is reachable again."
+    write_token_status UNREACHABLE \
+      "ALCF Inference Service unreachable while checking the login ($reason). The login itself may be fine; retry later."
+  else
+    warn "Could not verify the ALCF inference login: unexpected check result ($reason)."
+    warn "Continuing; if LLM calls fail with HTTP 401/403, re-authenticate: $reauth_cmd"
+    write_token_status UNKNOWN \
+      "ALCF inference login could not be verified ($reason). If LLM calls fail with HTTP 401/403, re-authenticate on the host: $reauth_cmd"
+  fi
+}
+
+# One iteration of the background refresh loop (step 6). Hermes mints the
+# per-request token itself through key_cmd; this keeps the catalog/config
+# current and the status file honest. render_config runs in a subshell so a
+# refusal (`exit 78`) inside it cannot kill the loop.
+token_refresh_tick() {
+  check_inference_login
+  case "$TOKEN_CHECK_STATUS" in
+    ok)
+      if ( render_config ) 2>/dev/null; then
+        diag "Inference login verified; config re-rendered."
+        : > "$TOKEN_STATUS" 2>/dev/null || true   # healthy again
+      else
+        TOKEN_CHECK_STATUS=unknown
+        TOKEN_CHECK_REASON="login OK but config re-render failed"
+        report_degraded_login
+      fi ;;
+    auth)
+      local why="ALCF login expired or rejected ($TOKEN_CHECK_REASON); access tokens auto-refresh for up to 30 days, after which, or after a high-assurance timeout, a new login is required"
+      err "╔═══════════════════════════════════════════════════════════════╗"
+      err "║  ALCF INFERENCE LOGIN EXPIRED OR REJECTED                     ║"
+      err "║  The agent's LLM calls will fail until you re-authenticate.   ║"
+      err "║  Run this on your host, then the agent works again:           ║"
+      err "╚═══════════════════════════════════════════════════════════════╝"
+      err "    $why."
+      err "    $reauth_cmd"
+      write_token_status EXPIRED "$why. Re-authenticate on the host: $reauth_cmd" ;;
+    *)
+      report_degraded_login ;;
+  esac
+}
+
+if [[ "$GENERIC_MODE" == "1" || "${ALCF_TOKEN_CHECK:-1}" == "0" ]]; then
+  if ! authed_inference; then
+    log "First-time setup: ONE Globus login for all ALCF services"
+    log "(Inference + IRI + Globus Compute + Transfer — ALCF policy default)"
+    log "A single URL will be printed — open it, log in with your ALCF/Globus"
+    log "account, and paste the ONE authorization code back here."
+    echo
+    "$ALCF_TOKENS" login
+    echo
+    if ! authed_inference; then
+      err "ALCF authentication failed. Re-run the container to try again."
+      exit 1
+    fi
+    log "ALCF authentication OK (single login covered all services)."
+  fi
+  if [[ "$GENERIC_MODE" == "0" ]]; then
+    diag "ALCF_TOKEN_CHECK=0: live inference login check skipped (local get-token gate only)"
+  fi
+else
+  check_inference_login
+  case "$TOKEN_CHECK_STATUS" in
+    ok)
+      diag "ALCF inference login verified live (whoami OK)" ;;
+    auth)
+      if [[ -t 0 && -t 1 ]]; then
+        log "ALCF inference login needed ($TOKEN_CHECK_REASON)."
+        log "ONE Globus login for all ALCF services"
+        log "(Inference + IRI + Globus Compute + Transfer — ALCF policy default)"
+        log "A single URL will be printed — open it, log in with your ALCF/Globus"
+        log "account, and paste the ONE authorization code back here."
+        echo
+        "$ALCF_TOKENS" login || true
+        echo
+        check_inference_login
+        if [[ "$TOKEN_CHECK_STATUS" != "ok" ]]; then
+          err "ALCF authentication failed (live check: $TOKEN_CHECK_STATUS, $TOKEN_CHECK_REASON). Re-run the container to try again."
+          exit 1
+        fi
+        log "ALCF authentication OK (single login covered all services)."
+      else
+        # No terminal: a login cannot be completed here, so do not start one.
+        err "ALCF inference login is missing or was rejected ($TOKEN_CHECK_REASON)."
+        err "No terminal is attached, so the Globus login cannot run here. Fix it with ONE of:"
+        err "  - restart interactively: docker run -it ... (your usual command, with -it)"
+        err "  - or log in inside the container: $reauth_cmd"
+        exit 77   # EX_NOPERM: valid ALCF login required
+      fi ;;
+    *)
+      report_degraded_login ;;
+  esac
 fi
 
 # --- 3. Dashboard auth (required for a container 0.0.0.0 bind) ---------------
@@ -309,6 +449,7 @@ GPYEOF
             ALCF_LAUNCH_SOURCE_FILE="$LAUNCH_SOURCE_FILE" \
             ALCF_MAX_TOKENS="${ALCF_MAX_TOKENS:-2048}" \
             ALCF_REASONING_MAX_TOKENS="${ALCF_REASONING_MAX_TOKENS:-12288}" \
+            ALCF_TOKENS_BIN="$ALCF_TOKENS" \
             "$PY" "$ALCF_DIR/populate_models.py" 2>>"$POPULATE_LOG")" \
     || providers_block=""   # a crash must reach the guard below, not abort under set -e
   launch_source="$(cat "$LAUNCH_SOURCE_FILE" 2>/dev/null || true)"
@@ -567,8 +708,19 @@ EOF
 
   # Render: substitute ${...} placeholders, and splice the generated providers
   # block over the sentinel-to-EOF region of the template. The generated block
-  # still contains ${ALCF_ACCESS_TOKEN}, so we splice FIRST then substitute.
-  ALCF_ACCESS_TOKEN="$token" \
+  # may contain ${ALCF_ACCESS_TOKEN}, so we splice FIRST then substitute.
+  #
+  # ALCF MODE writes NO token into the config: every ALCF provider declares
+  # `key_cmd` (alcf-tokens get-token inference), which Hermes runs per request
+  # and caches (agent/command_token_source.py), so a rotated token is picked up
+  # without a re-render. The top-level model.api_key renders EMPTY on purpose: a
+  # non-empty model key would be passed as the explicit key and win over the
+  # provider's key_cmd. GENERIC MODE substitutes its static token as before.
+  local config_api_key=""
+  if [[ "$GENERIC_MODE" == "1" ]]; then
+    config_api_key="$token"
+  fi
+  ALCF_ACCESS_TOKEN="$config_api_key" \
   ALCF_BASE_URL="$render_base_url" \
   ALCF_MODEL="$launch_model" \
   ALCF_LAUNCH_PROVIDER="$launch_provider" \
@@ -608,7 +760,8 @@ if extra:
 out = string.Template(tmpl).safe_substitute(os.environ)
 open(dst, "w", encoding="utf-8").write(out)
 PYEOF
-  # The rendered config embeds the live inference api_key. FORCE mode 0600 on
+  # The rendered config may embed a credential (generic mode's api_key; any
+  # MCP/dashboard settings). FORCE mode 0600 on
   # every render — including re-renders over an existing file, where the file
   # mode comes from the pre-existing inode and open(mode=) alone would not
   # tighten it.
@@ -725,43 +878,33 @@ managed_seed "$ALCF_DIR/SOUL.md" "$HERMES_HOME/SOUL.md" "ALCF Agent identity (SO
 # image-owned here.
 cp -r "$ALCF_DIR/skills/." "$HERMES_HOME/skills/research/" 2>/dev/null || true
 
-# --- 6. Token refresh loop (tokens last 48h; refresh every 6h) --------------
-# The inference token IS the api_key, and it rotates. We re-render the config
-# with a fresh token every 6h. GENERIC MODE SKIPS THIS LOOP: the supplied
-# INFERENCE_TOKEN is static and user-managed (restarting the container with an
-# updated -e INFERENCE_TOKEN=... is how you rotate it). If a refresh FAILS, the token has almost
-# certainly hit the 30-day hard re-auth limit — from then on every LLM call
-# will fail upstream (typically HTTP 401). A chat-only user never sees the
-# container log, so we (a) print a loud, actionable banner to the log AND (b)
-# drop a status file on the volume that the agent reads and surfaces IN CHAT
-# (see memory/MEMORY.md → "Inference token expiry"). On success we clear it.
-TOKEN_STATUS="$HERMES_HOME/.inference_token_status"
-: > "$TOKEN_STATUS" 2>/dev/null || true   # start clean (empty = healthy)
-reauth_cmd="docker exec -it <container> \
-  /opt/hermes/.venv/bin/alcf-tokens login"
+# --- 6. Login check loop (every ALCF_TOKEN_CHECK_INTERVAL s, default 6h) -----
+# Hermes mints the per-request inference token itself via key_cmd (cached, and
+# re-minted at most every 15 min), and alcf-tokens refreshes the access token
+# from the stored refresh token. What NO refresh can do is renew an expired or
+# rejected LOGIN (30-day limit, high-assurance timeout). So every interval we
+# re-run token_refresh_tick (step 2): get-token, then the live check, then
+#   ok          -> re-render the config (catalog) and clear the status file
+#   auth        -> loud EXPIRED banner + EXPIRED status file
+#   unavailable -> UNREACHABLE status file (NOT the expired banner)
+#   unknown     -> UNKNOWN status file
+# A chat-only user never sees the container log; the agent reads the status
+# file and explains it IN CHAT. GENERIC MODE SKIPS THIS LOOP: the supplied
+# INFERENCE_TOKEN is static and user-managed (restart with an updated
+# -e INFERENCE_TOKEN=... to rotate it).
+TOKEN_CHECK_INTERVAL="${ALCF_TOKEN_CHECK_INTERVAL:-21600}"
+if ! [[ "$TOKEN_CHECK_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+  diag "ALCF_TOKEN_CHECK_INTERVAL must be a positive integer; using 21600"
+  TOKEN_CHECK_INTERVAL=21600
+fi
 if [[ "$GENERIC_MODE" == "0" ]]; then
 (
   while true; do
-    sleep 21600
-    if render_config 2>/dev/null; then
-      diag "Refreshed inference access token."
-      : > "$TOKEN_STATUS" 2>/dev/null || true   # healthy again
-    else
-      err "╔═══════════════════════════════════════════════════════════════╗"
-      err "║  INFERENCE TOKEN REFRESH FAILED                               ║"
-      err "║  Your ALCF inference login has expired (30-day re-auth limit). ║"
-      err "║  The agent's LLM calls will fail until you re-authenticate.    ║"
-      err "║  Run this on your host, then the agent works again:           ║"
-      err "╚═══════════════════════════════════════════════════════════════╝"
-      err "    $reauth_cmd"
-      # Machine-readable note the agent reads to explain the failure in chat.
-      printf 'EXPIRED\n%s\n' \
-        "Inference Globus login expired (30-day re-auth). Re-authenticate on the host: $reauth_cmd" \
-        > "$TOKEN_STATUS" 2>/dev/null || true
-    fi
+    sleep "$TOKEN_CHECK_INTERVAL"
+    token_refresh_tick || true
   done
 ) &
-fi   # end ALCF-mode token-refresh loop guard (generic mode uses a static INFERENCE_TOKEN)
+fi   # end ALCF-mode login-check loop guard (generic mode uses a static INFERENCE_TOKEN)
 
 # --- 7. Launch: dashboard behind Caddy on a loopback-published HTTP port ------
 # Browsers treat http://localhost as a trustworthy secure context, so clipboard

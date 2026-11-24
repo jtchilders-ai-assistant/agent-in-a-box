@@ -60,7 +60,9 @@ On first run the container will:
 
 The single `alcf-agent-home` volume persists your Globus tokens **and** the
 agent's memory across restarts, so you only log in occasionally (tokens last 48h
-and auto-refresh; a full re-auth is required every 30 days).
+and auto-refresh; a full re-auth is required every 30 days, or sooner after an
+ALCF high-assurance timeout). See **Inference login: startup check, refresh and
+expiry** below.
 
 ### Startup output
 
@@ -300,6 +302,9 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 | `ALCF_ENABLE_MINERVA` | `1` | Include the Minerva cluster's models in the switchable list (ignored when `ALCF_CLUSTER=minerva`) |
 | `ALCF_ENABLE_TARA` | `1` | Include the Tara cluster's models in the switchable list (ignored when `ALCF_CLUSTER=tara`, the default) |
 | `ALCF_SHOW_MODEL_STATUS` | `1` | Print the model availability banner (LIVE/QUEUED/OFFLINE + context windows) at startup |
+| `ALCF_TOKEN_CHECK` | `1` | Live inference-login check at startup (`alcf-tokens test-token inference`). `0` restores the previous local `get-token` gate. See **Inference login: startup check, refresh and expiry** |
+| `ALCF_TOKEN_CHECK_TIMEOUT` | `20` | Seconds before the live check gives up (reported as unreachable) |
+| `ALCF_TOKEN_CHECK_INTERVAL` | `21600` | Seconds between background login checks (6h) |
 | `ALCF_BASH_ACCOUNT` | *(unset)* | **Recommended:** your default ALCF project for the compute-node `bash` tool. When set, the agent holds ONE warm compute node across the whole conversation instead of paying repeated cold starts; when unset, it must ask/look up a project first. |
 
 ## Generic OpenAI-compatible inference mode (optional)
@@ -307,7 +312,7 @@ running config at container start. Pass these with `-e` to Docker/Podman or as
 **The default is unchanged:** with no `INFERENCE_*` variables set, the box
 behaves exactly as before — ALCF Inference Service on `ALCF_CLUSTER`, the
 combined Globus login, the live catalog, the availability banner, and the
-6-hour token refresh. Everything below only applies when you opt in.
+6-hour login check. Everything below only applies when you opt in.
 
 Setting `INFERENCE_URL` points the agent's own brain at **any**
 OpenAI-compatible endpoint (`GET <base>/models` + Bearer auth) instead of the
@@ -414,13 +419,19 @@ than aborting the launch.
 1. **Globus authentication.** On first run, the pinned official
    `alcf-tokens==0.3.0` package performs ONE combined Globus login for Inference,
    IRI, Globus Compute, and Globus Transfer. It applies the ALCF all-services
-   policy and stores refreshable per-service credentials in `/opt/data`.
+   policy and stores refreshable per-service credentials in `/opt/data`. In ALCF
+   mode every start then checks the stored inference login **live** against
+   the gateway (see **Inference login: startup check, refresh and expiry**
+   below).
 2. **Dashboard auth gate.** Hashes the dashboard password (from
    `ALCF_DASHBOARD_PASSWORD`, or an auto-generated one printed once). Hermes
    refuses a non-loopback bind without this gate.
 3. **Config render** (`render_config`), which builds the running config from
    `config/config.template.yaml`:
-   - **Fetch a fresh inference token** — it's the `api_key`, and it rotates.
+   - **Fetch a fresh inference token** for the catalog and context-window
+     lookups. It is not written to the config: every ALCF provider carries
+     `key_cmd: "/opt/hermes/.venv/bin/alcf-tokens get-token inference"` and no
+     `api_key`, so Hermes mints the token itself.
    - **Resolve the launch model's real context window**
      (`resolve_context_length.py`) from the gateway's `max_model_len`, because
      ALCF caps some models below their published spec and Hermes must be told the
@@ -460,11 +471,53 @@ than aborting the launch.
    knowledge-base fixes reach existing volumes without clobbering user edits. A
    stock/legacy Hermes `SOUL.md` with no ALCF stamp is replaced so the ALCF
    identity always lands.
-6. **Token-refresh loop + launch.** A background loop re-renders the config with a
-   fresh inference token every 6h (tokens last 48h; a full re-auth is required
-   every 30 days). If a refresh fails — usually the 30-day limit — it logs a loud
-   banner and drops a status file the agent surfaces *in chat*. Then the Hermes
-   dashboard starts behind the loopback-only Caddy HTTP proxy.
+6. **Login-check loop + launch.** A background loop re-checks the inference
+   login every `ALCF_TOKEN_CHECK_INTERVAL` seconds (default 21600, 6h), keeps
+   the status file honest and re-renders the config while the login is good.
+   Then the Hermes dashboard starts behind the loopback-only Caddy HTTP proxy.
+
+### Inference login: startup check, refresh and expiry
+
+`alcf-tokens get-token inference` only proves a token can be produced
+*locally*: it succeeds with a cached or refreshed token even when ALCF rejects
+it (for example after a high-assurance timeout). So in ALCF mode the
+entrypoint checks the login **live** at startup with
+`alcf-tokens test-token inference` (a GET of the gateway's `whoami`), through
+`scripts/inference_token_check.py`. The check never prints a token or a
+response body; it classifies the outcome:
+
+| Result | Startup behavior |
+|---|---|
+| **ok** (gateway accepted the token) | Continue. |
+| **auth** (no stored login, `get-token` failed, or HTTP 401/403) | With a terminal (`docker run -it`): explain, run `alcf-tokens login`, re-check; exit 1 unless it is now ok. **Without a terminal: exit 77** with the reason and the fix (`docker run -it ...`, or `docker exec -it <container> /opt/hermes/.venv/bin/alcf-tokens login`). A login is never attempted without a terminal. |
+| **unavailable** (HTTP 5xx/429/408, network error, timeout) | Warn and continue; status file `UNREACHABLE`. The login may be fine. |
+| **unknown** (anything else) | Warn and continue; status file `UNKNOWN`. |
+
+The check times out after `ALCF_TOKEN_CHECK_TIMEOUT` seconds (default 20).
+`-e ALCF_TOKEN_CHECK=0` skips the live check and restores the previous gate
+(only the local `get-token`, with an interactive login when it fails).
+Generic inference mode (`INFERENCE_URL`) is unchanged.
+
+**Per-request refresh.** The rendered config holds no inference token. Each
+ALCF provider's `key_cmd` runs `alcf-tokens get-token inference`, and Hermes
+calls it per request, caching the result and re-minting **at most every 15
+minutes** (Hermes' `key_cmd` window). A token that `alcf-tokens` refreshed on
+disk therefore reaches the running agent without a re-render or restart.
+
+**Status file.** `$HERMES_HOME/.inference_token_status` (`/opt/data/...`) is
+empty when healthy. Otherwise its first line is `EXPIRED`, `UNREACHABLE` or
+`UNKNOWN` and the second line explains what to do; the agent reads it and
+relays the fix in chat. The background loop runs `get-token`, then the live
+check: **ok** re-renders the config and clears the file; **auth** logs a loud
+banner and writes `EXPIRED` ("ALCF login expired or rejected (...); access
+tokens auto-refresh for up to 30 days, after which, or after a high-assurance
+timeout, a new login is required"); **unavailable** / **unknown** write
+`UNREACHABLE` / `UNKNOWN`, without the expired banner.
+
+**Refresh cannot renew an expired login.** Neither `key_cmd` nor the loop can
+get past the 30-day limit or a high-assurance timeout: those need a new
+interactive Globus login (`docker exec -it <container>
+/opt/hermes/.venv/bin/alcf-tokens login`, or restart with `-it`).
 
 ## Memory & documentation
 

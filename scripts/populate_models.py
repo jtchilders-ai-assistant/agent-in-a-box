@@ -88,10 +88,13 @@ if it cannot be parsed, and never touch the network. Reads:
                         discovery failed and the fallback lacks it (>= 64k only)
     ALCF_LAUNCH_SOURCE_FILE  where to write the launch cluster's state: live |
                         fallback | fallback-injected | fallback-missing
+    ALCF_TOKENS_BIN     alcf-tokens CLI for each provider's key_cmd
+                        (default /opt/hermes/.venv/bin/alcf-tokens)
 """
 import json
 import os
 import re
+import shlex
 import sys
 import textwrap
 import urllib.error
@@ -113,6 +116,10 @@ TARA_BASE = f"{INFER_HOST}/tara/api/v1"
 PROVISIONING_CLUSTERS = ()
 
 PY = os.environ.get("ALCF_PY", sys.executable)
+# The alcf-tokens CLI every provider's key_cmd runs (env ALCF_TOKENS_BIN
+# overrides; the entrypoint passes its own $ALCF_TOKENS). Keep in sync with the
+# static fallback's key_cmd in config/config.template.yaml.
+DEFAULT_ALCF_TOKENS_BIN = "/opt/hermes/.venv/bin/alcf-tokens"
 # Fallback context window for a chat model that reports no server value.
 DEFAULT_CONTEXT = 32768
 
@@ -450,6 +457,17 @@ def _yaml_key(mid: str) -> str:
     return mid if _PLAIN_ID.fullmatch(mid) else json.dumps(mid)
 
 
+def alcf_key_cmd() -> str:
+    """The provider credential command: ``<alcf-tokens> get-token inference``.
+
+    Hermes runs a ``key_cmd`` per request and caches the token (re-minting at
+    most every 15 min, agent/command_token_source.py), so the rendered config
+    carries NO token and a rotated token is picked up without a re-render.
+    """
+    binary = os.environ.get("ALCF_TOKENS_BIN") or DEFAULT_ALCF_TOKENS_BIN
+    return f"{shlex.quote(binary)} get-token inference"
+
+
 def _emit_provider(name: str, base_url: str, mapping: dict,
                    max_tokens: int) -> list:
     """Render one keyed ``providers`` entry, indented to sit under ``providers:``.
@@ -464,7 +482,7 @@ def _emit_provider(name: str, base_url: str, mapping: dict,
         f"  {name}:",
         f"    name: {name}",
         f'    api: "{base_url}"',
-        '    api_key: "${ALCF_ACCESS_TOKEN}"',
+        f"    key_cmd: {json.dumps(alcf_key_cmd())}",
         "    discover_models: false",
         "    extra_body:",
         f"      max_tokens: {max_tokens}",
